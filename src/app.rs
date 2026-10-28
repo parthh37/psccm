@@ -164,7 +164,11 @@ mod tests {
                 n += 1;
             }
         }
-        let bash = std::process::Command::new("bash").arg("--version").output().is_ok();
+        // A working bash (on Windows runners "bash" may be a WSL stub without a distro).
+        let bash = std::process::Command::new("bash")
+            .args(["-c", "echo ok"])
+            .output()
+            .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok");
         let mut errors = Vec::new();
         for e in std::fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();

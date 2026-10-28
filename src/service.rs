@@ -4,7 +4,7 @@
 //! `psccm.exe --data-dir <dir> service run`, and the listen address/port/token
 //! come from the "server" setting in the database.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -36,6 +36,7 @@ impl Default for ServerSettings {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use anyhow::Context;
     use std::ffi::OsString;
     use std::sync::{Arc, OnceLock};
     use std::time::Duration;
