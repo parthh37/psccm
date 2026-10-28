@@ -17,6 +17,8 @@ pub struct Ctx {
     pub data_dir: PathBuf,
     /// Cancellation flags of running deployments.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Progress of the current (or last) inventory scan.
+    pub scan: Mutex<crate::inventory::ScanState>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -62,6 +64,7 @@ impl Ctx {
             db: Db::open(&data_dir.join("psccm.db"))?,
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
+            scan: Mutex::new(Default::default()),
         };
         std::fs::create_dir_all(ctx.packages_dir())?;
         std::fs::create_dir_all(ctx.repo_dir())?;

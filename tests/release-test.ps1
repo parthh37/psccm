@@ -6,11 +6,11 @@
     Runs against a built or installed PSCCM and, optionally, real target computers:
       - installer: silent install, Windows service, upgrade in place, uninstall   (-Setup)
       - binary:    version, help, built-in packages
-      - API:       auth, packages, computers, groups, credentials, schedules,
+      - API:       auth, packages, computers, groups, inventory, credentials, schedules,
                    deployments, redeploy, cancel, updates, GPO backup import
-      - Windows:   WinRM commands, every step type, rollback, detect, GPO
+      - Windows:   WinRM commands, inventory scan, every step type, rollback, detect, GPO
                    apply/remove, rolling batches, real installs (7-Zip, Node.js, IIS)
-      - Linux:     SSH + sudo, every step type, rollback, real installs
+      - Linux:     SSH + sudo, inventory scan, every step type, rollback, real installs
                    (7-Zip, Node.js, HAProxy upgrade/config/drain)
     Tests that need something not provided are reported as "skip".
 
@@ -129,6 +129,20 @@ function Wait-Deployment([string]$Id, [int]$TimeoutSec = 1800) {
     }
 }
 
+# Scan computers' inventory and return each one's stored inventory (by name).
+function Invoke-Scan([string[]]$Names, [int]$TimeoutSec = 600) {
+    [void](Ok (Api POST '/inventory/scan' @{ names = $Names }))
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    do {
+        Start-Sleep -Milliseconds 1500
+        $r = Ok (Api GET '/inventory')
+    } while ($r.scan.running -and (Get-Date) -lt $deadline)
+    Assert (-not $r.scan.running) 'inventory scan did not finish'
+    $out = @{}
+    foreach ($n in $Names) { $out[$n] = @($r.inventory) | Where-Object { $_.computer -eq $n } }
+    $out
+}
+
 function Invoke-Deploy([hashtable]$Body, [int]$TimeoutSec = 1800) {
     $r = Ok (Api POST '/deployments' $Body)
     Wait-Deployment $r.id $TimeoutSec
@@ -245,7 +259,7 @@ Test-Step 'Binary' 'Version' {
 }
 Test-Step 'Binary' 'Help lists the commands' {
     $out = (& $Exe --help) -join "`n"
-    foreach ($c in 'serve', 'deploy', 'run', 'packages', 'computers', 'groups', 'gpo', 'update', 'service') {
+    foreach ($c in 'serve', 'deploy', 'run', 'packages', 'computers', 'groups', 'inventory', 'gpo', 'update', 'service') {
         Assert ($out -match "(?m)^\s+$c\b") "help does not mention '$c'"
     }
 }
@@ -337,6 +351,18 @@ try {
         [void](Ok (Api POST "/groups/$($s.id)/members" @{ remove = @('rt-b.invalid') }))
         $st = (Ok (Api GET '/groups')).groups | Where-Object { $_.name -eq 'RT static' }
         Assert (@($st.members).Count -eq 1) 'remove member failed'
+    }
+    Test-Step 'API' 'Inventory: settings, unreachable scan, rule validation' {
+        [void](Ok (Api PUT '/settings/inventory' @{ interval_hours = 0; concurrency = 8; rescan_after_deploy = $true }))
+        Assert ((Ok (Api GET '/inventory')).settings.concurrency -eq 8) 'inventory settings not saved'
+        $inv = Invoke-Scan @('rt-a.invalid') 120
+        Assert ($inv['rt-a.invalid'].status -eq 'offline') "status $($inv['rt-a.invalid'].status)"
+        Assert (-not $inv['rt-a.invalid'].scanned_at) 'unreachable computer has a scan time'
+        $bad = Api POST '/groups' @{ name = 'RT bad inv'; kind = 'dynamic'; rules = @{ app_version = '<130' } }
+        Assert ($bad.Status -eq 400) 'version condition without software accepted'
+        $prev = Ok (Api POST '/groups/preview' @{ app = '*' })
+        Assert (@($prev.members).Count -eq 0) "unscanned computers matched a software rule: $($prev.members)"
+        Assert ((Api GET '/inventory/computer/no-such-computer').Status -eq 404) 'missing inventory is not 404'
     }
     Test-Step 'API' 'Credentials never return secrets' {
         $c = Ok (Api POST '/credentials' @{ name = 'rt-cred'; kind = 'ssh'; username = 'u'; secret = 'p@ss-rt' })
@@ -454,6 +480,21 @@ try {
         Test-Step 'Windows' 'Ad-hoc PowerShell over WinRM' {
             $r = Invoke-Deploy @{ command = "Write-Output ('ps=' + `$PSVersionTable.PSVersion.Major); hostname"; targets = @{ computers = @($WindowsTarget) } } 300
             Assert-Deploy $r 'success' @('ps=')
+        }
+        Test-Step 'Windows' 'Inventory scan over WinRM and a software group rule' {
+            $i = (Invoke-Scan @($WindowsTarget))[$WindowsTarget]
+            Assert ($i.status -eq 'ok') "scan $($i.status): $($i.error)"
+            Assert ($i.facts.os_name -like '*Windows*') "os_name '$($i.facts.os_name)'"
+            Assert ([int]$i.facts.ram_mb -gt 0) 'no memory size'
+            Assert (@($i.disks).Count -ge 1) 'no disks'
+            Assert ($i.app_count -gt 0) 'no installed programs'
+            $full = Ok (Api GET "/inventory/computer/$WindowsTarget")
+            $app = @($full.apps)[0].name
+            $prev = Ok (Api POST '/groups/preview' @{ app = $app })
+            Assert (@($prev.members) -contains $WindowsTarget) "software rule '$app' did not match"
+            $prev = Ok (Api POST '/groups/preview' @{ app = $app; app_missing = $true })
+            Assert (@($prev.members) -notcontains $WindowsTarget) "'without $app' matched"
+            "$($i.facts.os_name), $($i.app_count) programs"
         }
         Test-Step 'Windows' 'cmd shell' {
             $r = Invoke-Deploy @{ command = 'echo cmd-ok %COMPUTERNAME%'; shell = 'cmd'; targets = @{ computers = @($WindowsTarget) } } 300
@@ -586,6 +627,17 @@ verify:
         Test-Step 'Linux' 'Ad-hoc command over SSH with sudo' {
             $r = Invoke-Deploy @{ command = 'echo "kernel=$(uname -s) uid=$(id -u)"'; targets = @{ computers = @($LinuxTarget) } } 300
             Assert-Deploy $r 'success' @('kernel=Linux uid=0')
+        }
+        Test-Step 'Linux' 'Inventory scan over SSH' {
+            $i = (Invoke-Scan @($LinuxTarget))[$LinuxTarget]
+            Assert ($i.status -eq 'ok') "scan $($i.status): $($i.error)"
+            Assert ($i.facts.os_name) 'no os_name'
+            Assert ($i.facts.kernel) 'no kernel'
+            Assert (@($i.disks).Count -ge 1) 'no disks'
+            Assert ($i.app_count -gt 0) 'no installed packages'
+            $prev = Ok (Api POST '/groups/preview' @{ app = 'bash' })
+            Assert (@($prev.members) -contains $LinuxTarget) 'software rule "bash" did not match'
+            "$($i.facts.os_name), $($i.app_count) packages"
         }
         Test-Step 'Linux' 'Every step type (script, when, retry, copy, install, service, include, delegate)' {
             [void](Add-Package "id: rt-child-linux`nname: RT child`nplatforms: [linux]`nsteps:`n  - name: Child step`n    script: echo child-ok`n")

@@ -9,7 +9,10 @@ computers without installing an agent, similar to PDQ Deploy.
 - **Windows** targets over **WinRM** (PowerShell remoting, Kerberos/NTLM, encrypted).
 - **Linux** targets over **SSH** (password or key, `sudo`), with host-key pinning.
 - **Active Directory** computer import that is **read-only**: it only runs LDAP searches.
-- **Computer groups**: static lists or dynamic rules (OS, name pattern, OU, AD security group, tag).
+- **Computer groups**: static lists or dynamic rules (OS, name pattern, OU, AD security group, tag,
+  installed software and version, pending reboot, low disk space).
+- **Inventory**: agentless scans of OS, hardware, disks, logged-on user, pending reboot and installed
+  software, with a software report across all computers.
 - **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
   apply their computer settings directly on chosen computers, with no GPO link or AD change.
 - **Web console** for everyday use, plus a **CLI** for scripts and CI pipelines.
@@ -58,7 +61,7 @@ Windows targets need a Windows console (PowerShell remoting); Linux targets work
 
 | Data folder | What |
 |---|---|
-| `psccm.db` | Computers, groups, credentials (encrypted), history, schedules, settings |
+| `psccm.db` | Computers, groups, credentials (encrypted), history, schedules, inventory, settings |
 | `packages\` | Package YAML files (the built-ins are written here on first start) |
 | `repository\` | Installers and files that packages push (`install: file`, `copy: src`) |
 | `gpos\` | Imported Group Policy snapshots |
@@ -130,8 +133,38 @@ memberships are imported too, so they can drive dynamic groups.
   re-evaluated whenever it is used, so new computers from AD join automatically. The editor previews
   the matching computers as you type.
 
+Dynamic groups can also use the [inventory](#inventory): installed software with an optional version
+condition (`Google Chrome*` with `<130`, or *without* `Notepad++*`), *reboot pending*, and *a disk
+has less than N GB free*. These rules only match computers that have been scanned.
+
 You can deploy and schedule to groups (and combine them with tags and single computers). CLI:
 `psccm deploy 7zip --group "Web farm"`, `psccm groups list`.
+
+## Inventory
+
+*Inventory* page. A scan runs a read-only script on each computer over the same WinRM/SSH connection
+and credential that deployments use. Nothing is installed on the targets and nothing is changed. It
+collects:
+
+| | Windows | Linux |
+|---|---|---|
+| OS | name, version (`23H2`), build, architecture, install date, last update installed | `/etc/os-release`, kernel, architecture, package manager |
+| Hardware | manufacturer, model, serial number, CPU, logical CPUs, memory | the same, from `/sys/class/dmi` and `/proc` |
+| State | last boot, logged-on user, IPv4 addresses, domain, reboot pending (CBS, Windows Update, rename) | last boot, logged-on users, IPv4 addresses, reboot pending (`/var/run/reboot-required`, `needs-restarting`) |
+| Disks | fixed drives: size, free space, file system | mounted file systems (no tmpfs/overlay) |
+| Software | *Programs and Features* (64- and 32-bit, no system components or updates) | `dpkg` or `rpm` packages |
+
+- **Scan all computers** or *Scan now* on one computer. Set *Scan all computers every N hours* for a
+  periodic scan (off by default).
+- The **Software** tab lists every program with its versions and how many computers have each. From a
+  program you can create a dynamic group of the computers **with** or **without** it, then add a version
+  condition (`<130`, `>=22.11`, `!=24.09`, or `22` for any 22.x).
+- After a deployment succeeds, the computers it ran on are re-scanned (only computers that were scanned
+  before), so software groups see the change. You can turn this off.
+- A failed or offline scan keeps the last good inventory and shows the error.
+
+CLI: `psccm inventory scan [names…]`, `psccm inventory show web01`,
+`psccm inventory software --name "Google Chrome*"`.
 
 ## Group Policy (GPO) import and injection
 
@@ -229,6 +262,7 @@ psccm run web01,lb01 -s "Get-Service W3SVC"          # ad-hoc command (PowerShel
 psccm packages list | show <id> | validate <file.yaml>
 psccm computers list | add <names> [--os linux] [--tag web] | remove <names> | check
 psccm groups list | create <name> --computers a,b
+psccm inventory scan [names…] | show <name> | software [--name "Chrome*"]
 psccm ad sync [--import]
 psccm gpo list | import <GUID> | import-folder <path> [--name N]
 psccm catalog list | check | add <ids> | update [ids] | remove <id>
@@ -416,6 +450,7 @@ In debug builds, setting `PSCCM_WINRM_LOCAL=1` runs "Windows" targets on the con
 WinRM, which is useful to test packages on a dev box.
 
 Source map: `src/package.rs` (YAML format), `src/engine.rs` (deployment runner), `src/catalog.rs` (App catalog),
-`src/transport/` (WinRM, SSH), `src/ad.rs`, `src/gpo.rs`, `src/groups.rs`, `src/update.rs`,
+`src/transport/` (WinRM, SSH), `src/ad.rs`, `src/gpo.rs`, `src/groups.rs`, `src/inventory.rs`
+(scan scripts in `src/assets/`), `src/update.rs`,
 `src/service.rs`, `src/scheduler.rs`, `src/web.rs` (API), `web/` (UI), `installer/` (Inno Setup),
 `packages/` (built-ins).

@@ -7,6 +7,7 @@ mod db;
 mod engine;
 mod gpo;
 mod groups;
+mod inventory;
 mod package;
 mod scheduler;
 mod secrets;
@@ -133,6 +134,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Inventory: hardware, OS and installed software collected from the computers.
+    Inventory {
+        #[command(subcommand)]
+        cmd: InventoryCmd,
+    },
     /// Recent deployments.
     History {
         #[arg(long, default_value_t = 20)]
@@ -149,6 +155,19 @@ enum GroupsCmd {
         name: String,
         #[arg(long, value_delimiter = ',')]
         computers: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum InventoryCmd {
+    /// Scan computers now (all when no names are given) and wait for the result.
+    Scan { names: Vec<String> },
+    /// Show what is known about a computer.
+    Show { name: String },
+    /// Installed software across all computers, optionally filtered by name (* and ?).
+    Software {
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -369,8 +388,10 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
         Cmd::Groups { cmd } => match cmd {
             GroupsCmd::List => {
                 let all = app.db.list_computers()?;
-                for g in app.db.list_groups()? {
-                    let m: Vec<&str> = groups::members(&g, &all).iter().map(|c| c.name.as_str()).collect();
+                let list = app.db.list_groups()?;
+                let inv = groups::load_inventory(&app.db, list.iter().map(|g| &g.rules))?;
+                for g in list {
+                    let m: Vec<&str> = groups::members(&g, &all, &inv).iter().map(|c| c.name.as_str()).collect();
                     println!("{:<24} {:<8} {:>4}  {}", g.name, g.kind, m.len(), m.join(", "));
                 }
                 Ok(())
@@ -449,6 +470,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
             Ok(())
         }
         Cmd::Cred { cmd } => cred_cmd(&app, cmd),
+        Cmd::Inventory { cmd } => inventory_cmd(&app, cmd).await,
         Cmd::History { limit } => {
             for d in app.db.list_deployments(limit)? {
                 println!(
@@ -628,6 +650,57 @@ async fn computers_cmd(app: &App, cmd: ComputersCmd) -> Result<()> {
             res.sort();
             for (name, online) in &res {
                 println!("{:<40} {}", name, if *online { "online" } else { "OFFLINE" });
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn inventory_cmd(app: &App, cmd: InventoryCmd) -> Result<()> {
+    match cmd {
+        InventoryCmd::Scan { names } => {
+            let mut results = inventory::scan_now(app, &names).await?;
+            results.sort_by_key(|r| r.computer.to_lowercase());
+            let mut bad = 0;
+            for r in &results {
+                println!("{:<40} {:<8} {}", r.computer, r.status, r.error.as_deref().unwrap_or(""));
+                bad += usize::from(r.status != "ok");
+            }
+            println!("{} scanned, {bad} not scanned", results.len() - bad);
+            if bad > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        InventoryCmd::Show { name } => {
+            let inv = app
+                .db
+                .get_inventory(&name)?
+                .ok_or_else(|| anyhow!("no inventory for '{name}' (run 'psccm inventory scan {name}')"))?;
+            println!(
+                "{}  last scan: {}  ({}{})",
+                inv.computer,
+                inv.scanned_at.as_deref().unwrap_or("never"),
+                inv.status,
+                inv.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+            );
+            for (k, v) in &inv.facts {
+                println!("  {k:<16} {v}");
+            }
+            for d in &inv.disks {
+                println!("  disk {:<11} {:.1} GB free of {:.1} GB {}", d.mount, d.free as f64 / 1e9, d.size as f64 / 1e9, d.fs);
+            }
+            println!("  {} installed programs", inv.apps.len());
+            for a in &inv.apps {
+                println!("    {:<60} {:<24} {}", a.name, a.version, a.publisher);
+            }
+            Ok(())
+        }
+        InventoryCmd::Software { name } => {
+            for (n, version, _publisher, count) in app.db.software_summary()? {
+                if name.as_deref().is_none_or(|p| groups::glob(p, &n)) {
+                    println!("{n:<60} {version:<24} {count:>5}");
+                }
             }
             Ok(())
         }

@@ -1,5 +1,5 @@
 //! Background loop: starts scheduled deployments, recurring schedules,
-//! AD auto-sync and the daily app catalog check.
+//! AD auto-sync, periodic inventory scans and the daily app catalog check.
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
@@ -18,6 +18,9 @@ pub fn spawn(app: App) {
             }
             if let Err(e) = crate::update::tick(&app).await {
                 error!("update check: {e:#}");
+            }
+            if let Err(e) = crate::inventory::tick(&app) {
+                error!("inventory: {e:#}");
             }
             crate::catalog::tick(&app);
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
