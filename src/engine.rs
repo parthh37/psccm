@@ -51,12 +51,19 @@ pub fn resolve_targets(app: &App, spec: &TargetSpec) -> Result<Vec<Target>> {
     };
     if !spec.groups.is_empty() {
         let groups = app.db.list_groups()?;
-        for name in &spec.groups {
-            let g = groups
-                .iter()
-                .find(|g| g.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| anyhow!("computer group '{name}' not found"))?;
-            for c in crate::groups::members(g, &all) {
+        let wanted: Vec<&crate::db::Group> = spec
+            .groups
+            .iter()
+            .map(|name| {
+                groups
+                    .iter()
+                    .find(|g| g.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| anyhow!("computer group '{name}' not found"))
+            })
+            .collect::<Result<_>>()?;
+        let inv = crate::groups::load_inventory(&app.db, wanted.iter().map(|g| &g.rules))?;
+        for g in wanted {
+            for c in crate::groups::members(g, &all, &inv) {
                 push(from_db(c));
             }
         }
@@ -262,6 +269,8 @@ pub async fn run_deployment(app: &App, id: &str) -> Result<String> {
     };
     app.db.set_deployment_status(id, status)?;
     info!("deployment {id}: {status}");
+    let succeeded = results.into_iter().filter(|t| t.status == "success").map(|t| t.computer).collect();
+    crate::inventory::after_deployment(app, succeeded);
     Ok(status.to_string())
 }
 

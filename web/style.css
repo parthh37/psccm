@@ -205,6 +205,12 @@ pre.log .k { color: #86efac; font-weight: 600; }
 .progress .p-ok { background: var(--ok); }
 .progress .p-bad { background: var(--bad); }
 .progress .p-skip { background: var(--idle); }
+.progress .p-warn { background: var(--warn); }
+.stat.click { cursor: pointer; }
+.stat.click:hover, .stat.on { border-color: var(--accent); }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 5px 18px; margin: 0; font-size: 13px; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
 
 /* modal, toast */
 .modal-bg { position: fixed; inset: 0; background: rgba(10, 15, 25, .45); display: grid; place-items: center; z-index: 50; padding: 16px; }

@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -103,6 +103,22 @@ CREATE TABLE IF NOT EXISTS group_members (
     computer_id INTEGER NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
     PRIMARY KEY (group_id, computer_id)
 );
+CREATE TABLE IF NOT EXISTS inventory (
+    computer_id INTEGER PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
+    scanned_at TEXT,
+    last_attempt TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    facts TEXT NOT NULL DEFAULT '{}',
+    disks TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS inventory_apps (
+    computer_id INTEGER NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    publisher TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_inv_apps_computer ON inventory_apps(computer_id);
 "#;
 
 /// Columns added after the first release: (table, column, definition).
@@ -612,6 +628,105 @@ impl Db {
         self.with(|c| c.execute("DELETE FROM schedules WHERE id=?1", [id]))?;
         Ok(())
     }
+
+    // --------------------------------------------------------------- inventory
+
+    /// Store a successful scan, replacing the computer's previous inventory.
+    /// The OS description is filled in when AD did not provide one.
+    pub fn save_inventory(&self, computer_id: i64, scan: &Scan) -> Result<()> {
+        let facts = serde_json::to_string(&scan.facts)?;
+        let disks = serde_json::to_string(&scan.disks)?;
+        let os_detail = scan.facts.get("os_name").cloned();
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO inventory(computer_id,scanned_at,last_attempt,status,error,facts,disks) VALUES(?1,?2,?2,'ok',NULL,?3,?4)
+                 ON CONFLICT(computer_id) DO UPDATE SET scanned_at=?2, last_attempt=?2, status='ok', error=NULL, facts=?3, disks=?4",
+                params![computer_id, now(), facts, disks],
+            )?;
+            tx.execute("DELETE FROM inventory_apps WHERE computer_id=?1", [computer_id])?;
+            {
+                let mut st = tx.prepare("INSERT INTO inventory_apps(computer_id,name,version,publisher) VALUES(?1,?2,?3,?4)")?;
+                for a in &scan.apps {
+                    st.execute(params![computer_id, a.name, a.version, a.publisher])?;
+                }
+            }
+            tx.execute(
+                "UPDATE computers SET online=1, last_check=?2, os_detail=COALESCE(NULLIF(os_detail,''), ?3) WHERE id=?1",
+                params![computer_id, now(), os_detail],
+            )?;
+            tx.commit()
+        })?;
+        Ok(())
+    }
+
+    /// Record a failed or offline scan; the last good inventory is kept.
+    pub fn inventory_failed(&self, computer_id: i64, status: &str, error: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO inventory(computer_id,last_attempt,status,error) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(computer_id) DO UPDATE SET last_attempt=?2, status=?3, error=?4",
+                params![computer_id, now(), status, error],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Inventory of every scanned computer; `with_apps` also loads the software lists.
+    pub fn list_inventory(&self, with_apps: bool) -> Result<Vec<Inventory>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("{INVENTORY_SELECT} ORDER BY c.name COLLATE NOCASE"))?;
+            let mut list: Vec<Inventory> = st.query_map([], Inventory::from_row)?.collect::<rusqlite::Result<_>>()?;
+            if with_apps {
+                let mut by_id: HashMap<i64, usize> = list.iter().enumerate().map(|(i, v)| (v.computer_id, i)).collect();
+                let mut st = c.prepare("SELECT computer_id,name,version,publisher FROM inventory_apps ORDER BY name COLLATE NOCASE")?;
+                let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, InstalledApp::from_row(r, 1)?)))?;
+                for row in rows {
+                    let (id, app) = row?;
+                    if let Some(i) = by_id.get_mut(&id) {
+                        list[*i].apps.push(app);
+                    }
+                }
+            }
+            Ok(list)
+        })
+    }
+
+    pub fn get_inventory(&self, computer: &str) -> Result<Option<Inventory>> {
+        self.with(|c| {
+            let inv = c
+                .query_row(&format!("{INVENTORY_SELECT} WHERE c.name=?1"), [computer], Inventory::from_row)
+                .optional()?;
+            let Some(mut inv) = inv else { return Ok(None) };
+            let mut st = c.prepare(
+                "SELECT name,version,publisher FROM inventory_apps WHERE computer_id=?1 ORDER BY name COLLATE NOCASE",
+            )?;
+            inv.apps = st.query_map([inv.computer_id], |r| InstalledApp::from_row(r, 0))?.collect::<rusqlite::Result<_>>()?;
+            Ok(Some(inv))
+        })
+    }
+
+    /// Installed software across all computers: (name, version, publisher, computer count).
+    pub fn software_summary(&self) -> Result<Vec<(String, String, String, i64)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT name, version, MAX(publisher), COUNT(DISTINCT computer_id) FROM inventory_apps
+                 GROUP BY name COLLATE NOCASE, version ORDER BY name COLLATE NOCASE",
+            )?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect()
+        })
+    }
+
+    /// Computers with software `name` installed: (computer, version).
+    pub fn software_computers(&self, name: &str) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT c.name, a.version FROM inventory_apps a JOIN computers c ON c.id=a.computer_id
+                 WHERE a.name=?1 COLLATE NOCASE ORDER BY c.name COLLATE NOCASE",
+            )?;
+            st.query_map([name], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        })
+    }
 }
 
 fn json_col<T: DeserializeOwned + Default>(row: &Row, col: &str) -> rusqlite::Result<T> {
@@ -994,4 +1109,89 @@ pub struct GroupRules {
     /// Text the OS description must contain, e.g. "Server 2022"
     #[serde(default)]
     pub os_detail: String,
+    /// Installed software name pattern with * and ? (from inventory), e.g. "Google Chrome*"
+    #[serde(default)]
+    pub app: String,
+    /// Version condition for `app`, e.g. "<130" or ">=22.11" (empty = any version)
+    #[serde(default)]
+    pub app_version: String,
+    /// Match scanned computers that do NOT have `app` (at that version)
+    #[serde(default)]
+    pub app_missing: bool,
+    /// Inventory reports a pending reboot
+    #[serde(default)]
+    pub pending_reboot: bool,
+    /// A fixed disk has less than this many GB free (0 = off)
+    #[serde(default)]
+    pub low_disk_gb: f64,
+}
+
+/// Result of one inventory scan, as parsed from the scan script's output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Scan {
+    pub facts: BTreeMap<String, String>,
+    pub disks: Vec<Disk>,
+    pub apps: Vec<InstalledApp>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Disk {
+    /// Drive letter ("C:") or mount point ("/var")
+    pub mount: String,
+    pub size: u64,
+    pub free: u64,
+    #[serde(default)]
+    pub fs: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstalledApp {
+    pub name: String,
+    pub version: String,
+    pub publisher: String,
+}
+
+impl InstalledApp {
+    fn from_row(r: &Row, first: usize) -> rusqlite::Result<InstalledApp> {
+        Ok(InstalledApp { name: r.get(first)?, version: r.get(first + 1)?, publisher: r.get(first + 2)? })
+    }
+}
+
+const INVENTORY_SELECT: &str = "SELECT i.*, c.name AS computer,
+    (SELECT COUNT(*) FROM inventory_apps a WHERE a.computer_id=i.computer_id) AS app_count
+    FROM inventory i JOIN computers c ON c.id=i.computer_id";
+
+/// The stored inventory of one computer.
+#[derive(Debug, Clone, Serialize)]
+pub struct Inventory {
+    pub computer_id: i64,
+    pub computer: String,
+    /// Time of the last successful scan (None = never succeeded).
+    pub scanned_at: Option<String>,
+    pub last_attempt: String,
+    /// "ok", "failed" or "offline" (of the last attempt)
+    pub status: String,
+    pub error: Option<String>,
+    pub facts: BTreeMap<String, String>,
+    pub disks: Vec<Disk>,
+    pub app_count: i64,
+    /// Filled only when asked for.
+    pub apps: Vec<InstalledApp>,
+}
+
+impl Inventory {
+    fn from_row(r: &Row) -> rusqlite::Result<Inventory> {
+        Ok(Inventory {
+            computer_id: r.get("computer_id")?,
+            computer: r.get("computer")?,
+            scanned_at: r.get("scanned_at")?,
+            last_attempt: r.get("last_attempt")?,
+            status: r.get("status")?,
+            error: r.get("error")?,
+            facts: json_col(r, "facts")?,
+            disks: json_col(r, "disks")?,
+            app_count: r.get("app_count")?,
+            apps: vec![],
+        })
+    }
 }
