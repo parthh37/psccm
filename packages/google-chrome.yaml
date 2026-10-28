@@ -1,0 +1,35 @@
+id: google-chrome
+name: Google Chrome
+category: Browsers
+description: >-
+  Install Google Chrome (Enterprise MSI on Windows, Google's package on Debian/Ubuntu/RHEL).
+  Computers that already have Chrome are skipped because Chrome updates itself;
+  untick "Skip computers that already have it" to force a reinstall.
+platforms: [windows, linux]
+detect:
+  windows: |
+    if (Test-AppInstalled -Name 'Google Chrome') { exit 0 }
+    exit 1
+  linux: command -v google-chrome >/dev/null 2>&1
+steps:
+  - name: Install Chrome Enterprise (64-bit MSI)
+    os: windows
+    install:
+      url: https://dl.google.com/chrome/install/googlechromestandaloneenterprise64.msi
+  - name: Install Chrome
+    os: linux
+    script: |
+      case "$(pkg_manager)" in
+        apt-get)
+          download https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb /tmp/psccm-chrome.deb
+          apt-get install -y /tmp/psccm-chrome.deb
+          rm -f /tmp/psccm-chrome.deb ;;
+        dnf|yum)
+          "$(pkg_manager)" install -y https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm ;;
+        *) echo "Unsupported distribution" >&2; exit 1 ;;
+      esac
+verify:
+  windows: |
+    if (Test-AppInstalled -Name 'Google Chrome') { exit 0 }
+    exit 1
+  linux: google-chrome --version

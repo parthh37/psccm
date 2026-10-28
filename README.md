@@ -1,0 +1,371 @@
+# PSCCM — lightweight agentless deployment manager
+
+[![CI](https://github.com/parthh37/psccm/actions/workflows/ci.yml/badge.svg)](https://github.com/parthh37/psccm/actions/workflows/ci.yml)
+[![Release](https://github.com/parthh37/psccm/actions/workflows/release.yml/badge.svg)](https://github.com/parthh37/psccm/releases)
+
+A single Rust executable that deploys software and runs changes on **Windows and Linux**
+computers without installing an agent, similar to PDQ Deploy.
+
+- **Windows** targets over **WinRM** (PowerShell remoting, Kerberos/NTLM, encrypted).
+- **Linux** targets over **SSH** (password or key, `sudo`), with host-key pinning.
+- **Active Directory** computer import that is **read-only**: it only runs LDAP searches.
+- **Computer groups**: static lists or dynamic rules (OS, name pattern, OU, AD security group, tag).
+- **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
+  apply their computer settings directly on chosen computers, with no GPO link or AD change.
+- **Web console** for everyday use, plus a **CLI** for scripts and CI pipelines.
+- **YAML packages** with detection, variables, conditions, retries, rollback, rolling
+  batches and steps delegated to another host (e.g. drain HAProxy while patching IIS).
+- **Windows installer** (Inno Setup) that runs PSCCM as a service, plus **auto-update** from
+  GitHub releases (SHA-256 verified).
+
+Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, IIS
+install, IIS site deploy, IIS app-pool recycle, IIS zero-downtime deploy behind HAProxy,
+HAProxy install/upgrade, HAProxy config deploy, HAProxy drain/ready, generic MSI/EXE
+install, Windows uninstall, Linux package install/remove/upgrade, Linux full update,
+and reboot.
+
+## Why not Ansible?
+
+The Ansible control node does not run on Windows (WSL only) and needs Python. PSCCM runs as
+one `.exe` on the admin box you already have and uses the remoting stack built into
+Windows. Being agentless, it needs nothing on the targets beyond WinRM or SSH.
+
+---
+
+## Install
+
+**Windows (recommended):** download `psccm-setup-<version>.exe` from
+[Releases](https://github.com/parthh37/psccm/releases) and run it. The setup asks for:
+
+- **Port** (default 8080).
+- **Network access**: this computer only, or other computers too. For network access a random
+  access token is generated and shown at the end.
+- **Service account**: the Windows account the `PSCCM` service runs as. Use a domain account that is
+  local admin on your targets (e.g. `CORP\svc-psccm`), so Windows deployments use Kerberos with no
+  stored password. Leave it empty for Local System and add a Windows credential in the console.
+
+Files go to `C:\Program Files\PSCCM`, data to `C:\ProgramData\PSCCM`. Upgrades keep the service
+account and settings.
+
+**Portable:** download `psccm-x86_64-windows.exe` (or build with `cargo build --release`), put it in a
+folder and double-click it. Data is kept in `data\` next to the executable and the console opens at
+<http://127.0.0.1:8080/>.
+
+**Linux console:** `psccm-x86_64-linux` plus [packaging/psccm.service](packaging/psccm.service) for systemd.
+Windows targets need a Windows console (PowerShell remoting); Linux targets work from either.
+
+| Data folder | What |
+|---|---|
+| `psccm.db` | Computers, groups, credentials (encrypted), history, schedules, settings |
+| `packages\` | Package YAML files (the built-ins are written here on first start) |
+| `repository\` | Installers and files that packages push (`install: file`, `copy: src`) |
+| `gpos\` | Imported Group Policy snapshots |
+| `psccm.log` | Service log |
+
+## First steps
+
+1. **Settings → Credentials.** If the service already runs as a domain admin-type account, Windows
+   needs no credential. Otherwise add a Windows credential (`CORP\deploy`) and tick *default for
+   Windows*. For Linux add an SSH credential (user with sudo) and tick *default for Linux*. Add
+   credentials **in the console**, so they are encrypted for the account that runs the service.
+2. **Computers → Add computers**, or **Import from AD**. Create **groups** for the sets you deploy to.
+3. **Deploy**: pick a package, pick groups, tags or computers, and press **Deploy**. Watch the live log
+   for each computer.
+
+### Network access without the installer
+
+The console only listens on `127.0.0.1` unless a token is set:
+
+```bash
+psccm serve --bind 0.0.0.0 --port 8080 --token "long-random-string"
+psccm service install --bind 0.0.0.0 --token "long-random-string" --account CORP\svc-psccm
+```
+
+For the second command, `PSCCM_SERVICE_PASSWORD` holds the account password; run it as administrator.
+
+## Preparing the targets
+
+**Windows** (one-time, best done by GPO):
+
+- *Computer Configuration → Administrative Templates → Windows Components → Windows Remote Management
+  → WinRM Service → Allow remote server management through WinRM* = Enabled
+- Service *WinRM* set to Automatic, and the firewall allowing TCP 5985 (or 5986 for HTTPS) from the console.
+- Or on a single machine: `Enable-PSRemoting -Force`.
+- Use FQDNs so Kerberos works. For IP addresses or non-domain machines, add them to the console's
+  `TrustedHosts` and use a credential, or switch on HTTPS in *Settings → Windows (WinRM)*.
+
+**Linux:**
+
+- SSH reachable on port 22 (or set a port on the computer).
+- A user with sudo. With password login the same password is used for sudo. With key login, sudo
+  must be `NOPASSWD` (or log in as root).
+- `bash` and `curl` or `wget`. Host keys are pinned on first connect; a changed key fails the
+  deployment until you *forget* it in Settings.
+
+## Active Directory (read-only)
+
+*Settings → Active Directory*. Two modes:
+
+- **Account running PSCCM** (Windows, recommended): uses ADSI with the console's own Kerberos
+  ticket. No password is stored, and it works with DCs that require LDAP signing.
+- **LDAP with a stored credential**: any normal domain user (`reader@corp.local`), over LDAPS 636 or
+  StartTLS. This also works when the console runs on Linux.
+
+PSCCM only performs LDAP **searches** for `objectCategory=computer`. No code path writes to AD, so the
+account needs no delegated rights. Options cover the OUs to search, an extra LDAP filter, skipping
+disabled or stale computers, tagging by OU (`OU=Web Servers` → tag `web-servers`) and auto-sync every N
+minutes. Imports add and refresh computers; they never delete any. Each computer's AD security group
+memberships are imported too, so they can drive dynamic groups.
+
+## Computer groups
+
+*Computers → Groups*. A group is either:
+
+- **Static**: a fixed list. Select computers and choose *Add to group*.
+- **Dynamic**: every computer that matches **all** of the rules you fill in: OS, name pattern
+  (`web*, app0?`), AD OU contains, OS version contains (`Server 2022`), AD security group, tag. It is
+  re-evaluated whenever it is used, so new computers from AD join automatically. The editor previews
+  the matching computers as you type.
+
+You can deploy and schedule to groups (and combine them with tags and single computers). CLI:
+`psccm deploy 7zip --group "Web farm"`, `psccm groups list`.
+
+## Group Policy (GPO) import and injection
+
+*Group Policy* page. PSCCM reads GPOs from AD (`groupPolicyContainer` objects and their `gPLink`
+links, read-only) and copies a GPO's folder from SYSVOL into a local snapshot. It can also import a
+**GPO backup folder** (GPMC *Back Up…* / `Backup-GPO`), which needs no AD access at all.
+
+Each imported GPO becomes a package `gpo-<name>-<id>` that applies the GPO's **computer settings
+directly on the computers you choose**. Nothing is linked or changed in AD. It covers:
+
+| GPO part | How it is applied |
+|---|---|
+| Administrative Templates / registry policies (`Machine\Registry.pol`), including `**del.` / `**delvals.` / `**soft.` | Written to `HKLM` |
+| Security settings (`GptTmpl.inf`: password/lockout policy, user rights, security options…) | `secedit /configure` with a separate database |
+| Advanced audit policy (`audit.csv`) | `auditpol /restore` |
+| Preferences, scripts, software installation, user settings | Listed as *not applied* |
+
+Deploy it like any package: once, to a group, or on a schedule to keep computers compliant
+(re-applying fixes drift). With the variable `mode=remove` the registry values the GPO sets are
+deleted again; security and audit settings are not reverted. *Re-import* refreshes the snapshot when
+the GPO changes in AD (the page shows outdated imports). CLI: `psccm gpo list`,
+`psccm gpo import <GUID>`, `psccm gpo import-folder <path>`.
+
+Reading SYSVOL uses the service account (Windows mode) or the AD credential (LDAP mode).
+
+---
+
+## Deploy options
+
+| Option | Meaning |
+|---|---|
+| Parallel computers | How many computers are worked on at the same time (default 10). |
+| Batch size | Rolling deployment. `1` = one computer at a time (HA pairs, web farms). `0` = all. |
+| Stop after failures | Don't start more computers once this many failed. `0` = stop at the first failure. |
+| Skip computers that already have it | Run the package's `detect` script first; exit 0 = skip. |
+| Start at | Run later (one-off). For repeats use **Schedules** (daily/weekly/interval). |
+
+Tags are resolved when a deployment starts, so a schedule on tag `web` picks up new web servers
+imported from AD.
+
+Failed computers can be re-run with **Redeploy to failed**. Logs, the variables used and a snapshot
+of the package are kept with each deployment.
+
+## CLI
+
+```text
+psccm serve [--bind IP] [--port N] [--token T] [--no-browser]
+psccm deploy <package> -t web01,web02 [--group "Web farm"] [--tag web] [-v version=22] [--batch-size 1] [--max-failures 0] [--force]
+psccm run web01,lb01 -s "Get-Service W3SVC"          # ad-hoc command (PowerShell / bash)
+psccm packages list | show <id> | validate <file.yaml>
+psccm computers list | add <names> [--os linux] [--tag web] | remove <names> | check
+psccm groups list | create <name> --computers a,b
+psccm ad sync [--import]
+psccm gpo list | import <GUID> | import-folder <path> [--name N]
+psccm cred add --name deploy --kind ssh --user deploy [--key ~/.ssh/id_ed25519] [--default-for linux]
+psccm update [--install]
+psccm service install [--bind IP] [--port N] [--token T] [--account DOMAIN\user] | uninstall
+psccm history
+```
+
+`deploy` and `run` wait for the result, print every computer's log and exit with `1` if any
+computer failed, so they can be used from CI/CD. Use `--data-dir` (or `PSCCM_DATA`) to point at the
+console's data folder.
+
+---
+
+## Writing packages
+
+Packages are YAML files in `data\packages\`. Edit them in the console (*Packages → package → Definition*),
+which validates before saving, or with any editor. `psccm packages validate file.yaml` checks a file.
+
+```yaml
+id: my-app                 # a-z 0-9 - _
+name: My App
+version: "2.1"
+category: Custom
+description: Install My App and restart its service.
+platforms: [windows]       # windows, linux or both (empty = both)
+
+variables:
+  version: { default: "2.1", description: Version to install }
+  license: { required: true, secret: true }      # secret = masked in logs/UI
+  edition: { default: std, options: [std, pro] } # dropdown
+
+detect:                    # exit 0 = already installed -> computer is skipped
+  windows: |
+    if (Test-AppInstalled -Name 'My App*' -MinVersion '{{version}}') { exit 0 }
+    exit 1
+
+steps:
+  - name: Install My App {{version}}
+    install:
+      file: apps/myapp-{{version}}.msi   # from data\repository (or url: https://...)
+      args: LICENSE={{license}} EDITION={{edition}}
+      sha256: 9f86d0...                  # optional integrity check
+
+  - name: Copy config
+    copy: { src: "apps/myapp.config", dest: 'C:\Program Files\MyApp\myapp.config' }
+
+  - name: Restart service
+    service: { name: MyAppSvc, action: restart }   # start | stop | restart
+
+  - name: Custom script
+    script: |
+      Write-Output "Hello from {{host}}"
+    shell: powershell      # powershell | cmd (Windows), bash | sh (Linux); default by OS
+
+  - name: Only on Server 2016
+    when: |                # step runs only if this exits 0
+      if ((Get-CimInstance Win32_OperatingSystem).Caption -like '*2016*') { exit 0 }; exit 1
+    script: ...
+
+  - name: Reboot
+    reboot: true           # reboots and waits until the computer is back
+
+  - name: Pause
+    wait: 30               # seconds
+
+  - name: Shared steps
+    include: other-package # run another package's steps (nested package)
+
+  - name: Drain on load balancer
+    delegate_to: "{{haproxy_host}}"   # run this step on another computer
+    os: linux
+    script: echo "set server web/{{host_short}} state drain" | socat stdio /run/haproxy/admin.sock
+
+verify:                    # after all steps; non-zero = failed
+  windows: if (Test-AppInstalled -Name 'My App*' -MinVersion '{{version}}') { exit 0 }; exit 1
+
+rollback:                  # runs (best effort) when a step or verify fails
+  - name: Restore backup
+    script: ...
+```
+
+**Every step** also accepts `os`, `when`, `timeout` (seconds, default 1800), `retries`,
+`retry_delay` (default 10), `success_codes` (default `[0]`; install steps also accept `3010` and `1641`),
+`continue_on_error` and `delegate_to`.
+
+**Install** on Windows: `.msi` runs `msiexec /i … /qn /norestart /l*v` (the MSI log tail is shown on
+failure), `.msp` runs `msiexec /p`, `.msu` runs `wusa /quiet /norestart`, and anything else is executed
+with `args`. On Linux: `.deb` uses `apt-get install`, `.rpm` uses `dnf/yum install`, and `.sh/.run`
+runs with bash.
+
+**Built-in variables:** `{{host}}`, `{{host_short}}` (first DNS label), `{{os}}`, `{{workdir}}` (a temp
+folder on the target, removed afterwards) and `{{deployment_id}}`. Variable defaults may use them
+(e.g. `default: "{{host_short}}"`).
+
+**Helpers available in every script.**
+
+PowerShell:
+
+- `Get-InstalledApp -Name 'Chrome*'`
+- `Test-AppInstalled -Name 'X*' -MinVersion 1.2`
+- `ConvertTo-PsccmVersion`
+- `Get-PsccmFile -Url -OutFile`
+- `Invoke-PsccmProcess -FilePath -Arguments` (returns the exit code)
+- `Uninstall-App -Name 'X*'`
+
+Scripts run with `$ErrorActionPreference = 'Stop'`, and the last native exit code is the step result.
+
+bash (runs with `set -eo pipefail`):
+
+- `pkg_manager`, `pkg_install pkgs…`, `pkg_installed pkg`
+- `version_ge A B`
+- `download URL FILE`
+- `backup_file FILE`
+
+## Typical jobs
+
+| Job | Package | Tip |
+|---|---|---|
+| New utility on all PCs | `7zip`, `google-chrome`, `notepad-plus-plus`, `install-msi`, `install-exe` | Target an AD tag; detect skips machines that already have it. |
+| Node.js upgrade | `nodejs` (`version` = `lts`, `22`, or `22.11.0`) | Set `restart_services` to restart your Node services. |
+| IIS server build | `iis-install` | `reboot_if_needed: yes` to finish in one go. |
+| Website release | `iis-site-deploy` | Zip in `repository\web\`; backups kept next to the site folder. |
+| Zero-downtime web farm release | `iis-rolling-deploy` | Batch size 1, Stop after failures 0. |
+| HAProxy upgrade | `haproxy-upgrade` | Batch size 1 on HA pairs; config backup restored on failure. |
+| HAProxy config change | `haproxy-config` | Validated with `haproxy -c` before it goes live. |
+| Patch Linux | `linux-update` | Use a weekly schedule. |
+
+## Security notes
+
+- The console binds to localhost unless a token is set. Anyone who can use the console can run commands
+  as admin on every managed computer, so protect it like a domain admin account.
+- Passwords are encrypted with DPAPI (Windows) and never returned by the API; secret variables are
+  masked in logs. On a Linux console, secrets are only base64-encoded, so prefer SSH keys there and keep
+  `data/` at mode 700.
+- WinRM over HTTP in a domain is encrypted by Kerberos. Use HTTPS for workgroup machines.
+- SSH host keys are pinned on first use (TOFU).
+- Updates are only installed when the download matches the release's `SHA256SUMS`.
+
+## Updates
+
+*Settings → Updates*. PSCCM checks the GitHub releases of `parthh37/psccm` once a day (configurable)
+and shows a notice in the sidebar when a newer version exists. **Install** downloads the new release
+and verifies its SHA-256. On Windows it then runs the setup silently: the setup stops the service,
+replaces the files and starts it again with the same account and settings. On Linux it replaces the
+binary and exits, so systemd restarts it. *Install updates automatically* does this unattended, but
+never while a deployment is running. CLI: `psccm update [--install]`.
+
+## Releases and release tests
+
+Push a tag `vX.Y.Z` (matching `Cargo.toml`). The [Release workflow](.github/workflows/release.yml):
+
+1. runs the tests and builds `psccm.exe`, the Inno Setup installer and the Linux binary;
+2. publishes a GitHub release with `SHA256SUMS`;
+3. **tests the published release** on fresh CI machines with
+   [tests/release-test.ps1](tests/release-test.ps1):
+   - **Windows:** silent install, service, upgrade in place, real WinRM deployments to the runner,
+     every step type, rollback, GPO apply/remove, 7-Zip, Node.js, IIS install + site deploy +
+     health check, and uninstall.
+   - **Linux:** SSH + sudo deployments, every step type, 7-Zip, Node.js, HAProxy install, config
+     deploy, rejected bad config with rollback, and drain/ready.
+4. attaches `test-report-windows.html` and `test-report-linux.html` to the release.
+
+Run the same tests yourself against test machines:
+
+```powershell
+./tests/release-test.ps1 -Setup .\psccm-setup-0.2.0.exe -WindowsTarget testsrv01 -RealInstalls
+pwsh ./tests/release-test.ps1 -Exe ./psccm-x86_64-linux -LinuxTarget 10.0.0.5 -LinuxUser deploy -LinuxPassword '...'
+```
+
+Results go to `test-report/report.html` (also `report.json` and `junit.xml`). `-RealInstalls`
+installs software and changes the targets, so use it on test machines only.
+
+## Development
+
+```bash
+cargo test        # unit tests, incl. every built-in script parsed by PowerShell and bash
+cargo run -- serve
+./tests/release-test.ps1 -Exe target/release/psccm.exe   # API/CLI tests without targets
+```
+
+In debug builds, setting `PSCCM_WINRM_LOCAL=1` runs "Windows" targets on the console itself without
+WinRM, which is useful to test packages on a dev box.
+
+Source map: `src/package.rs` (YAML format), `src/engine.rs` (deployment runner),
+`src/transport/` (WinRM, SSH), `src/ad.rs`, `src/gpo.rs`, `src/groups.rs`, `src/update.rs`,
+`src/service.rs`, `src/scheduler.rs`, `src/web.rs` (API), `web/` (UI), `installer/` (Inno Setup),
+`packages/` (built-ins).

@@ -1,0 +1,30 @@
+id: linux-update
+name: Linux - update all packages
+category: Generic
+description: Apply all available package updates (apt/dnf/yum/zypper) and optionally reboot when required.
+platforms: [linux]
+variables:
+  reboot_if_required:
+    default: "no"
+    options: ["no", "yes"]
+steps:
+  - name: Update packages
+    timeout: 3600
+    script: |
+      case "$(pkg_manager)" in
+        apt-get) apt-get update -q && apt-get -y -q -o Dpkg::Options::=--force-confold dist-upgrade ;;
+        dnf) dnf upgrade -y ;;
+        yum) yum update -y ;;
+        zypper) zypper --non-interactive update ;;
+        apk) apk upgrade ;;
+        *) echo "No supported package manager" >&2; exit 1 ;;
+      esac
+  - name: Reboot if required
+    when: |
+      [ '{{reboot_if_required}}' = yes ] || exit 1
+      if [ -f /var/run/reboot-required ]; then exit 0; fi
+      if command -v needs-restarting >/dev/null 2>&1; then
+        needs-restarting -r >/dev/null 2>&1 && exit 1 || exit 0
+      fi
+      exit 1
+    reboot: true

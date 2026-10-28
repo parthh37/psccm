@@ -1,0 +1,95 @@
+id: iis-site-deploy
+name: IIS - deploy website (zip)
+category: IIS
+description: >-
+  Deploy a zipped build to an IIS site: backs up the current files, stops the app pool,
+  extracts the zip, starts the app pool and optionally checks a health URL. Put the zip
+  in the repository folder (for example repository/web/myapp-1.4.zip).
+platforms: [windows]
+variables:
+  site:
+    required: true
+    description: IIS site name, e.g. Default Web Site
+  app_pool:
+    required: true
+    description: Application pool to stop/start
+  package:
+    required: true
+    description: Zip file in the repository, e.g. web/myapp-1.4.zip
+  path:
+    default: ""
+    description: Physical path; empty = the site's current physical path
+  clean:
+    default: "no"
+    options: ["no", "yes"]
+    description: Delete existing files before extracting (except the ones in 'preserve')
+  preserve:
+    default: web.config
+    description: Files/folders kept when clean=yes, comma separated
+  backup:
+    default: "yes"
+    options: ["yes", "no"]
+  keep_backups:
+    default: "5"
+    description: Number of backups to keep
+  health_url:
+    default: ""
+    description: Optional URL that must answer 2xx/3xx after deployment, e.g. http://localhost/health
+steps:
+  - name: Upload {{package}}
+    copy:
+      src: "{{package}}"
+      dest: '{{workdir}}\site.zip'
+  - name: Deploy to {{site}}
+    script: |
+      Import-Module WebAdministration
+      $site = '{{site}}'
+      $pool = '{{app_pool}}'
+      $path = '{{path}}'
+      if (-not (Test-Path "IIS:\Sites\$site")) { throw "IIS site '$site' not found" }
+      if (-not (Test-Path "IIS:\AppPools\$pool")) { throw "App pool '$pool' not found" }
+      if (-not $path) { $path = [Environment]::ExpandEnvironmentVariables((Get-Item "IIS:\Sites\$site").physicalPath) }
+      New-Item -ItemType Directory -Force -Path $path | Out-Null
+      $zip = Join-Path '{{workdir}}' 'site.zip'
+
+      if ('{{backup}}' -eq 'yes' -and (Get-ChildItem -LiteralPath $path -Force)) {
+          $bdir = "$path.backups"
+          New-Item -ItemType Directory -Force -Path $bdir | Out-Null
+          $b = Join-Path $bdir ('{0:yyyyMMdd-HHmmss}.zip' -f (Get-Date))
+          Compress-Archive -Path (Join-Path $path '*') -DestinationPath $b
+          Write-Output "Backup: $b"
+          Get-ChildItem $bdir -Filter *.zip | Sort-Object Name -Descending | Select-Object -Skip {{keep_backups}} | Remove-Item -Force
+      }
+
+      Write-Output "Stopping app pool $pool"
+      if ((Get-WebAppPoolState -Name $pool).Value -ne 'Stopped') { Stop-WebAppPool -Name $pool }
+      $deadline = (Get-Date).AddSeconds(90)
+      while ((Get-WebAppPoolState -Name $pool).Value -ne 'Stopped' -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+      try {
+          if ('{{clean}}' -eq 'yes') {
+              $keep = '{{preserve}}' -split '[,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+              Get-ChildItem -LiteralPath $path -Force | Where-Object { $keep -notcontains $_.Name } | Remove-Item -Recurse -Force
+          }
+          Expand-Archive -Path $zip -DestinationPath $path -Force
+          Write-Output "Extracted to $path"
+      } finally {
+          Start-WebAppPool -Name $pool
+      }
+      Write-Output "App pool ${pool}: $((Get-WebAppPoolState -Name $pool).Value)"
+verify:
+  windows: |
+    $url = '{{health_url}}'
+    if (-not $url) { exit 0 }
+    for ($i = 1; $i -le 12; $i++) {
+        try {
+            $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 20 -MaximumRedirection 0 -ErrorAction Stop
+            Write-Output "$url -> $($r.StatusCode)"
+            exit 0
+        } catch {
+            $code = $_.Exception.Response.StatusCode.value__
+            if ($code -ge 300 -and $code -lt 400) { Write-Output "$url -> $code"; exit 0 }
+            Write-Output "health check $i/12: $($_.Exception.Message)"
+            Start-Sleep -Seconds 5
+        }
+    }
+    exit 1

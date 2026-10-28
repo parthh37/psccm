@@ -1,0 +1,21 @@
+# systemd unit for running the PSCCM console on Linux.
+#   sudo install -m 755 psccm-x86_64-linux /usr/local/bin/psccm
+#   sudo useradd --system --home /var/lib/psccm --create-home psccm
+#   sudo cp psccm.service /etc/systemd/system/ && sudo systemctl enable --now psccm
+# Auto-update replaces /usr/local/bin/psccm, so that file must be writable by
+# the service user (or turn auto-install off and update with your own tooling).
+[Unit]
+Description=PSCCM deployment console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=psccm
+Environment=PSCCM_DATA=/var/lib/psccm
+ExecStart=/usr/local/bin/psccm serve --no-browser --bind 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

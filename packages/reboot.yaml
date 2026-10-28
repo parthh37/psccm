@@ -1,0 +1,9 @@
+id: reboot
+name: Reboot and wait
+category: Generic
+description: Restart the computer and wait until it is reachable again (Windows and Linux).
+platforms: [windows, linux]
+steps:
+  - name: Reboot
+    reboot: true
+    timeout: 1200

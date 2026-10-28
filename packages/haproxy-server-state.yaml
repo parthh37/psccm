@@ -1,0 +1,43 @@
+id: haproxy-server-state
+name: HAProxy - drain / enable a backend server
+category: HAProxy
+description: >-
+  Change a backend server's state through the HAProxy runtime API (stats socket):
+  drain (finish current sessions, no new ones), maint (out of rotation) or ready (back in
+  rotation). Deploy this to the HAProxy host. Needs "stats socket ... level admin" in
+  haproxy.cfg; socat is installed if missing.
+platforms: [linux]
+variables:
+  backend:
+    required: true
+    description: Backend name in haproxy.cfg
+  server:
+    required: true
+    description: Server name inside the backend
+  state:
+    default: drain
+    options: [drain, maint, ready]
+  socket:
+    default: /run/haproxy/admin.sock
+  wait_seconds:
+    default: "60"
+    description: When draining, wait up to this long for active sessions to reach 0
+steps:
+  - name: Set {{backend}}/{{server}} to {{state}}
+    script: |
+      command -v socat >/dev/null 2>&1 || pkg_install socat
+      sock='{{socket}}'
+      out=$(echo "set server {{backend}}/{{server}} state {{state}}" | socat stdio "unix-connect:$sock")
+      if [ -n "$out" ]; then echo "$out"; exit 1; fi
+      echo "{{backend}}/{{server}} -> {{state}}"
+      if [ '{{state}}' = drain ]; then
+        end=$(( $(date +%s) + {{wait_seconds}} ))
+        while :; do
+          stat=$(echo "show stat" | socat stdio "unix-connect:$sock")
+          cur=$(awk -F, -v b='{{backend}}' -v s='{{server}}' '$1==b && $2==s {print $5}' <<<"$stat")
+          echo "active sessions: ${cur:-?}"
+          [ "${cur:-0}" = 0 ] && break
+          [ "$(date +%s)" -ge "$end" ] && { echo "still ${cur} sessions after {{wait_seconds}}s, continuing"; break; }
+          sleep 3
+        done
+      fi

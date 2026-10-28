@@ -1,0 +1,107 @@
+id: nodejs
+name: Node.js (install / upgrade)
+category: Runtimes
+description: >-
+  Install or upgrade Node.js from nodejs.org. Version can be "lts" (latest LTS),
+  "latest", a major version like "22" (newest 22.x) or an exact version like "22.11.0".
+  Windows uses the official MSI. Linux unpacks the official tarball under
+  /usr/local/lib/nodejs and links node/npm/npx into /usr/local/bin. Old versions are
+  kept, so you can roll back by deploying again with the old version.
+platforms: [windows, linux]
+variables:
+  version:
+    default: lts
+    description: lts, latest, a major version (22) or an exact version (22.11.0)
+  restart_services:
+    default: ""
+    description: Services to restart after the upgrade, comma separated (e.g. MyNodeApp or pm2-root)
+detect:
+  windows: |
+    $want = '{{version}}'
+    $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing
+    if ($want -eq 'lts') { $rel = $index | Where-Object { $_.lts } | Select-Object -First 1 }
+    elseif ($want -eq 'latest') { $rel = $index | Select-Object -First 1 }
+    elseif ($want -match '^\d+$') { $rel = $index | Where-Object { $_.version -like "v$want.*" } | Select-Object -First 1 }
+    else { $rel = $index | Where-Object { $_.version -eq "v$($want.TrimStart('v'))" } | Select-Object -First 1 }
+    if (-not $rel) { Write-Output "Node.js version '$want' not found on nodejs.org"; exit 1 }
+    $node = Join-Path $env:ProgramFiles 'nodejs\node.exe'
+    $cur = if (Test-Path $node) { (& $node -v) } else { 'none' }
+    Write-Output "installed: $cur, wanted: $($rel.version)"
+    if ($cur -eq $rel.version) { exit 0 }
+    exit 1
+  linux: |
+    want='{{version}}'
+    idx=$(curl -fsSL https://nodejs.org/dist/index.tab)
+    case "$want" in
+      lts) v=$(awk -F'\t' 'NR>1 && $10!="-" {print $1; exit}' <<<"$idx") ;;
+      latest) v=$(awk -F'\t' 'NR>1 {print $1; exit}' <<<"$idx") ;;
+      *[!0-9]*) v="v${want#v}" ;;
+      *) v=$(awk -F'\t' -v m="v$want." 'NR>1 && index($1,m)==1 {print $1; exit}' <<<"$idx") ;;
+    esac
+    cur=$(/usr/local/bin/node -v 2>/dev/null || echo none)
+    echo "installed: $cur, wanted: $v"
+    [ -n "$v" ] && [ "$cur" = "$v" ]
+steps:
+  - name: Install Node.js (Windows MSI)
+    os: windows
+    script: |
+      $want = '{{version}}'
+      $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing
+      if ($want -eq 'lts') { $rel = $index | Where-Object { $_.lts } | Select-Object -First 1 }
+      elseif ($want -eq 'latest') { $rel = $index | Select-Object -First 1 }
+      elseif ($want -match '^\d+$') { $rel = $index | Where-Object { $_.version -like "v$want.*" } | Select-Object -First 1 }
+      else { $rel = $index | Where-Object { $_.version -eq "v$($want.TrimStart('v'))" } | Select-Object -First 1 }
+      if (-not $rel) { throw "Node.js version '$want' not found on nodejs.org" }
+      $v = $rel.version
+      $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+      $f = Join-Path '{{workdir}}' "node-$v-$arch.msi"
+      Get-PsccmFile -Url "https://nodejs.org/dist/$v/node-$v-$arch.msi" -OutFile $f
+      exit (Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "/i `"$f`" /qn /norestart")
+    success_codes: [0, 3010]
+  - name: Install Node.js (Linux tarball)
+    os: linux
+    script: |
+      want='{{version}}'
+      idx=$(curl -fsSL https://nodejs.org/dist/index.tab)
+      case "$want" in
+        lts) v=$(awk -F'\t' 'NR>1 && $10!="-" {print $1; exit}' <<<"$idx") ;;
+        latest) v=$(awk -F'\t' 'NR>1 {print $1; exit}' <<<"$idx") ;;
+        *[!0-9]*) v="v${want#v}" ;;
+        *) v=$(awk -F'\t' -v m="v$want." 'NR>1 && index($1,m)==1 {print $1; exit}' <<<"$idx") ;;
+      esac
+      [ -n "$v" ] || { echo "Node.js version '$want' not found on nodejs.org" >&2; exit 1; }
+      case "$(uname -m)" in
+        x86_64) a=x64 ;;
+        aarch64|arm64) a=arm64 ;;
+        *) echo "Unsupported CPU $(uname -m)" >&2; exit 1 ;;
+      esac
+      dir=/usr/local/lib/nodejs
+      mkdir -p "$dir"
+      tmp=$(mktemp -d)
+      download "https://nodejs.org/dist/$v/node-$v-linux-$a.tar.gz" "$tmp/node.tar.gz"
+      tar -xzf "$tmp/node.tar.gz" -C "$dir"
+      rm -rf "$tmp"
+      for b in node npm npx corepack; do
+        if [ -e "$dir/node-$v-linux-$a/bin/$b" ]; then ln -sfn "$dir/node-$v-linux-$a/bin/$b" "/usr/local/bin/$b"; fi
+      done
+      echo "Node.js $v installed in $dir/node-$v-linux-$a"
+  - name: Restart dependent services
+    os: linux
+    when: |
+      [ -n '{{restart_services}}' ]
+    script: |
+      for s in $(echo '{{restart_services}}' | tr ',;' '  '); do systemctl restart "$s"; echo "restarted $s"; done
+  - name: Restart dependent services
+    os: windows
+    when: |
+      if ('{{restart_services}}'.Trim()) { exit 0 }
+      exit 1
+    script: |
+      foreach ($n in ('{{restart_services}}' -split '[,; ]+' | Where-Object { $_ })) {
+          Restart-Service -Name $n -Force
+          Write-Output "restarted $n"
+      }
+verify:
+  windows: |
+    & (Join-Path $env:ProgramFiles 'nodejs\node.exe') -v
+  linux: /usr/local/bin/node -v && /usr/local/bin/npm -v

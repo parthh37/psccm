@@ -1,0 +1,51 @@
+id: haproxy-config
+name: HAProxy - deploy configuration
+category: HAProxy
+description: >-
+  Push haproxy.cfg from the repository, validate it with "haproxy -c" BEFORE it replaces
+  the live file, back up the old file and reload. A config that fails validation never
+  goes live; if the reload fails the backup is restored.
+platforms: [linux]
+variables:
+  source:
+    default: haproxy/haproxy.cfg
+    description: Config file in the repository folder
+  config:
+    default: /etc/haproxy/haproxy.cfg
+    description: Live config path on the server
+steps:
+  - name: Upload new configuration
+    copy:
+      src: "{{source}}"
+      dest: "{{config}}.psccm-new"
+  - name: Validate new configuration
+    script: haproxy -c -f '{{config}}.psccm-new'
+  - name: Show changes
+    continue_on_error: true
+    script: |
+      diff -u '{{config}}' '{{config}}.psccm-new' || true
+  - name: Back up and activate
+    script: |
+      cfg='{{config}}'
+      cp -a "$cfg" "$cfg.psccm-{{deployment_id}}"
+      echo "backup: $cfg.psccm-{{deployment_id}}"
+      # Write in place so ownership and permissions of the live file are kept.
+      cat "$cfg.psccm-new" > "$cfg"
+      rm -f "$cfg.psccm-new"
+  - name: Reload HAProxy
+    script: |
+      systemctl reload haproxy
+      sleep 2
+      systemctl is-active haproxy
+rollback:
+  - name: Restore previous configuration
+    script: |
+      cfg='{{config}}'
+      rm -f "$cfg.psccm-new"
+      if [ -f "$cfg.psccm-{{deployment_id}}" ]; then
+        cat "$cfg.psccm-{{deployment_id}}" > "$cfg"
+        echo "restored previous config"
+        systemctl reload haproxy || systemctl restart haproxy
+      fi
+verify:
+  linux: systemctl is-active haproxy

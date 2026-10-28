@@ -1,0 +1,82 @@
+id: iis-rolling-deploy
+name: IIS - zero-downtime deploy behind HAProxy
+category: IIS
+description: >-
+  For web farms behind HAProxy. For each IIS server: drain it on the HAProxy host, deploy
+  the zip (iis-site-deploy), check health, put it back in rotation. Deploy with "Batch
+  size" 1 and "Stop after failures" 0 so only one server is out at a time and a broken
+  build stops the rollout. A server whose deployment fails stays drained.
+platforms: [windows]
+variables:
+  haproxy_host:
+    required: true
+    description: HAProxy computer (must be in the computer list with an SSH credential)
+  backend:
+    required: true
+    description: HAProxy backend name
+  server_name:
+    default: "{{host_short}}"
+    description: Server name in the backend; {{host_short}} = the IIS computer's short name
+  socket:
+    default: /run/haproxy/admin.sock
+  site:
+    required: true
+  app_pool:
+    required: true
+  package:
+    required: true
+    description: Zip file in the repository
+  path:
+    default: ""
+  clean:
+    default: "no"
+    options: ["no", "yes"]
+  preserve:
+    default: web.config
+  backup:
+    default: "yes"
+    options: ["yes", "no"]
+  keep_backups:
+    default: "5"
+  health_url:
+    default: http://localhost/
+    description: Checked on the IIS server before it goes back into rotation
+steps:
+  - name: Drain {{host_short}} on HAProxy
+    delegate_to: "{{haproxy_host}}"
+    os: linux
+    script: |
+      command -v socat >/dev/null 2>&1 || pkg_install socat
+      srv='{{server_name}}'
+      out=$(echo "set server {{backend}}/$srv state drain" | socat stdio unix-connect:'{{socket}}')
+      [ -z "$out" ] || { echo "$out"; exit 1; }
+      for i in $(seq 1 30); do
+        cur=$(echo "show stat" | socat stdio unix-connect:'{{socket}}' | awk -F, -v b='{{backend}}' -v s="$srv" '$1==b && $2==s {print $5}')
+        echo "active sessions on $srv: ${cur:-?}"
+        [ "${cur:-0}" = 0 ] && break
+        sleep 3
+      done
+  - name: Deploy site
+    include: iis-site-deploy
+  - name: Health check
+    script: |
+      $url = '{{health_url}}'
+      for ($i = 1; $i -le 12; $i++) {
+          try {
+              $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+              Write-Output "$url -> $($r.StatusCode)"
+              exit 0
+          } catch {
+              Write-Output "attempt ${i}: $($_.Exception.Message)"
+              Start-Sleep -Seconds 5
+          }
+      }
+      exit 1
+  - name: Put {{host_short}} back into rotation
+    delegate_to: "{{haproxy_host}}"
+    os: linux
+    script: |
+      srv='{{server_name}}'
+      out=$(echo "set server {{backend}}/$srv state ready" | socat stdio unix-connect:'{{socket}}')
+      [ -z "$out" ] || { echo "$out"; exit 1; }
+      echo "{{backend}}/$srv is ready"

@@ -1,0 +1,30 @@
+id: iis-apppool-recycle
+name: IIS - recycle app pools / restart IIS
+category: IIS
+description: Recycle one or more application pools, or restart all of IIS with iisreset.
+platforms: [windows]
+variables:
+  action:
+    default: recycle
+    options: [recycle, iisreset]
+  pools:
+    default: ""
+    description: App pools to recycle, comma separated (ignored for iisreset)
+steps:
+  - name: Recycle app pools
+    when: |
+      if ('{{action}}' -eq 'recycle') { exit 0 }
+      exit 1
+    script: |
+      Import-Module WebAdministration
+      $pools = '{{pools}}' -split '[,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+      if (-not $pools) { throw 'Enter at least one app pool' }
+      foreach ($p in $pools) {
+          Restart-WebAppPool -Name $p
+          Write-Output "recycled ${p}: $((Get-WebAppPoolState -Name $p).Value)"
+      }
+  - name: Restart IIS
+    when: |
+      if ('{{action}}' -eq 'iisreset') { exit 0 }
+      exit 1
+    script: iisreset.exe /restart

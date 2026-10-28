@@ -1,0 +1,609 @@
+//! PSCCM - lightweight, agentless deployment manager for Windows and Linux.
+
+mod ad;
+mod app;
+mod db;
+mod engine;
+mod gpo;
+mod groups;
+mod package;
+mod scheduler;
+mod secrets;
+mod service;
+mod transport;
+mod update;
+mod web;
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+
+use crate::app::{App, Ctx};
+use crate::db::{DeployOptions, NewComputer, NewCredential, TargetSpec};
+use crate::package::{Package, Shell};
+
+
+#[derive(Parser)]
+#[command(name = "psccm", version, about = "Agentless deployment manager for Windows (WinRM) and Linux (SSH)")]
+struct Cli {
+    /// Data folder (database, packages, repository). Default: "data" next to the executable.
+    #[arg(long, env = "PSCCM_DATA", global = true)]
+    data_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Start the web console (default when no command is given).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Required when binding to a non-loopback address.
+        #[arg(long, env = "PSCCM_TOKEN")]
+        token: Option<String>,
+        /// Do not open the browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Deploy a package and wait for the result (exit code 1 if any target failed).
+    Deploy {
+        package: String,
+        /// Computer names, comma separated.
+        #[arg(short, long, value_delimiter = ',')]
+        targets: Vec<String>,
+        /// Computer tags, comma separated ("*" = all computers).
+        #[arg(long, value_delimiter = ',')]
+        tag: Vec<String>,
+        /// Computer groups, comma separated.
+        #[arg(short, long, value_delimiter = ',')]
+        group: Vec<String>,
+        /// Package variables: -v version=22.11.0
+        #[arg(short = 'v', long = "var")]
+        vars: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        concurrency: usize,
+        /// Rolling deployment: computers per batch.
+        #[arg(long, default_value_t = 0)]
+        batch_size: usize,
+        /// Stop starting new computers after this many failures.
+        #[arg(long)]
+        max_failures: Option<usize>,
+        /// Ignore the package's detect check and always run the steps.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run an ad-hoc command on computers.
+    Run {
+        #[arg(required = true, value_delimiter = ',')]
+        targets: Vec<String>,
+        #[arg(short, long)]
+        script: String,
+        /// powershell, cmd, bash or sh (default: by OS)
+        #[arg(long)]
+        shell: Option<String>,
+    },
+    /// Manage packages.
+    Packages {
+        #[command(subcommand)]
+        cmd: PackagesCmd,
+    },
+    /// Manage the computer list.
+    Computers {
+        #[command(subcommand)]
+        cmd: ComputersCmd,
+    },
+    /// Active Directory (read-only).
+    Ad {
+        #[command(subcommand)]
+        cmd: AdCmd,
+    },
+    /// Manage stored credentials.
+    Cred {
+        #[command(subcommand)]
+        cmd: CredCmd,
+    },
+    /// Computer groups.
+    Groups {
+        #[command(subcommand)]
+        cmd: GroupsCmd,
+    },
+    /// Group Policy objects from AD (read-only import).
+    Gpo {
+        #[command(subcommand)]
+        cmd: GpoCmd,
+    },
+    /// Check for (and optionally install) a newer PSCCM release.
+    Update {
+        #[arg(long)]
+        install: bool,
+    },
+    /// Windows service management.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Recent deployments.
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupsCmd {
+    /// List groups and their members.
+    List,
+    /// Create a static group with the given computers.
+    Create {
+        name: String,
+        #[arg(long, value_delimiter = ',')]
+        computers: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GpoCmd {
+    /// List GPOs in the domain.
+    List,
+    /// Import a GPO (by GUID) and create its package.
+    Import { guid: String },
+    /// Import a GPO backup / GPO folder from disk (no AD needed).
+    ImportFolder {
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Register and start the PSCCM Windows service (run as administrator).
+    Install {
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Access token (required when binding to a non-loopback address).
+        #[arg(long, env = "PSCCM_TOKEN")]
+        token: Option<String>,
+        /// Run the service as this account (e.g. CORP\svc-psccm); password from PSCCM_SERVICE_PASSWORD.
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Stop and remove the service.
+    Uninstall,
+    /// Used by the service manager.
+    #[command(hide = true)]
+    Run,
+}
+
+#[derive(Subcommand)]
+enum PackagesCmd {
+    List,
+    Show { id: String },
+    /// Check a package file for mistakes.
+    Validate { file: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum ComputersCmd {
+    List,
+    Add {
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// windows or linux (detected automatically when omitted)
+        #[arg(long)]
+        os: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        tag: Vec<String>,
+    },
+    Remove {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Check which computers are reachable.
+    Check,
+}
+
+#[derive(Subcommand)]
+enum AdCmd {
+    /// List computers in AD; with --import add them to the computer list.
+    Sync {
+        #[arg(long)]
+        import: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredCmd {
+    List,
+    /// Add a credential; the password is prompted (or read from PSCCM_SECRET).
+    Add {
+        #[arg(long)]
+        name: String,
+        /// windows, ssh or ldap
+        #[arg(long)]
+        kind: String,
+        /// DOMAIN\user or user@domain (windows/ldap), login name (ssh).
+        /// Empty windows user = the account running the console.
+        #[arg(long, default_value = "")]
+        user: String,
+        /// SSH private key file (the prompted secret is its passphrase).
+        #[arg(long)]
+        key: Option<String>,
+        /// Make this the default credential for "windows" or "linux" computers.
+        #[arg(long)]
+        default_for: Option<String>,
+        /// Don't prompt for a secret.
+        #[arg(long)]
+        no_secret: bool,
+    },
+    Remove { name: String },
+}
+
+/// "data" next to the executable (portable), or %ProgramData%\PSCCM when
+/// installed with the setup program.
+pub fn default_data_dir() -> PathBuf {
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if let Some(d) = &exe_dir
+        && (d.join("data").is_dir() || !d.join("unins000.exe").exists()) {
+            return d.join("data");
+        }
+    match std::env::var_os("ProgramData") {
+        Some(pd) => PathBuf::from(pd).join("PSCCM"),
+        None => PathBuf::from("data"),
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+    let is_service = matches!(cli.command, Some(Cmd::Service { cmd: ServiceCmd::Run }));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "psccm=info,warn".into());
+    if is_service {
+        // No console for a service: log to data\psccm.log.
+        let _ = std::fs::create_dir_all(&data_dir);
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(data_dir.join("psccm.log"));
+        match log {
+            Ok(f) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
+            Err(_) => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        }
+        if let Err(e) = service::run(data_dir) {
+            tracing::error!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    if let Err(e) = rt.block_on(real_main(cli, data_dir)) {
+        eprintln!("error: {e:#}");
+        std::process::exit(2);
+    }
+}
+
+async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
+    let app = Ctx::open(&data_dir)?;
+    let command = cli.command.unwrap_or(Cmd::Serve {
+        bind: "127.0.0.1".into(),
+        port: 8080,
+        token: std::env::var("PSCCM_TOKEN").ok(),
+        no_browser: false,
+    });
+    match command {
+        Cmd::Serve { bind, port, token, no_browser } => {
+            let addr: std::net::SocketAddr = format!("{bind}:{port}").parse().context("invalid --bind/--port")?;
+            app.db.fail_interrupted()?;
+            scheduler::spawn(app.clone());
+            let url = format!("http://{}:{port}/", if addr.ip().is_unspecified() { "localhost".into() } else { bind.clone() });
+            println!("PSCCM console: {url}");
+            println!("Data folder:   {}", app.data_dir.display());
+            if !no_browser {
+                open_browser(&url);
+            }
+            let shutdown = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+            web::serve(app, addr, token.filter(|t| !t.is_empty()), shutdown).await
+        }
+        Cmd::Service { cmd } => match cmd {
+            ServiceCmd::Install { bind, port, token, account } => {
+                let token = token.filter(|t| !t.is_empty());
+                let ip: std::net::IpAddr = bind.parse().context("invalid --bind")?;
+                if !ip.is_loopback() && token.is_none() {
+                    bail!("binding to {bind} needs --token");
+                }
+                app.db.set_setting("server", &service::ServerSettings { bind, port, token })?;
+                let password = std::env::var("PSCCM_SERVICE_PASSWORD").ok();
+                service::install(&app.data_dir, account, password)?;
+                println!("Service '{}' installed and started (data: {})", service::SERVICE_NAME, app.data_dir.display());
+                Ok(())
+            }
+            ServiceCmd::Uninstall => {
+                service::uninstall()?;
+                println!("Service removed");
+                Ok(())
+            }
+            ServiceCmd::Run => bail!("'service run' is started by the Windows service manager"),
+        },
+        Cmd::Update { install } => {
+            let r = update::check(&app).await?;
+            println!("Installed: {}   Latest: {} ({})", update::CURRENT, r.version, r.url);
+            if !r.newer {
+                println!("Up to date.");
+            } else if install {
+                println!("{}", update::install(&app).await?);
+            } else {
+                println!("A newer version is available; run 'psccm update --install'.");
+            }
+            Ok(())
+        }
+        Cmd::Groups { cmd } => match cmd {
+            GroupsCmd::List => {
+                let all = app.db.list_computers()?;
+                for g in app.db.list_groups()? {
+                    let m: Vec<&str> = groups::members(&g, &all).iter().map(|c| c.name.as_str()).collect();
+                    println!("{:<24} {:<8} {:>4}  {}", g.name, g.kind, m.len(), m.join(", "));
+                }
+                Ok(())
+            }
+            GroupsCmd::Create { name, computers } => {
+                let id = app.db.save_group(&db::Group {
+                    id: 0,
+                    name,
+                    description: String::new(),
+                    kind: "static".into(),
+                    rules: Default::default(),
+                    members: vec![],
+                })?;
+                let n = app.db.set_group_members(id, &computers, true)?;
+                println!("Group created with {n} computer(s)");
+                Ok(())
+            }
+        },
+        Cmd::Gpo { cmd } => match cmd {
+            GpoCmd::List => {
+                for g in gpo::list(&app).await? {
+                    let imported = g.imported.as_ref().map(|m| format!("imported v{}", m.computer_version)).unwrap_or_default();
+                    println!("{{{}}}  v{:<5} {:<45} {}", g.guid, g.computer_version, g.name, imported);
+                }
+                Ok(())
+            }
+            GpoCmd::ImportFolder { path, name } => {
+                let m = gpo::import_folder(&app, &path, name)?;
+                println!("Imported '{}' as package '{}' ({} registry settings)", m.name, m.package_id, m.machine_settings);
+                Ok(())
+            }
+            GpoCmd::Import { guid } => {
+                let m = gpo::import(&app, &guid).await?;
+                println!("Imported '{}' as package '{}': {} registry settings, security: {}, audit: {}", m.name, m.package_id, m.machine_settings, m.has_security, m.has_audit);
+                for u in &m.unsupported {
+                    println!("  not applied: {u}");
+                }
+                Ok(())
+            }
+        },
+        Cmd::Deploy { package, targets, tag, group, vars, concurrency, batch_size, max_failures, force } => {
+            let lib = app.library()?;
+            let pkg = lib.packages.get(&package).ok_or_else(|| anyhow!("package '{package}' not found"))?;
+            let options = DeployOptions { concurrency, batch_size, max_failures, use_detect: !force };
+            let spec = TargetSpec { computers: targets, tags: tag, groups: group };
+            let id = engine::create_deployment(&app, pkg, parse_vars(&vars)?, spec, options, "cli", None)?;
+            run_and_report(&app, &id).await
+        }
+        Cmd::Run { targets, script, shell } => {
+            let shell = shell.map(|s| parse_shell(&s)).transpose()?;
+            let pkg = engine::adhoc_package(&script, shell)?;
+            let spec = TargetSpec { computers: targets, ..Default::default() };
+            let id = engine::create_deployment(&app, &pkg, BTreeMap::new(), spec, DeployOptions::default(), "cli", None)?;
+            run_and_report(&app, &id).await
+        }
+        Cmd::Packages { cmd } => packages_cmd(&app, cmd),
+        Cmd::Computers { cmd } => computers_cmd(&app, cmd).await,
+        Cmd::Ad { cmd: AdCmd::Sync { import } } => {
+            let settings: ad::AdSettings = app.db.get_setting("ad")?;
+            if import {
+                println!("Imported {} computers from AD", ad::sync(&app).await?);
+            } else {
+                let list = ad::fetch(&app, &settings).await?;
+                for c in &list {
+                    println!(
+                        "{:<40} {:<35} {:<6} {}",
+                        c.name,
+                        c.os,
+                        if c.exists { "known" } else { "new" },
+                        c.last_logon.as_deref().unwrap_or("-")
+                    );
+                }
+                println!("{} computers (run with --import to add them)", list.len());
+            }
+            Ok(())
+        }
+        Cmd::Cred { cmd } => cred_cmd(&app, cmd),
+        Cmd::History { limit } => {
+            for d in app.db.list_deployments(limit)? {
+                println!(
+                    "{}  {:<10} {:<30} ok {:>3}  skip {:>3}  fail {:>3}  {}",
+                    &d.created_at[..16.min(d.created_at.len())],
+                    d.status,
+                    d.package_name,
+                    d.n_success,
+                    d.n_skipped,
+                    d.n_failed,
+                    &d.id[..8]
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_vars(vars: &[String]) -> Result<BTreeMap<String, String>> {
+    vars.iter()
+        .map(|v| {
+            v.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.to_string()))
+                .ok_or_else(|| anyhow!("variable '{v}' must look like name=value"))
+        })
+        .collect()
+}
+
+fn parse_shell(s: &str) -> Result<Shell> {
+    serde_json::from_value(serde_json::Value::String(s.to_lowercase()))
+        .map_err(|_| anyhow!("shell must be powershell, cmd, bash or sh"))
+}
+
+async fn run_and_report(app: &App, id: &str) -> Result<()> {
+    println!("Deployment {}", &id[..8]);
+    let status = engine::run_deployment(app, id).await?;
+    let mut failed = false;
+    for t in app.db.list_targets(id, true)? {
+        println!("\n=== {} [{}] {}", t.computer, t.status.to_uppercase(), t.error.as_deref().unwrap_or(""));
+        print!("{}", t.log);
+        failed |= matches!(t.status.as_str(), "failed" | "offline" | "cancelled");
+    }
+    println!("\nResult: {status}");
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn packages_cmd(app: &App, cmd: PackagesCmd) -> Result<()> {
+    match cmd {
+        PackagesCmd::List => {
+            let lib = app.library()?;
+            let mut list: Vec<&Package> = lib.packages.values().collect();
+            list.sort_by(|a, b| a.id.cmp(&b.id));
+            for p in list {
+                let platforms: Vec<&str> = p.platforms.iter().map(|o| o.as_str()).collect();
+                println!("{:<24} {:<36} {}", p.id, p.name, platforms.join(","));
+            }
+            for (file, err) in &lib.errors {
+                eprintln!("BROKEN {file}: {err}");
+            }
+            Ok(())
+        }
+        PackagesCmd::Show { id } => {
+            let lib = app.library()?;
+            let file = lib.files.get(&id).ok_or_else(|| anyhow!("package '{id}' not found"))?;
+            print!("{}", std::fs::read_to_string(file)?);
+            Ok(())
+        }
+        PackagesCmd::Validate { file } => {
+            let p = Package::from_yaml(&std::fs::read_to_string(&file)?)?;
+            println!("OK: '{}' ({}), {} steps", p.name, p.id, p.steps.len());
+            Ok(())
+        }
+    }
+}
+
+async fn computers_cmd(app: &App, cmd: ComputersCmd) -> Result<()> {
+    match cmd {
+        ComputersCmd::List => {
+            for c in app.db.list_computers()? {
+                let online = match c.online {
+                    Some(true) => "online",
+                    Some(false) => "offline",
+                    None => "-",
+                };
+                println!("{:<40} {:<8} {:<8} {:<6} {}", c.name, c.os, online, c.source, c.tags.join(","));
+            }
+            Ok(())
+        }
+        ComputersCmd::Add { names, os, tag } => {
+            if let Some(o) = &os
+                && o != "windows" && o != "linux" {
+                    bail!("--os must be windows or linux");
+                }
+            for n in &names {
+                app.db.upsert_computer(&NewComputer {
+                    name: n.clone(),
+                    os: os.clone(),
+                    tags: Some(tag.clone()),
+                    ..Default::default()
+                })?;
+            }
+            println!("Added {} computer(s)", names.len());
+            Ok(())
+        }
+        ComputersCmd::Remove { names } => {
+            let ids: Vec<i64> = names
+                .iter()
+                .filter_map(|n| app.db.get_computer(n).ok().flatten().map(|c| c.id))
+                .collect();
+            app.db.delete_computers(&ids)?;
+            println!("Removed {} computer(s)", ids.len());
+            Ok(())
+        }
+        ComputersCmd::Check => {
+            let mut res = engine::check_online(app, None).await?;
+            res.sort();
+            for (name, online) in &res {
+                println!("{:<40} {}", name, if *online { "online" } else { "OFFLINE" });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cred_cmd(app: &App, cmd: CredCmd) -> Result<()> {
+    match cmd {
+        CredCmd::List => {
+            for c in app.db.list_credentials()? {
+                println!(
+                    "{:<20} {:<8} {:<30} {}",
+                    c.name,
+                    c.kind,
+                    if c.username.is_empty() { "(console user)" } else { &c.username },
+                    c.default_for.map(|d| format!("default for {d}")).unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        CredCmd::Add { name, kind, user, key, default_for, no_secret } => {
+            let secret = if no_secret {
+                None
+            } else if let Ok(s) = std::env::var("PSCCM_SECRET") {
+                Some(s)
+            } else {
+                let prompt = if key.is_some() { "Key passphrase (empty for none): " } else { "Password: " };
+                Some(rpassword::prompt_password(prompt)?)
+            };
+            app.db.add_credential(&NewCredential {
+                name,
+                kind,
+                username: user,
+                secret,
+                key_path: key,
+                default_for,
+            })?;
+            println!("Saved");
+            Ok(())
+        }
+        CredCmd::Remove { name } => {
+            let c = app
+                .db
+                .list_credentials()?
+                .into_iter()
+                .find(|c| c.name == name)
+                .ok_or_else(|| anyhow!("credential '{name}' not found"))?;
+            app.db.delete_credential(c.id)?;
+            println!("Removed");
+            Ok(())
+        }
+    }
+}
+
+fn open_browser(url: &str) {
+    #[cfg(windows)]
+    let r = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(not(windows))]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    let _ = r;
+}

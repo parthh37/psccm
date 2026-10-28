@@ -1,0 +1,31 @@
+id: install-msi
+name: Install any MSI (from repository)
+category: Generic
+description: >-
+  Push an MSI from the repository folder and install it silently (/qn /norestart is
+  added automatically). Fill in "Detect name" to skip computers that already have it.
+platforms: [windows]
+variables:
+  file:
+    required: true
+    description: MSI path inside the repository, e.g. apps/vcredist.msi
+  args:
+    default: ""
+    description: Extra msiexec arguments or properties, e.g. ALLUSERS=1 INSTALLDIR="D:\App"
+  detect_name:
+    default: ""
+    description: Optional installed-program name (wildcards ok) used to skip computers that have it
+  detect_version:
+    default: ""
+    description: Optional minimum version for the detect check
+detect:
+  windows: |
+    $name = '{{detect_name}}'
+    if (-not $name) { exit 1 }
+    if (Test-AppInstalled -Name $name -MinVersion '{{detect_version}}') { exit 0 }
+    exit 1
+steps:
+  - name: Install {{file}}
+    install:
+      file: "{{file}}"
+      args: "{{args}}"

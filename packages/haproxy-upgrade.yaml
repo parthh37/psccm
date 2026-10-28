@@ -1,0 +1,84 @@
+id: haproxy-upgrade
+name: HAProxy - install / upgrade
+category: HAProxy
+description: >-
+  Install or upgrade HAProxy from the configured package repositories (apt/dnf/yum),
+  keeping the existing configuration. The config is backed up and validated, then
+  HAProxy is reloaded (no dropped connections). If anything fails the config backup is
+  restored. Run with "Batch size" 1 on HA pairs so one node keeps serving.
+platforms: [linux]
+variables:
+  version:
+    default: ""
+    description: Version to install, e.g. 2.8.5 (empty = newest available in the repositories)
+  config:
+    default: /etc/haproxy/haproxy.cfg
+  restart_mode:
+    default: reload
+    options: [reload, restart]
+    description: reload keeps existing connections; restart is a hard restart
+detect:
+  linux: |
+    [ -n '{{version}}' ] || exit 1
+    command -v haproxy >/dev/null 2>&1 || exit 1
+    out=$(haproxy -v 2>/dev/null || true)
+    cur=$(awk 'NR==1 {for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+/) {print $i; exit}}' <<<"$out")
+    cur=${cur%%-*}
+    echo "installed: ${cur:-none}, wanted: {{version}}"
+    version_ge "$cur" '{{version}}'
+steps:
+  - name: Show current version
+    continue_on_error: true
+    script: |
+      if command -v haproxy >/dev/null 2>&1; then haproxy -v | head -n 1; else echo "HAProxy not installed yet"; fi
+  - name: Back up configuration
+    script: |
+      if [ -f '{{config}}' ]; then cp -a '{{config}}' '{{config}}.psccm-{{deployment_id}}'; echo "backup: {{config}}.psccm-{{deployment_id}}"; fi
+  - name: Install / upgrade HAProxy package
+    timeout: 1800
+    script: |
+      v='{{version}}'
+      case "$(pkg_manager)" in
+        apt-get)
+          apt-get update -q
+          opts="-y -q -o Dpkg::Options::=--force-confold"
+          if [ -n "$v" ]; then
+            pkgver=$(apt-cache madison haproxy | awk -v v="$v" '$3 ~ "^"v {print $3; exit}')
+            if [ -z "$pkgver" ]; then
+              echo "haproxy $v is not available in the configured repositories:" >&2
+              apt-cache madison haproxy >&2
+              exit 1
+            fi
+            apt-get install $opts --allow-downgrades "haproxy=$pkgver"
+          else
+            apt-get install $opts haproxy
+          fi ;;
+        dnf|yum)
+          pm=$(pkg_manager)
+          if [ -n "$v" ]; then "$pm" install -y "haproxy-$v*"; else "$pm" install -y haproxy && "$pm" upgrade -y haproxy; fi ;;
+        zypper) zypper --non-interactive install haproxy ;;
+        *) echo "Unsupported package manager" >&2; exit 1 ;;
+      esac
+      haproxy -v | head -n 1
+  - name: Validate configuration
+    script: haproxy -c -f '{{config}}'
+  - name: Enable and {{restart_mode}} HAProxy
+    script: |
+      systemctl enable haproxy >/dev/null 2>&1 || true
+      if systemctl is-active --quiet haproxy && [ '{{restart_mode}}' = reload ]; then
+        systemctl reload haproxy
+      else
+        systemctl restart haproxy
+      fi
+      sleep 2
+      systemctl is-active haproxy
+rollback:
+  - name: Restore configuration backup
+    script: |
+      b='{{config}}.psccm-{{deployment_id}}'
+      if [ -f "$b" ]; then cp -a "$b" '{{config}}'; echo "restored $b"; fi
+      haproxy -c -f '{{config}}' && (systemctl reload haproxy || systemctl restart haproxy)
+verify:
+  linux: |
+    systemctl is-active haproxy
+    haproxy -v | head -n 1

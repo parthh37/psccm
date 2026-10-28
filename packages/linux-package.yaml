@@ -1,0 +1,30 @@
+id: linux-package
+name: Linux package (install / upgrade / remove)
+category: Generic
+description: Install, upgrade or remove distribution packages with apt, dnf, yum, zypper or apk.
+platforms: [linux]
+variables:
+  packages:
+    required: true
+    description: Package names separated by spaces, e.g. curl htop
+  action:
+    default: install
+    options: [install, upgrade, remove]
+steps:
+  - name: "{{action}} {{packages}}"
+    timeout: 3600
+    script: |
+      pkgs='{{packages}}'
+      pm=$(pkg_manager)
+      case "{{action}}:$pm" in
+        install:*) pkg_install $pkgs ;;
+        upgrade:apt-get) apt-get update -q && apt-get install -y -q --only-upgrade $pkgs ;;
+        upgrade:dnf|upgrade:yum) "$pm" upgrade -y $pkgs ;;
+        upgrade:zypper) zypper --non-interactive update $pkgs ;;
+        upgrade:apk) apk upgrade $pkgs ;;
+        remove:apt-get) apt-get remove -y -q $pkgs ;;
+        remove:dnf|remove:yum) "$pm" remove -y $pkgs ;;
+        remove:zypper) zypper --non-interactive remove $pkgs ;;
+        remove:apk) apk del $pkgs ;;
+        *) echo "Unsupported: {{action}} with $pm" >&2; exit 1 ;;
+      esac

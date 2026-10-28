@@ -1,0 +1,19 @@
+id: notepad-plus-plus
+name: Notepad++
+version: "8.7.1"
+category: Utilities
+description: Install or upgrade Notepad++ from the official GitHub release.
+platforms: [windows]
+variables:
+  version:
+    default: "8.7.1"
+    description: Notepad++ version, e.g. 8.7.1 (see github.com/notepad-plus-plus/notepad-plus-plus/releases)
+detect:
+  windows: |
+    if (Test-AppInstalled -Name 'Notepad++*' -MinVersion '{{version}}') { exit 0 }
+    exit 1
+steps:
+  - name: Install Notepad++ {{version}}
+    install:
+      url: https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v{{version}}/npp.{{version}}.Installer.x64.exe
+      args: /S

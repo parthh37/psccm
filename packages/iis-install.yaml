@@ -1,0 +1,54 @@
+id: iis-install
+name: IIS - install / add features
+category: IIS
+description: >-
+  Install IIS (Web-Server role) and the listed features on Windows Server. On Windows
+  10/11 the basic IIS optional features are enabled instead. Optionally reboots
+  when Windows asks for it.
+platforms: [windows]
+variables:
+  features:
+    default: Web-Server,Web-Mgmt-Console,Web-Default-Doc,Web-Static-Content,Web-Http-Errors,Web-Http-Redirect,Web-Http-Logging,Web-Request-Monitor,Web-Stat-Compression,Web-Dyn-Compression,Web-Filtering,Web-Windows-Auth,Web-Net-Ext45,Web-Asp-Net45,Web-ISAPI-Ext,Web-ISAPI-Filter,Web-WebSockets
+    description: Windows Server feature names, comma separated (Get-WindowsFeature Web-* lists them)
+  reboot_if_needed:
+    default: "no"
+    options: ["no", "yes"]
+    description: Reboot automatically if Windows needs a restart to finish
+detect:
+  windows: |
+    if (-not (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue)) { exit 1 }
+    $feats = '{{features}}' -split '[,; ]+' | Where-Object { $_ }
+    $missing = @(Get-WindowsFeature -Name $feats | Where-Object { -not $_.Installed })
+    if ($missing.Count) { Write-Output "missing: $($missing.Name -join ', ')"; exit 1 }
+    exit 0
+steps:
+  - name: Install IIS features
+    success_codes: [0, 3010]
+    timeout: 3600
+    script: |
+      $feats = '{{features}}' -split '[,; ]+' | Where-Object { $_ }
+      if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+          $r = Install-WindowsFeature -Name $feats -IncludeManagementTools
+          $r.FeatureResult | ForEach-Object { Write-Output "installed $($_.Name)" }
+          Write-Output "Success: $($r.Success)  Restart needed: $($r.RestartNeeded)"
+          if (-not $r.Success) { exit 1 }
+          if ("$($r.RestartNeeded)" -eq 'Yes') { exit 3010 }
+      } else {
+          Write-Output 'Client Windows: enabling IIS optional features'
+          $r = Enable-WindowsOptionalFeature -Online -All -NoRestart -FeatureName IIS-WebServerRole, IIS-WebServer, IIS-ManagementConsole, IIS-DefaultDocument, IIS-StaticContent, IIS-HttpErrors, IIS-HttpLogging
+          if ($r.RestartNeeded) { exit 3010 }
+      }
+      exit 0
+  - name: Reboot if Windows needs it
+    when: |
+      $pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+                 (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+      if ('{{reboot_if_needed}}' -eq 'yes' -and $pending) { exit 0 }
+      exit 1
+    reboot: true
+verify:
+  windows: |
+    $svc = Get-Service -Name W3SVC -ErrorAction SilentlyContinue
+    if (-not $svc) { Write-Output 'W3SVC not installed yet (reboot pending?)'; exit 1 }
+    Write-Output "W3SVC is $($svc.Status)"
+    exit 0

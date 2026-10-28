@@ -1,0 +1,997 @@
+//! SQLite storage: computers, credentials, settings, deployment history, schedules.
+
+use anyhow::{Result, anyhow};
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension, Row, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use crate::secrets;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS computers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    address TEXT,
+    os TEXT NOT NULL DEFAULT 'unknown',
+    os_detail TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',
+    ad_ou TEXT,
+    description TEXT,
+    tags TEXT NOT NULL DEFAULT '',
+    credential_id INTEGER,
+    port INTEGER,
+    last_logon TEXT,
+    online INTEGER,
+    last_check TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS credentials (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    secret TEXT,
+    key_path TEXT,
+    default_for TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS known_hosts (
+    host TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    added_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deployments (
+    id TEXT PRIMARY KEY,
+    package_id TEXT NOT NULL,
+    package_name TEXT NOT NULL,
+    package_yaml TEXT NOT NULL,
+    variables TEXT NOT NULL,
+    targets TEXT NOT NULL,
+    options TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    scheduled_for TEXT,
+    started_at TEXT,
+    finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS deployment_targets (
+    id INTEGER PRIMARY KEY,
+    deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+    computer TEXT NOT NULL,
+    os TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_step TEXT,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    log TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_targets_dep ON deployment_targets(deployment_id);
+CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    package_id TEXT NOT NULL,
+    targets TEXT NOT NULL,
+    variables TEXT NOT NULL,
+    options TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    time TEXT NOT NULL DEFAULT '02:00',
+    weekdays TEXT NOT NULL DEFAULT '[]',
+    interval_minutes INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run TEXT,
+    next_run TEXT
+);
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    description TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'static',
+    rules TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    computer_id INTEGER NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, computer_id)
+);
+"#;
+
+/// Columns added after the first release: (table, column, definition).
+const MIGRATIONS: &[(&str, &str, &str)] = &[("computers", "ad_groups", "TEXT NOT NULL DEFAULT ''")];
+
+pub fn now() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[derive(Clone)]
+pub struct Db(Arc<Mutex<Connection>>);
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Db> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )?;
+        conn.execute_batch(SCHEMA)?;
+        for (table, col, def) in MIGRATIONS {
+            let exists: bool = conn.query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+                [col],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {def}"))?;
+            }
+        }
+        Ok(Db(Arc::new(Mutex::new(conn))))
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
+        let conn = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(f(&conn)?)
+    }
+
+    // ---------------------------------------------------------------- settings
+
+    pub fn get_setting<T: DeserializeOwned + Default>(&self, key: &str) -> Result<T> {
+        let raw: Option<String> = self.with(|c| {
+            c.query_row("SELECT value FROM settings WHERE key=?1", [key], |r| r.get(0))
+                .optional()
+        })?;
+        Ok(match raw {
+            Some(s) => serde_json::from_str(&s)?,
+            None => T::default(),
+        })
+    }
+
+    pub fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let s = serde_json::to_string(value)?;
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, s],
+            )
+        })?;
+        Ok(())
+    }
+
+    // --------------------------------------------------------------- computers
+
+    pub fn list_computers(&self) -> Result<Vec<Computer>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM computers ORDER BY name COLLATE NOCASE")?;
+            st.query_map([], Computer::from_row)?.collect()
+        })
+    }
+
+    pub fn get_computer(&self, name: &str) -> Result<Option<Computer>> {
+        self.with(|c| {
+            c.query_row("SELECT * FROM computers WHERE name=?1", [name], Computer::from_row)
+                .optional()
+        })
+    }
+
+    /// Insert or update by name. Fields that are `None` keep their old value.
+    pub fn upsert_computer(&self, n: &NewComputer) -> Result<()> {
+        let tags = n.tags.as_ref().map(|t| join_tags(t));
+        let ad_groups = n.ad_groups.as_ref().map(|g| g.join("\n"));
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO computers(name,address,os,os_detail,source,ad_ou,description,tags,credential_id,port,last_logon,created_at,ad_groups)
+                 VALUES(?1,?2,COALESCE(?3,'unknown'),?4,COALESCE(?5,'manual'),?6,?7,COALESCE(?8,''),?9,?10,?11,?12,COALESCE(?13,''))
+                 ON CONFLICT(name) DO UPDATE SET
+                   ad_groups=COALESCE(?13,ad_groups),
+                   address=COALESCE(excluded.address,address),
+                   os=COALESCE(?3,os),
+                   os_detail=COALESCE(excluded.os_detail,os_detail),
+                   source=COALESCE(?5,source),
+                   ad_ou=COALESCE(excluded.ad_ou,ad_ou),
+                   description=COALESCE(excluded.description,description),
+                   tags=COALESCE(?8,tags),
+                   credential_id=COALESCE(excluded.credential_id,credential_id),
+                   port=COALESCE(excluded.port,port),
+                   last_logon=COALESCE(excluded.last_logon,last_logon)",
+                params![
+                    n.name.trim(),
+                    n.address,
+                    n.os,
+                    n.os_detail,
+                    n.source,
+                    n.ad_ou,
+                    n.description,
+                    tags,
+                    n.credential_id,
+                    n.port,
+                    n.last_logon,
+                    now(),
+                    ad_groups
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Full update from the UI edit form (None clears a field).
+    pub fn update_computer(&self, id: i64, u: &ComputerUpdate) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE computers SET address=?2, os=?3, description=?4, tags=?5, credential_id=?6, port=?7 WHERE id=?1",
+                params![
+                    id,
+                    u.address.as_deref().filter(|s| !s.is_empty()),
+                    u.os,
+                    u.description,
+                    join_tags(&u.tags),
+                    u.credential_id,
+                    u.port
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn delete_computers(&self, ids: &[i64]) -> Result<()> {
+        self.with(|c| {
+            for id in ids {
+                c.execute("DELETE FROM computers WHERE id=?1", [id])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn set_online(&self, name: &str, online: bool) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE computers SET online=?2, last_check=?3 WHERE name=?1",
+                params![name, online, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn set_computer_os(&self, name: &str, os: &str) -> Result<()> {
+        self.with(|c| c.execute("UPDATE computers SET os=?2 WHERE name=?1", params![name, os]))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ groups
+
+    pub fn list_groups(&self) -> Result<Vec<Group>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM groups ORDER BY name COLLATE NOCASE")?;
+            let mut groups: Vec<Group> = st.query_map([], Group::from_row)?.collect::<rusqlite::Result<_>>()?;
+            let mut st = c.prepare(
+                "SELECT m.group_id, c.name FROM group_members m JOIN computers c ON c.id=m.computer_id ORDER BY c.name COLLATE NOCASE",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (gid, name) = row?;
+                if let Some(g) = groups.iter_mut().find(|g| g.id == gid) {
+                    g.members.push(name);
+                }
+            }
+            Ok(groups)
+        })
+    }
+
+    pub fn save_group(&self, g: &Group) -> Result<i64> {
+        let rules = serde_json::to_string(&g.rules)?;
+        self.with(|c| {
+            if g.id > 0 {
+                c.execute(
+                    "UPDATE groups SET name=?2, description=?3, kind=?4, rules=?5 WHERE id=?1",
+                    params![g.id, g.name.trim(), g.description, g.kind, rules],
+                )?;
+                Ok(g.id)
+            } else {
+                c.execute(
+                    "INSERT INTO groups(name,description,kind,rules,created_at) VALUES(?1,?2,?3,?4,?5)",
+                    params![g.name.trim(), g.description, g.kind, rules, now()],
+                )?;
+                Ok(c.last_insert_rowid())
+            }
+        })
+    }
+
+    pub fn delete_group(&self, id: i64) -> Result<()> {
+        self.with(|c| c.execute("DELETE FROM groups WHERE id=?1", [id]))?;
+        Ok(())
+    }
+
+    /// Add (or remove) computers, by name, to a static group.
+    pub fn set_group_members(&self, group_id: i64, names: &[String], add: bool) -> Result<usize> {
+        self.with(|c| {
+            let mut n = 0;
+            for name in names {
+                let sql = if add {
+                    "INSERT OR IGNORE INTO group_members(group_id, computer_id) SELECT ?1, id FROM computers WHERE name=?2"
+                } else {
+                    "DELETE FROM group_members WHERE group_id=?1 AND computer_id=(SELECT id FROM computers WHERE name=?2)"
+                };
+                n += c.execute(sql, params![group_id, name])?;
+            }
+            Ok(n)
+        })
+    }
+
+    // ------------------------------------------------------------- credentials
+
+    pub fn list_credentials(&self) -> Result<Vec<Credential>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM credentials ORDER BY name")?;
+            st.query_map([], Credential::from_row)?.collect()
+        })
+    }
+
+    pub fn get_credential(&self, id: i64) -> Result<Option<Credential>> {
+        self.with(|c| {
+            c.query_row("SELECT * FROM credentials WHERE id=?1", [id], Credential::from_row)
+                .optional()
+        })
+    }
+
+    pub fn default_credential(&self, kind: &str) -> Result<Option<Credential>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT * FROM credentials WHERE default_for=?1 LIMIT 1",
+                [kind],
+                Credential::from_row,
+            )
+            .optional()
+        })
+    }
+
+    pub fn add_credential(&self, n: &NewCredential) -> Result<i64> {
+        let secret = match n.secret.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => Some(secrets::protect(s)?),
+            None => None,
+        };
+        self.with(|c| {
+            if let Some(d) = &n.default_for {
+                c.execute("UPDATE credentials SET default_for=NULL WHERE default_for=?1", [d])?;
+            }
+            c.execute(
+                "INSERT INTO credentials(name,kind,username,secret,key_path,default_for,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![n.name, n.kind, n.username, secret, n.key_path, n.default_for, now()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn delete_credential(&self, id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE computers SET credential_id=NULL WHERE credential_id=?1", [id])?;
+            c.execute("DELETE FROM credentials WHERE id=?1", [id])
+        })?;
+        Ok(())
+    }
+
+    /// Decrypted password / passphrase for a credential.
+    pub fn credential_secret(&self, id: i64) -> Result<Option<String>> {
+        let enc: Option<Option<String>> = self.with(|c| {
+            c.query_row("SELECT secret FROM credentials WHERE id=?1", [id], |r| r.get(0))
+                .optional()
+        })?;
+        match enc.flatten() {
+            Some(e) => Ok(Some(secrets::unprotect(&e)?)),
+            None => Ok(None),
+        }
+    }
+
+    // ------------------------------------------------------------- known hosts
+
+    pub fn known_host(&self, host: &str) -> Result<Option<String>> {
+        self.with(|c| {
+            c.query_row("SELECT fingerprint FROM known_hosts WHERE host=?1", [host], |r| r.get(0))
+                .optional()
+        })
+    }
+
+    pub fn add_known_host(&self, host: &str, fp: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO known_hosts(host,fingerprint,added_at) VALUES(?1,?2,?3)",
+                params![host, fp, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn forget_known_host(&self, host: &str) -> Result<()> {
+        self.with(|c| c.execute("DELETE FROM known_hosts WHERE host=?1", [host]))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- deployments
+
+    pub fn create_deployment(&self, d: &NewDeployment) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO deployments(id,package_id,package_name,package_yaml,variables,targets,options,status,source,created_at,scheduled_for)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    d.id,
+                    d.package_id,
+                    d.package_name,
+                    d.package_yaml,
+                    serde_json::to_string(&d.variables).unwrap(),
+                    serde_json::to_string(&d.targets).unwrap(),
+                    serde_json::to_string(&d.options).unwrap(),
+                    if d.scheduled_for.is_some() { "scheduled" } else { "queued" },
+                    d.source,
+                    now(),
+                    d.scheduled_for
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn list_deployments(&self, limit: usize) -> Result<Vec<Deployment>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!(
+                "{DEPLOYMENT_SELECT} ORDER BY d.created_at DESC LIMIT {limit}"
+            ))?;
+            st.query_map([], Deployment::from_row)?.collect()
+        })
+    }
+
+    pub fn get_deployment(&self, id: &str) -> Result<Option<Deployment>> {
+        self.with(|c| {
+            c.query_row(&format!("{DEPLOYMENT_SELECT} WHERE d.id=?1"), [id], Deployment::from_row)
+                .optional()
+        })
+    }
+
+    pub fn due_scheduled_deployments(&self) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id FROM deployments WHERE status='scheduled' AND scheduled_for<=?1",
+            )?;
+            st.query_map([now()], |r| r.get(0))?.collect()
+        })
+    }
+
+    /// Deployments left running/queued by a previous process are marked failed.
+    pub fn fail_interrupted(&self) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE deployment_targets SET status='failed', error='console restarted during deployment', finished_at=?1
+                 WHERE status IN ('pending','running')",
+                [now()],
+            )?;
+            c.execute(
+                "UPDATE deployments SET status='failed', finished_at=?1 WHERE status IN ('queued','running')",
+                [now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn set_deployment_status(&self, id: &str, status: &str) -> Result<()> {
+        self.with(|c| {
+            let col = match status {
+                "running" => "started_at",
+                _ => "finished_at",
+            };
+            c.execute(
+                &format!("UPDATE deployments SET status=?2, {col}=COALESCE({col}, ?3) WHERE id=?1"),
+                params![id, status, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn delete_deployment(&self, id: &str) -> Result<()> {
+        self.with(|c| c.execute("DELETE FROM deployments WHERE id=?1", [id]))?;
+        Ok(())
+    }
+
+    pub fn add_target(&self, dep: &str, computer: &str, os: &str) -> Result<i64> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO deployment_targets(deployment_id,computer,os,status) VALUES(?1,?2,?3,'pending')",
+                params![dep, computer, os],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    pub fn list_targets(&self, dep: &str, with_log: bool) -> Result<Vec<TargetRow>> {
+        self.with(|c| {
+            let log = if with_log { "log" } else { "''" };
+            let mut st = c.prepare(&format!(
+                "SELECT id,deployment_id,computer,os,status,current_step,error,started_at,finished_at,{log}
+                 FROM deployment_targets WHERE deployment_id=?1 ORDER BY id"
+            ))?;
+            st.query_map([dep], TargetRow::from_row)?.collect()
+        })
+    }
+
+    pub fn target_log(&self, target_id: i64) -> Result<String> {
+        self.with(|c| {
+            c.query_row("SELECT log FROM deployment_targets WHERE id=?1", [target_id], |r| r.get(0))
+        })
+    }
+
+    pub fn update_target(
+        &self,
+        id: i64,
+        status: &str,
+        step: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let terminal = !matches!(status, "pending" | "running");
+        self.with(|c| {
+            c.execute(
+                "UPDATE deployment_targets SET status=?2, current_step=?3, error=?4,
+                    started_at=CASE WHEN ?2='running' THEN COALESCE(started_at, ?5) ELSE started_at END,
+                    finished_at=CASE WHEN ?6 THEN ?5 ELSE finished_at END
+                 WHERE id=?1",
+                params![id, status, step, error, now(), terminal],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn append_log(&self, target_id: i64, text: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE deployment_targets SET log = log || ?2 WHERE id=?1",
+                params![target_id, text],
+            )
+        })?;
+        Ok(())
+    }
+
+    // --------------------------------------------------------------- schedules
+
+    pub fn list_schedules(&self) -> Result<Vec<Schedule>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM schedules ORDER BY name")?;
+            st.query_map([], Schedule::from_row)?.collect()
+        })
+    }
+
+    pub fn save_schedule(&self, s: &Schedule) -> Result<i64> {
+        let targets = serde_json::to_string(&s.targets)?;
+        let variables = serde_json::to_string(&s.variables)?;
+        let options = serde_json::to_string(&s.options)?;
+        let weekdays = serde_json::to_string(&s.weekdays)?;
+        self.with(|c| {
+            let args = params![
+                s.name,
+                s.package_id,
+                targets,
+                variables,
+                options,
+                s.kind,
+                s.time,
+                weekdays,
+                s.interval_minutes,
+                s.enabled,
+                s.next_run,
+                s.id,
+            ];
+            if s.id > 0 {
+                c.execute(
+                    "UPDATE schedules SET name=?1,package_id=?2,targets=?3,variables=?4,options=?5,kind=?6,time=?7,weekdays=?8,interval_minutes=?9,enabled=?10,next_run=?11 WHERE id=?12",
+                    args,
+                )?;
+                Ok(s.id)
+            } else {
+                c.execute(
+                    "INSERT INTO schedules(name,package_id,targets,variables,options,kind,time,weekdays,interval_minutes,enabled,next_run) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    &args[..11],
+                )?;
+                Ok(c.last_insert_rowid())
+            }
+        })
+    }
+
+    pub fn mark_schedule_run(&self, id: i64, next_run: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE schedules SET last_run=?2, next_run=?3 WHERE id=?1",
+                params![id, now(), next_run],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn delete_schedule(&self, id: i64) -> Result<()> {
+        self.with(|c| c.execute("DELETE FROM schedules WHERE id=?1", [id]))?;
+        Ok(())
+    }
+}
+
+fn json_col<T: DeserializeOwned + Default>(row: &Row, col: &str) -> rusqlite::Result<T> {
+    let s: String = row.get(col)?;
+    Ok(serde_json::from_str(&s).unwrap_or_default())
+}
+
+pub fn split_tags(s: &str) -> Vec<String> {
+    s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+}
+
+fn join_tags(t: &[String]) -> String {
+    let mut v: Vec<String> = t.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    v.sort();
+    v.dedup();
+    v.join(",")
+}
+
+// ------------------------------------------------------------------- models
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Computer {
+    pub id: i64,
+    pub name: String,
+    pub address: Option<String>,
+    /// "windows", "linux" or "unknown"
+    pub os: String,
+    pub os_detail: Option<String>,
+    pub source: String,
+    pub ad_ou: Option<String>,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub credential_id: Option<i64>,
+    pub port: Option<u16>,
+    pub last_logon: Option<String>,
+    pub online: Option<bool>,
+    pub last_check: Option<String>,
+    /// Names of the AD security groups the computer is a member of.
+    pub ad_groups: Vec<String>,
+}
+
+impl Computer {
+    fn from_row(r: &Row) -> rusqlite::Result<Computer> {
+        Ok(Computer {
+            id: r.get("id")?,
+            name: r.get("name")?,
+            address: r.get("address")?,
+            os: r.get("os")?,
+            os_detail: r.get("os_detail")?,
+            source: r.get("source")?,
+            ad_ou: r.get("ad_ou")?,
+            description: r.get("description")?,
+            tags: split_tags(&r.get::<_, String>("tags")?),
+            credential_id: r.get("credential_id")?,
+            port: r.get("port")?,
+            last_logon: r.get("last_logon")?,
+            online: r.get("online")?,
+            last_check: r.get("last_check")?,
+            ad_groups: r.get::<_, String>("ad_groups")?.lines().filter(|l| !l.is_empty()).map(String::from).collect(),
+        })
+    }
+
+    /// Host name or address to connect to.
+    pub fn connect_host(&self) -> &str {
+        self.address.as_deref().filter(|a| !a.is_empty()).unwrap_or(&self.name)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct NewComputer {
+    pub name: String,
+    pub address: Option<String>,
+    pub os: Option<String>,
+    pub os_detail: Option<String>,
+    pub source: Option<String>,
+    pub ad_ou: Option<String>,
+    pub description: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub credential_id: Option<i64>,
+    pub port: Option<u16>,
+    pub last_logon: Option<String>,
+    pub ad_groups: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ComputerUpdate {
+    pub address: Option<String>,
+    pub os: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub credential_id: Option<i64>,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Credential {
+    pub id: i64,
+    pub name: String,
+    /// "windows" (WinRM), "ssh" or "ldap"
+    pub kind: String,
+    pub username: String,
+    pub has_secret: bool,
+    pub key_path: Option<String>,
+    pub default_for: Option<String>,
+}
+
+impl Credential {
+    fn from_row(r: &Row) -> rusqlite::Result<Credential> {
+        Ok(Credential {
+            id: r.get("id")?,
+            name: r.get("name")?,
+            kind: r.get("kind")?,
+            username: r.get("username")?,
+            has_secret: r.get::<_, Option<String>>("secret")?.is_some(),
+            key_path: r.get("key_path")?,
+            default_for: r.get("default_for")?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NewCredential {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub username: String,
+    pub secret: Option<String>,
+    pub key_path: Option<String>,
+    pub default_for: Option<String>,
+}
+
+/// Which computers a deployment or schedule targets. Tags are resolved when
+/// the deployment starts, so new AD computers are picked up automatically.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetSpec {
+    #[serde(default)]
+    pub computers: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Computer group names.
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployOptions {
+    /// Targets worked on in parallel.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    /// Rolling deployment: targets per batch (0 = no batching).
+    #[serde(default)]
+    pub batch_size: usize,
+    /// Stop starting new targets after this many failures.
+    #[serde(default)]
+    pub max_failures: Option<usize>,
+    /// Skip targets that already have the package (run `detect`). Default true.
+    #[serde(default = "yes")]
+    pub use_detect: bool,
+}
+
+fn default_concurrency() -> usize {
+    10
+}
+fn yes() -> bool {
+    true
+}
+
+impl Default for DeployOptions {
+    fn default() -> Self {
+        DeployOptions { concurrency: 10, batch_size: 0, max_failures: None, use_detect: true }
+    }
+}
+
+pub struct NewDeployment {
+    pub id: String,
+    pub package_id: String,
+    pub package_name: String,
+    pub package_yaml: String,
+    pub variables: BTreeMap<String, String>,
+    pub targets: TargetSpec,
+    pub options: DeployOptions,
+    pub source: String,
+    pub scheduled_for: Option<String>,
+}
+
+const DEPLOYMENT_SELECT: &str = "SELECT d.*,
+    (SELECT COUNT(*) FROM deployment_targets t WHERE t.deployment_id=d.id) AS n_total,
+    (SELECT COUNT(*) FROM deployment_targets t WHERE t.deployment_id=d.id AND t.status='success') AS n_success,
+    (SELECT COUNT(*) FROM deployment_targets t WHERE t.deployment_id=d.id AND t.status='skipped') AS n_skipped,
+    (SELECT COUNT(*) FROM deployment_targets t WHERE t.deployment_id=d.id AND t.status IN ('failed','offline')) AS n_failed
+    FROM deployments d";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Deployment {
+    pub id: String,
+    pub package_id: String,
+    pub package_name: String,
+    #[serde(skip)]
+    pub package_yaml: String,
+    pub variables: BTreeMap<String, String>,
+    pub targets: TargetSpec,
+    pub options: DeployOptions,
+    pub status: String,
+    pub source: String,
+    pub created_at: String,
+    pub scheduled_for: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub n_total: i64,
+    pub n_success: i64,
+    pub n_skipped: i64,
+    pub n_failed: i64,
+}
+
+impl Deployment {
+    fn from_row(r: &Row) -> rusqlite::Result<Deployment> {
+        Ok(Deployment {
+            id: r.get("id")?,
+            package_id: r.get("package_id")?,
+            package_name: r.get("package_name")?,
+            package_yaml: r.get("package_yaml")?,
+            variables: json_col(r, "variables")?,
+            targets: json_col(r, "targets")?,
+            options: json_col(r, "options")?,
+            status: r.get("status")?,
+            source: r.get("source")?,
+            created_at: r.get("created_at")?,
+            scheduled_for: r.get("scheduled_for")?,
+            started_at: r.get("started_at")?,
+            finished_at: r.get("finished_at")?,
+            n_total: r.get("n_total")?,
+            n_success: r.get("n_success")?,
+            n_skipped: r.get("n_skipped")?,
+            n_failed: r.get("n_failed")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetRow {
+    pub id: i64,
+    pub deployment_id: String,
+    pub computer: String,
+    pub os: String,
+    /// pending, running, success, skipped, failed, offline, cancelled
+    pub status: String,
+    pub current_step: Option<String>,
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub log: String,
+}
+
+impl TargetRow {
+    fn from_row(r: &Row) -> rusqlite::Result<TargetRow> {
+        Ok(TargetRow {
+            id: r.get(0)?,
+            deployment_id: r.get(1)?,
+            computer: r.get(2)?,
+            os: r.get(3)?,
+            status: r.get(4)?,
+            current_step: r.get(5)?,
+            error: r.get(6)?,
+            started_at: r.get(7)?,
+            finished_at: r.get(8)?,
+            log: r.get(9)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    pub package_id: String,
+    #[serde(default)]
+    pub targets: TargetSpec,
+    #[serde(default)]
+    pub variables: BTreeMap<String, String>,
+    #[serde(default)]
+    pub options: DeployOptions,
+    /// "once", "daily", "weekly" or "interval"
+    pub kind: String,
+    /// "HH:MM" local time (daily/weekly), or RFC 3339 / "YYYY-MM-DD HH:MM" (once)
+    #[serde(default)]
+    pub time: String,
+    /// 0 = Monday … 6 = Sunday (weekly)
+    #[serde(default)]
+    pub weekdays: Vec<u32>,
+    #[serde(default)]
+    pub interval_minutes: i64,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub last_run: Option<String>,
+    #[serde(default)]
+    pub next_run: Option<String>,
+}
+
+impl Schedule {
+    fn from_row(r: &Row) -> rusqlite::Result<Schedule> {
+        Ok(Schedule {
+            id: r.get("id")?,
+            name: r.get("name")?,
+            package_id: r.get("package_id")?,
+            targets: json_col(r, "targets")?,
+            variables: json_col(r, "variables")?,
+            options: json_col(r, "options")?,
+            kind: r.get("kind")?,
+            time: r.get("time")?,
+            weekdays: json_col(r, "weekdays")?,
+            interval_minutes: r.get("interval_minutes")?,
+            enabled: r.get("enabled")?,
+            last_run: r.get("last_run")?,
+            next_run: r.get("next_run")?,
+        })
+    }
+}
+
+pub fn not_found(what: &str) -> anyhow::Error {
+    anyhow!("{what} not found")
+}
+
+/// A named set of computers: either a fixed member list ("static") or
+/// everything matching `rules` ("dynamic", re-evaluated whenever used).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    #[serde(default)]
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// "static" or "dynamic"
+    #[serde(default = "static_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub rules: GroupRules,
+    /// Static members (computer names); filled when listing.
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+fn static_kind() -> String {
+    "static".into()
+}
+
+impl Group {
+    fn from_row(r: &Row) -> rusqlite::Result<Group> {
+        Ok(Group {
+            id: r.get("id")?,
+            name: r.get("name")?,
+            description: r.get("description")?,
+            kind: r.get("kind")?,
+            rules: json_col(r, "rules")?,
+            members: vec![],
+        })
+    }
+}
+
+/// Conditions of a dynamic group; all filled-in conditions must match.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GroupRules {
+    /// "windows" or "linux"
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Name patterns with * and ?, comma separated (any may match), e.g. "web*, app0?"
+    #[serde(default)]
+    pub name: String,
+    /// Text the computer's AD OU path must contain, e.g. "OU=Servers"
+    #[serde(default)]
+    pub ou: String,
+    /// Computers with any of these tags
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Member of this AD security group (name)
+    #[serde(default)]
+    pub ad_group: String,
+    /// Text the OS description must contain, e.g. "Server 2022"
+    #[serde(default)]
+    pub os_detail: String,
+}

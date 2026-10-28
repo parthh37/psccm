@@ -1,0 +1,169 @@
+name: Release
+
+# Push a tag like v0.2.0 to build, publish and then test the release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to re-test (skips building)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build-windows:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check version matches tag
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:TAG) { throw "Cargo.toml version $v does not match tag $env:TAG" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+      - name: Test
+        run: cargo test --locked --release
+      - name: Build
+        run: cargo build --locked --release
+        env:
+          PSCCM_UPDATE_REPO: ${{ github.repository }}
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Qp "/DAppVersion=$env:VERSION" installer\psccm.iss
+          if ($LASTEXITCODE) { throw "ISCC failed" }
+          Copy-Item target\release\psccm.exe dist\psccm-x86_64-windows.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  build-linux:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --release
+      - run: cargo build --locked --release
+        env:
+          PSCCM_UPDATE_REPO: ${{ github.repository }}
+      - run: mkdir dist && cp target/release/psccm dist/psccm-x86_64-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  publish:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" dist/* --title "PSCCM $TAG" --generate-notes --verify-tag
+
+  # ---------------------------------------------------------------------------
+  # Post-release tests: download what was published, install it like a user
+  # would and run tests/release-test.ps1 against real WinRM / SSH targets on
+  # the (throwaway) CI machines. Reports are attached to the release.
+  test-windows:
+    needs: [publish]
+    if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$env:TAG" --dir rel --pattern "psccm-setup-*.exe" --pattern SHA256SUMS
+      - name: Prepare this runner as a target (WinRM)
+        shell: pwsh
+        run: |
+          Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          Set-Item WSMan:\localhost\Client\TrustedHosts -Value 'localhost,127.0.0.1' -Force
+      - name: Install (silent) and run release tests
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem rel\psccm-setup-*.exe).FullName
+          ./tests/release-test.ps1 -Setup $setup -ExpectedVersion $env:TAG.TrimStart('v') `
+            -WindowsTarget localhost -RealInstalls -UpdateRepo $env:GITHUB_REPOSITORY -ReportDir report
+      - name: Attach report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          if (Test-Path report\report.html) {
+            Copy-Item report\report.html report\test-report-windows.html
+            gh release upload "$env:TAG" report\test-report-windows.html --clobber
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-report-windows
+          path: report/
+
+  test-linux:
+    needs: [publish]
+    if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" --dir rel --pattern psccm-x86_64-linux --pattern SHA256SUMS
+      - name: Verify checksum
+        run: cd rel && sha256sum --check --ignore-missing SHA256SUMS
+      - name: Prepare this runner as a target (SSH + sudo)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q openssh-server
+          PW="$(openssl rand -hex 16)"
+          echo "::add-mask::$PW"
+          echo "LINUX_PW=$PW" >> "$GITHUB_ENV"
+          sudo useradd -m -s /bin/bash psccmtest
+          echo "psccmtest:$PW" | sudo chpasswd
+          sudo usermod -aG sudo psccmtest
+          echo 'PasswordAuthentication yes' | sudo tee /etc/ssh/sshd_config.d/99-psccm-test.conf
+          sudo systemctl restart ssh
+      - name: Run release tests
+        shell: pwsh
+        run: |
+          chmod +x rel/psccm-x86_64-linux
+          ./tests/release-test.ps1 -Exe rel/psccm-x86_64-linux -ExpectedVersion $env:TAG.TrimStart('v') `
+            -LinuxTarget 127.0.0.1 -LinuxUser psccmtest -LinuxPassword $env:LINUX_PW -RealInstalls `
+            -UpdateRepo $env:GITHUB_REPOSITORY -ReportDir report
+      - name: Attach report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f report/report.html ]; then
+            cp report/report.html report/test-report-linux.html
+            gh release upload "$TAG" report/test-report-linux.html --clobber
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-report-linux
+          path: report/

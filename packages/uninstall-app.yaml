@@ -1,0 +1,28 @@
+id: uninstall-app
+name: Uninstall a Windows program
+category: Generic
+description: >-
+  Uninstall every program whose name matches (wildcards ok, e.g. "Java 8*"). MSI products
+  are removed with msiexec /x; others run their uninstaller with the given switches.
+platforms: [windows]
+variables:
+  name:
+    required: true
+    description: Program name as shown in Apps & Features (wildcards ok)
+  exe_args:
+    default: /S
+    description: Silent switches for non-MSI uninstallers
+detect:
+  windows: |
+    if (Test-AppInstalled -Name '{{name}}') { exit 1 }
+    Write-Output 'not installed'
+    exit 0
+steps:
+  - name: Uninstall {{name}}
+    script: |
+      Get-InstalledApp -Name '{{name}}' | Format-Table DisplayName, DisplayVersion -AutoSize | Out-String
+      Uninstall-App -Name '{{name}}' -ExeArgs '{{exe_args}}'
+verify:
+  windows: |
+    if (Test-AppInstalled -Name '{{name}}') { Write-Output 'still installed'; exit 1 }
+    exit 0

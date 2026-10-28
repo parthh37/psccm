@@ -1,0 +1,39 @@
+id: 7zip
+name: 7-Zip
+version: "24.09"
+category: Utilities
+description: Install or upgrade 7-Zip. Windows downloads the MSI from 7-zip.org; Linux uses the distribution package.
+platforms: [windows, linux]
+variables:
+  version:
+    default: "24.09"
+    description: 7-Zip version for Windows (as shown on 7-zip.org, e.g. 24.09)
+detect:
+  windows: |
+    if (Test-AppInstalled -Name '7-Zip*' -MinVersion '{{version}}') { exit 0 }
+    exit 1
+  linux: |
+    command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1
+steps:
+  - name: Download and install 7-Zip {{version}}
+    os: windows
+    script: |
+      $v = '{{version}}'.Replace('.', '')
+      $f = Join-Path '{{workdir}}' "7z$v-x64.msi"
+      Get-PsccmFile -Url "https://www.7-zip.org/a/7z$v-x64.msi" -OutFile $f
+      exit (Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "/i `"$f`" /qn /norestart")
+    success_codes: [0, 3010]
+  - name: Install 7-Zip package
+    os: linux
+    script: |
+      case "$(pkg_manager)" in
+        apt-get) pkg_install p7zip-full ;;
+        dnf|yum) pkg_install p7zip p7zip-plugins || pkg_install 7zip ;;
+        *) pkg_install p7zip ;;
+      esac
+verify:
+  windows: |
+    if (Test-AppInstalled -Name '7-Zip*' -MinVersion '{{version}}') { exit 0 }
+    Get-InstalledApp -Name '7-Zip*' | Format-Table -AutoSize | Out-String
+    exit 1
+  linux: command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1

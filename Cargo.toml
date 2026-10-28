@@ -1,0 +1,36 @@
+[package]
+name = "psccm"
+version = "0.2.0"
+edition = "2024"
+description = "Lightweight agentless deployment manager for Windows and Linux"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+ldap3 = "0.12"
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+rpassword = "7"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+windows-service = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
