@@ -17,6 +17,7 @@ pub mod terminal;
 use serde::{Deserialize, Serialize};
 
 /// Windows service name for the agent (the console service is `PSCCM`).
+#[cfg(windows)]
 pub const AGENT_SERVICE_NAME: &str = "PSCCMAgent";
 
 /// How long the console holds a check-in open waiting for work (seconds).

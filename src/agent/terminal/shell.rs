@@ -65,6 +65,7 @@ impl ShellProc {
     /// Build a [`ShellProc`] from already-wired parts (used by the Win32 run-as
     /// helpers): a stdin writer, a stdout reader, a kill closure and a liveness
     /// probe.
+    #[cfg(windows)]
     pub fn from_parts(
         stdin: Box<dyn Write + Send>,
         stdout: impl std::io::Read + Send + 'static,

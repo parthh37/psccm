@@ -184,6 +184,7 @@ pub fn install(_: &std::path::Path, _: Option<String>, _: Option<String>) -> Res
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)] // kept for API symmetry with the Windows build
 pub fn install_named(
     _: &str,
     _: &str,
@@ -201,6 +202,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)] // kept for API symmetry with the Windows build
 pub fn uninstall_named(_: &str) -> Result<()> {
     anyhow::bail!("not a Windows system")
 }

@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use super::terminal::shell::ShellProc;
-use super::{AGENT_SERVICE_NAME, CheckinReq, CheckinResp, DiskUsage, EnrollReq, EnrollResp, JobResult, Metrics, RunAs};
+use super::{CheckinReq, CheckinResp, DiskUsage, EnrollReq, EnrollResp, JobResult, Metrics, RunAs};
+#[cfg(windows)]
+use super::AGENT_SERVICE_NAME;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
