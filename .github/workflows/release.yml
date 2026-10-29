@@ -36,6 +36,7 @@ jobs:
         run: cargo build --locked --release
         env:
           PSCCM_UPDATE_REPO: ${{ github.repository }}
+          PSCCM_UPDATE_PUBKEY: ${{ vars.PSCCM_UPDATE_PUBKEY }}
       - name: Installer
         shell: pwsh
         run: |
@@ -60,6 +61,7 @@ jobs:
       - run: cargo build --locked --release
         env:
           PSCCM_UPDATE_REPO: ${{ github.repository }}
+          PSCCM_UPDATE_PUBKEY: ${{ vars.PSCCM_UPDATE_PUBKEY }}
       - run: mkdir dist && cp target/release/psccm dist/psccm-x86_64-linux
       - uses: actions/upload-artifact@v4
         with:
@@ -77,6 +79,41 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      # PSCCM only installs a release whose SHA256SUMS.sig is a valid ed25519
+      # signature, by the key built into it, over "psccm-release <tag>\n" +
+      # SHA256SUMS (README, "Release signing").
+      - name: Sign checksums
+        env:
+          PSCCM_SIGNING_KEY: ${{ secrets.PSCCM_SIGNING_KEY }}
+          PSCCM_UPDATE_PUBKEY: ${{ vars.PSCCM_UPDATE_PUBKEY }}
+          KEY_ROTATION: ${{ vars.PSCCM_KEY_ROTATION }}
+        run: |
+          if [ -z "$PSCCM_SIGNING_KEY" ]; then
+            echo "::error::The PSCCM_SIGNING_KEY secret is not set, so the release cannot be signed (see README, Release signing)."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/signing.pem" msg="$RUNNER_TEMP/signed" sig="$RUNNER_TEMP/sig"
+          trap 'rm -f "$key" "$msg" "$sig"' EXIT
+          (umask 077 && printf '%s\n' "$PSCCM_SIGNING_KEY" > "$key")
+          # The key the binaries were built with (repo variable, else the one in
+          # src/update.rs) must be this key's public half, except for the one
+          # release that hands installs a new key (PSCCM_KEY_ROTATION=true).
+          want="${PSCCM_UPDATE_PUBKEY:-$(sed -n 's/^const RELEASE_PUBKEY: &str = "\(.*\)";/\1/p' src/update.rs)}"
+          spki="$(openssl pkey -in "$key" -pubout | sed -n 2p)"
+          raw="$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | base64 -w0)"
+          if [ "$want" != "$spki" ] && [ "$want" != "$raw" ]; then
+            if [ "$KEY_ROTATION" = true ] && [ -n "$want" ]; then
+              echo "::warning::Key rotation: signing with $spki; this release's binaries trust '$want'."
+            else
+              echo "::error::PSCCM_SIGNING_KEY (public key $spki) does not match the key built into PSCCM ('$want'), so installs would refuse this release."
+              exit 1
+            fi
+          fi
+          { printf 'psccm-release %s\n' "$TAG"; cat dist/SHA256SUMS; } > "$msg"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in "$msg" -out "$sig"
+          openssl pkeyutl -verify -rawin -inkey "$key" -in "$msg" -sigfile "$sig"
+          base64 -w0 "$sig" > dist/SHA256SUMS.sig && echo >> dist/SHA256SUMS.sig
+          cat dist/SHA256SUMS.sig
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}

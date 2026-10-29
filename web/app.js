@@ -1964,16 +1964,17 @@ function updateCard(u) {
   const l = u.settings.latest;
   return `<div class="card"><div class="card-head"><h2>Updates</h2><span class="small muted">Installed: v${esc(u.current)}</span>
       <div class="right"><button onclick="App.updCheck()">Check now</button>
-        ${l && l.newer ? `<button class="primary" onclick="App.updInstall()">Install ${esc(l.version)}</button>` : ''}</div></div>
+        ${l && l.newer && !l.signature_error ? `<button class="primary" onclick="App.updInstall()">Install ${esc(l.version)}</button>` : ''}</div></div>
     <div class="card-body">
       ${l ? `<p style="margin-top:0">Latest release: <a href="${esc(l.url)}" target="_blank" rel="noopener">v${esc(l.version)}</a>
         ${l.newer ? pill('scheduled').replace('scheduled', 'update available') : pill('success').replace('success', 'up to date')}
         <span class="small muted">checked ${ago(u.settings.last_check)}</span></p>` : '<p class="muted" style="margin-top:0">Not checked yet.</p>'}
+      ${l && l.newer && l.signature_error ? `<p class="small" style="color:var(--bad)">This release will not be installed: ${esc(l.signature_error)}.</p>` : ''}
       ${u.platform === 'windows' && !u.installed ? '<p class="small muted">Running the portable exe: installing an update runs the setup program, which installs PSCCM as a service in Program Files.</p>' : ''}
       <label class="check"><input type="checkbox" id="u-check" ${u.settings.auto_check ? 'checked' : ''}> Check for updates daily</label>
       <label class="check"><input type="checkbox" id="u-install" ${u.settings.auto_install ? 'checked' : ''}> Install updates automatically (when no deployment is running)</label>
       <div class="row" style="margin-top:8px"><div class="field"><label>Release source (GitHub owner/repo)</label><input id="u-repo" value="${esc(u.settings.repo)}"></div></div>
-      <p class="small muted">Downloads are verified against the release's SHA256SUMS before installing.</p>
+      <p class="small muted">A release is only installed when its SHA256SUMS carries a valid signature by the PSCCM release key and the download matches it.</p>
       <button onclick="App.updSave()">Save</button></div></div>`;
 }
 

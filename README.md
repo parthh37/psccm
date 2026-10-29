@@ -575,13 +575,16 @@ bash (runs with `set -eo pipefail`):
   `data/` at mode 700.
 - WinRM over HTTP in a domain is encrypted by Kerberos. Use HTTPS for workgroup machines.
 - SSH host keys are pinned on first use (TOFU).
-- Updates are only installed when the download matches the release's `SHA256SUMS`.
+- Updates are only installed when the release's `SHA256SUMS` is signed by the release key built into
+  PSCCM and the download matches it ([Release signing](#release-signing)).
 
 ## Updates
 
 *Settings → Updates*. PSCCM checks the GitHub releases of `parthh37/psccm` once a day (configurable)
 and shows a notice in the sidebar when a newer version exists. **Install** downloads the new release
-and verifies its SHA-256. On Windows it then runs the setup silently: the setup stops the service,
+and checks that the release is signed with the PSCCM release key and that the download matches its
+signed SHA-256 (a release without a valid signature is never installed, whoever published it). On
+Windows it then runs the setup silently: the setup stops the service,
 replaces the files and starts it again with the same account and settings. On Linux it replaces the
 binary and exits, so systemd restarts it. *Install updates automatically* does this unattended, but
 never while a deployment is running. CLI: `psccm update [--install]`.
@@ -591,7 +594,7 @@ never while a deployment is running. CLI: `psccm update [--install]`.
 Push a tag `vX.Y.Z` (matching `Cargo.toml`). The [Release workflow](.github/workflows/release.yml):
 
 1. runs the tests and builds `psccm.exe`, the Inno Setup installer and the Linux binary;
-2. publishes a GitHub release with `SHA256SUMS`;
+2. publishes a GitHub release with `SHA256SUMS` and its signature `SHA256SUMS.sig`;
 3. **tests the published release** on fresh CI machines with
    [tests/release-test.ps1](tests/release-test.ps1):
    - **Windows:** silent install, service, upgrade in place, real WinRM deployments to the runner,
@@ -610,6 +613,49 @@ pwsh ./tests/release-test.ps1 -Exe ./psccm-x86_64-linux -LinuxTarget 10.0.0.5 -L
 
 Results go to `test-report/report.html` (also `report.json` and `junit.xml`). `-RealInstalls`
 installs software and changes the targets, so use it on test machines only.
+
+### Release signing
+
+PSCCM installs an update only if `SHA256SUMS.sig` is a valid ed25519 signature over the line
+`psccm-release <tag>` followed by `SHA256SUMS`, made with the key whose public half is built into
+the running PSCCM. A stolen GitHub token or a changed *Release source* can publish a release, but not
+one that installs. Including the tag stops an old signed release being re-published as a newer one.
+
+One-time setup (keep the private key offline, e.g. in a password manager):
+
+```bash
+openssl genpkey -algorithm ed25519 -out psccm-signing.pem                # private key: never commit it
+openssl pkey -in psccm-signing.pem -pubout -out psccm-signing.pub && cat psccm-signing.pub
+```
+
+1. In the repository on GitHub, *Settings → Secrets and variables → Actions*: add the **secret**
+   `PSCCM_SIGNING_KEY` with the whole contents of `psccm-signing.pem` (including the `BEGIN`/`END`
+   lines).
+2. Build the public key into PSCCM: paste the middle line of `psccm-signing.pub`
+   (`MCowBQYDK2VwAyEA…`) into
+   `RELEASE_PUBKEY` in [src/update.rs](src/update.rs) and commit it. (Alternatively, a fork can set
+   the repository **variable** `PSCCM_UPDATE_PUBKEY`; the release build uses it instead.)
+
+The *Sign checksums* step of the release workflow fails if the secret is missing or does not match
+the public key the binaries were built with, so a release is never published unsigned. A build without
+a key (e.g. a local `cargo build`) cannot verify releases and so installs no updates.
+
+Installs keep trusting the key they were built with. To rotate it, commit the new public key, set the
+repository variable `PSCCM_KEY_ROTATION` to `true` and release once with the *old* secret (installs
+accept it and now trust the new key; that release's own update test fails, as expected); then put the new private key in the secret and delete the
+variable. If the old private key is lost or leaked, installs must be updated by hand once with a build
+that has the new key.
+
+To check a download by hand, verify the signature and then the checksum, or check the build
+provenance GitHub attests for each release:
+
+```bash
+{ printf 'psccm-release %s\n' v0.2.3; cat SHA256SUMS; } > signed
+base64 -d SHA256SUMS.sig > sig
+openssl pkeyutl -verify -rawin -pubin -inkey psccm-signing.pub -in signed -sigfile sig
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify psccm-x86_64-linux --repo parthh37/psccm
+```
 
 ## Development
 
