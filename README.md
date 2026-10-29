@@ -21,6 +21,8 @@ computers without installing an agent, similar to PDQ Deploy.
 - **Web console** for everyday use, plus a **CLI** for scripts and CI pipelines.
 - **YAML packages** with detection, variables, conditions, retries, rollback, rolling
   batches and steps delegated to another host (e.g. drain HAProxy while patching IIS).
+- **App catalog**: 7-Zip, Chrome, Firefox, Node.js, Python, Java, VS Code, Git and more at
+  their latest version, downloaded once, checksum-verified and kept up to date automatically.
 - **Windows installer** (Inno Setup) that runs PSCCM as a service, plus **auto-update** from
   GitHub releases (SHA-256 verified).
 
@@ -66,6 +68,7 @@ Windows targets need a Windows console (PowerShell remoting); Linux targets work
 | `packages\` | Package YAML files (the built-ins are written here on first start) |
 | `repository\` | Installers and files that packages push (`install: file`, `copy: src`) |
 | `gpos\` | Imported Group Policy snapshots |
+| `catalog.yaml` | Your own App catalog entries (optional) |
 | `psccm.log` | Service log |
 
 ## First steps
@@ -246,6 +249,53 @@ logged-on user needs no password and is preferred.
 
 ---
 
+## App catalog
+
+*App catalog* page. A list of common Windows applications that PSCCM keeps at their latest
+version: 7-Zip, Google Chrome, Mozilla Firefox, Node.js LTS, Python 3, Java JDK 21 (Temurin),
+Notepad++, Visual Studio Code, Git for Windows, PowerShell 7, PuTTY, KeePassXC and VLC.
+
+- **Add** looks up the newest version at the vendor (GitHub release, JSON API or download page),
+  downloads the 64-bit installer **once to the console** (`repository\catalog\<app>\<version>\`)
+  and creates a package `catalog-<app>` in the *App catalog* category. Targets get the installer
+  pushed over WinRM, so they need no internet access.
+- The download is checked against the **SHA-256 the vendor publishes** where there is one (GitHub
+  release digests, `SHA256SUMS` files, the Adoptium API); otherwise it is HTTPS-only and the hash is
+  recorded. Every deployment checks the file's SHA-256 on the target before installing.
+- The package's detect check skips computers that already have **that version or newer**, so it is
+  safe to deploy again and again.
+- **Daily check** (on by default): new versions of added apps are downloaded and their packages
+  updated. The previous version is kept in the repository.
+- **Auto-deploy**: pick groups per app and each new version is deployed to them as soon as it is
+  downloaded. That covers "install or update it on every machine" without a schedule. For a fixed
+  maintenance window, leave it empty and add a schedule for `catalog-<app>` instead.
+
+GitHub allows 60 API requests an hour without a token, which is plenty for the daily check.
+
+**Your own apps** go in `data\catalog.yaml`, in the same format as the built-in
+[catalog/apps.yaml](catalog/apps.yaml); an entry with the same `id` replaces the built-in one:
+
+```yaml
+- id: winmerge
+  name: WinMerge
+  category: Utilities
+  description: Compare and merge files and folders.
+  version: { github: WinMerge/winmerge }               # latest GitHub release
+  installer:
+    asset: '^WinMerge-[\d.]+-x64-Setup\.exe$'          # release file (regex)
+    args: /VERYSILENT /NORESTART /SP- /ALLUSERS
+  detect: WinMerge*                                    # installed-program name
+```
+
+Other sources: `version: { url: <page or JSON>, regex: '...(\d+\.\d+)...' }` or `json: /pointer`,
+and `installer: { url: https://.../{{version}}/setup.msi }` (also `{{version_nodots}}`), with
+`sha256_url:` for a SHA256SUMS list. Only HTTPS sources are accepted.
+
+CLI: `psccm catalog list`, `psccm catalog add 7zip google-chrome`, `psccm catalog update`,
+`psccm catalog check`. (The CLI downloads but does not auto-deploy; the console's daily check does.)
+
+---
+
 ## Deploy options
 
 | Option | Meaning |
@@ -274,6 +324,7 @@ psccm groups list | create <name> --computers a,b
 psccm inventory scan [names…] | show <name> | software [--name "Chrome*"]
 psccm ad sync [--import]
 psccm gpo list | import <GUID> | import-folder <path> [--name N]
+psccm catalog list | check | add <ids> | update [ids] | remove <id>
 psccm cred add --name deploy --kind ssh --user deploy [--key ~/.ssh/id_ed25519] [--default-for linux]
 psccm update [--install]
 psccm service install [--bind IP] [--port N] [--token T] [--account DOMAIN\user] | uninstall
@@ -391,6 +442,7 @@ bash (runs with `set -eo pipefail`):
 
 | Job | Package | Tip |
 |---|---|---|
+| Common apps, always current | *App catalog* → Add, then Auto-deploy to a group | New versions are downloaded daily and rolled out; PCs that have it are skipped. |
 | New utility on all PCs | `7zip`, `google-chrome`, `notepad-plus-plus`, `install-msi`, `install-exe` | Target an AD tag; detect skips machines that already have it. |
 | Node.js upgrade | `nodejs` (`version` = `lts`, `22`, or `22.11.0`) | Set `restart_services` to restart your Node services. |
 | IIS server build | `iis-install` | `reboot_if_needed: yes` to finish in one go. |
@@ -456,7 +508,7 @@ cargo run -- serve
 In debug builds, setting `PSCCM_WINRM_LOCAL=1` runs "Windows" targets on the console itself without
 WinRM, which is useful to test packages on a dev box.
 
-Source map: `src/package.rs` (YAML format), `src/engine.rs` (deployment runner),
+Source map: `src/package.rs` (YAML format), `src/engine.rs` (deployment runner), `src/catalog.rs` (App catalog),
 `src/transport/` (WinRM, SSH), `src/ad.rs`, `src/gpo.rs`, `src/groups.rs`, `src/inventory.rs`
 (scan scripts in `src/assets/`), `src/update.rs`, `src/service.rs`, `src/scheduler.rs`,
 `src/web.rs` (API), `src/agent/` (agent protocol, runtime, jobs, Win32 run-as and the web

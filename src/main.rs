@@ -3,6 +3,7 @@
 mod ad;
 mod agent;
 mod app;
+mod catalog;
 mod db;
 mod engine;
 mod gpo;
@@ -119,6 +120,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GpoCmd,
     },
+    /// App catalog: common apps (7-Zip, Chrome, Node.js...) at their latest version.
+    Catalog {
+        #[command(subcommand)]
+        cmd: CatalogCmd,
+    },
     /// Check for (and optionally install) a newer PSCCM release.
     Update {
         #[arg(long)]
@@ -183,6 +189,23 @@ enum GpoCmd {
         #[arg(long)]
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum CatalogCmd {
+    /// Show the catalog with the latest and downloaded versions.
+    List,
+    /// Look up the latest versions and download new versions of added apps.
+    Check,
+    /// Download the latest installer of apps and create their packages (catalog-<id>).
+    Add {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Download the newest version of added apps (all of them when none are given).
+    Update { ids: Vec<String> },
+    /// Remove an app's package and downloaded installers.
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -438,6 +461,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Catalog { cmd } => catalog_cmd(&app, cmd).await,
         Cmd::Gpo { cmd } => match cmd {
             GpoCmd::List => {
                 for g in gpo::list(&app).await? {
@@ -545,6 +569,64 @@ async fn run_and_report(app: &App, id: &str) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// The CLI downloads but never auto-deploys: the process would exit before
+/// a deployment finished. The console's daily check does that.
+async fn catalog_cmd(app: &App, cmd: CatalogCmd) -> Result<()> {
+    let print = |id: &str, r: &Result<String>| match r {
+        Ok(m) => println!("{id:<18} {m}"),
+        Err(e) => println!("{id:<18} ERROR: {e:#}"),
+    };
+    match cmd {
+        CatalogCmd::List => {
+            let (list, errors) = catalog::load(app);
+            let s = catalog::settings(app)?;
+            for a in &list {
+                let st = s.apps.get(&a.id).cloned().unwrap_or_default();
+                let have = match (&st.current, st.added) {
+                    (Some(d), true) => format!("{} ({})", d.version, a.package_id()),
+                    (None, true) => "added, not downloaded".into(),
+                    _ => "-".into(),
+                };
+                println!("{:<18} {:<32} latest {:<20} have {}", a.id, a.name, st.latest.as_deref().unwrap_or("?"), have);
+            }
+            for e in errors {
+                eprintln!("BROKEN {e}");
+            }
+            Ok(())
+        }
+        CatalogCmd::Check => {
+            for (id, r) in catalog::check_all(app, false).await {
+                print(&id, &r);
+            }
+            Ok(())
+        }
+        CatalogCmd::Add { ids } => {
+            for id in ids {
+                let r = catalog::add(app, &id).await;
+                print(&id, &r);
+            }
+            Ok(())
+        }
+        CatalogCmd::Update { ids } => {
+            let ids = if ids.is_empty() {
+                catalog::settings(app)?.apps.into_iter().filter(|(_, a)| a.added).map(|(k, _)| k).collect()
+            } else {
+                ids
+            };
+            for id in ids {
+                let r = catalog::refresh(app, &id, false).await;
+                print(&id, &r);
+            }
+            Ok(())
+        }
+        CatalogCmd::Remove { id } => {
+            catalog::remove(app, &id)?;
+            println!("Removed {id}");
+            Ok(())
+        }
+    }
 }
 
 fn packages_cmd(app: &App, cmd: PackagesCmd) -> Result<()> {

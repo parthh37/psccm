@@ -1,0 +1,181 @@
+# PSCCM app catalog: common Windows applications, always the latest version.
+#
+# For each app PSCCM looks up the newest version, downloads the 64-bit
+# installer once to the repository folder and keeps a package
+# "catalog-<id>" up to date. Add your own apps in data\catalog.yaml (same
+# format; an entry with the same id replaces the built-in one).
+#
+#   version:              how to find the latest version (one of):
+#     github: owner/repo    latest GitHub release (its tag)
+#     url: https://...      a web page or JSON document
+#     json: /a/0/b          JSON pointer to the version inside "url"
+#     regex: '...'          capture group 1 = version (applied to the page,
+#                           or to the GitHub tag)
+#   installer:            where the installer comes from (one of):
+#     asset: '...'          regex for the GitHub release asset name
+#     url: https://...      URL template, {{version}} / {{version_nodots}}
+#     url_json: /a/b        JSON pointer to the URL inside the version document
+#   installer options:
+#     file:                 file name to save as (when the URL has none)
+#     sha256_url:           SHA256SUMS-style list to verify the download
+#     sha256_json:          JSON pointer to the SHA-256 in the version document
+#     args:                 silent-install arguments (MSI already gets /qn /norestart)
+#   detect:               installed-program name (wildcards) used to skip
+#                         computers that already have this version or newer
+
+- id: 7zip
+  name: 7-Zip
+  category: Utilities
+  description: File archiver with a high compression ratio.
+  homepage: https://www.7-zip.org
+  version: { github: ip7z/7zip }
+  installer: { asset: '^7z\d+-x64\.msi$' }
+  detect: 7-Zip*
+
+- id: google-chrome
+  name: Google Chrome
+  category: Browsers
+  description: Google's web browser (Enterprise MSI).
+  homepage: https://chromeenterprise.google
+  version:
+    url: https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions
+    json: /versions/0/version
+  installer:
+    url: https://dl.google.com/chrome/install/googlechromestandaloneenterprise64.msi
+  detect: Google Chrome
+
+- id: firefox
+  name: Mozilla Firefox
+  category: Browsers
+  description: Mozilla's web browser (en-US MSI).
+  homepage: https://www.mozilla.org/firefox
+  version:
+    url: https://product-details.mozilla.org/1.0/firefox_versions.json
+    json: /LATEST_FIREFOX_VERSION
+  installer:
+    url: https://download-installer.cdn.mozilla.net/pub/firefox/releases/{{version}}/win64/en-US/Firefox%20Setup%20{{version}}.msi
+    sha256_url: https://download-installer.cdn.mozilla.net/pub/firefox/releases/{{version}}/SHA256SUMS
+  detect: Mozilla Firefox*
+
+- id: nodejs-lts
+  name: Node.js LTS
+  category: Runtimes
+  description: JavaScript runtime, newest long-term-support release.
+  homepage: https://nodejs.org
+  version:
+    url: https://nodejs.org/dist/index.tab
+    # First release whose "lts" column (10th) has a codename.
+    regex: '(?m)^v(\d+\.\d+\.\d+)\t(?:[^\t\n]*\t){8}[A-Za-z]'
+  installer:
+    url: https://nodejs.org/dist/v{{version}}/node-v{{version}}-x64.msi
+    sha256_url: https://nodejs.org/dist/v{{version}}/SHASUMS256.txt
+  detect: Node.js
+
+- id: python3
+  name: Python 3
+  category: Runtimes
+  description: Python interpreter for all users, added to PATH. A new minor version (3.x) installs next to the old one.
+  homepage: https://www.python.org
+  version:
+    url: https://www.python.org/downloads/windows/
+    regex: 'Latest Python 3 Release - Python (3\.\d+\.\d+)'
+  installer:
+    url: https://www.python.org/ftp/python/{{version}}/python-{{version}}-amd64.exe
+    args: /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
+  detect: Python 3.* (64-bit)
+
+- id: temurin-jdk-21
+  name: Java JDK 21 (Eclipse Temurin)
+  category: Runtimes
+  description: OpenJDK 21 LTS from Eclipse Adoptium, with JAVA_HOME and PATH set.
+  homepage: https://adoptium.net
+  version:
+    url: https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse
+    json: /0/version/semver
+  installer:
+    url_json: /0/binary/installer/link
+    sha256_json: /0/binary/installer/checksum
+    args: ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome
+  detect: Eclipse Temurin JDK with Hotspot 21*
+
+- id: notepad-plus-plus
+  name: Notepad++
+  category: Utilities
+  description: Source code and text editor.
+  homepage: https://notepad-plus-plus.org
+  version: { github: notepad-plus-plus/notepad-plus-plus }
+  installer:
+    asset: '^npp\.[\d.]+\.Installer\.x64\.exe$'
+    args: /S
+  detect: Notepad++*
+
+- id: vscode
+  name: Visual Studio Code
+  category: Developer tools
+  description: Code editor from Microsoft (system installer, for all users).
+  homepage: https://code.visualstudio.com
+  version:
+    url: https://update.code.visualstudio.com/api/releases/stable
+    json: /0
+  installer:
+    url: https://update.code.visualstudio.com/{{version}}/win32-x64/stable
+    file: VSCodeSetup-x64-{{version}}.exe
+    args: /VERYSILENT /NORESTART /MERGETASKS=!runcode
+  detect: Microsoft Visual Studio Code
+
+- id: git
+  name: Git for Windows
+  category: Developer tools
+  description: Git with Git Bash and Git Credential Manager.
+  homepage: https://gitforwindows.org
+  version:
+    github: git-for-windows/git
+    regex: '^v(\d+\.\d+\.\d+)'
+  installer:
+    asset: '^Git-[\d.]+-64-bit\.exe$'
+    args: /VERYSILENT /NORESTART /NOCANCEL /SP- /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS
+  detect: Git
+
+- id: powershell7
+  name: PowerShell 7
+  category: Developer tools
+  description: Cross-platform PowerShell, installed next to Windows PowerShell 5.1.
+  homepage: https://github.com/PowerShell/PowerShell
+  version: { github: PowerShell/PowerShell }
+  installer:
+    asset: '^PowerShell-[\d.]+-win-x64\.msi$'
+    args: ADD_PATH=1
+  detect: PowerShell 7*
+
+- id: putty
+  name: PuTTY
+  category: Utilities
+  description: SSH and telnet client.
+  homepage: https://www.chiark.greenend.org.uk/~sgtatham/putty/
+  version:
+    url: https://the.earth.li/~sgtatham/putty/latest/w64/
+    regex: 'putty-64bit-(\d+\.\d+)-installer\.msi'
+  installer:
+    url: https://the.earth.li/~sgtatham/putty/{{version}}/w64/putty-64bit-{{version}}-installer.msi
+  detect: PuTTY*
+
+- id: keepassxc
+  name: KeePassXC
+  category: Utilities
+  description: Offline password manager.
+  homepage: https://keepassxc.org
+  version: { github: keepassxreboot/keepassxc }
+  installer: { asset: '^KeePassXC-[\d.]+-x64\.msi$' }
+  detect: KeePassXC
+
+- id: vlc
+  name: VLC media player
+  category: Media
+  description: Plays most audio and video formats.
+  homepage: https://www.videolan.org/vlc/
+  version:
+    url: https://get.videolan.org/vlc/last/win64/
+    regex: 'vlc-(\d+\.\d+\.\d+)-win64\.msi'
+  installer:
+    url: https://get.videolan.org/vlc/{{version}}/win64/vlc-{{version}}-win64.msi
+  detect: VLC media player

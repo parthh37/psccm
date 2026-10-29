@@ -18,7 +18,7 @@ use crate::ad::{self, AdComputer, AdSettings};
 use crate::app::{AgentSettings, App, WinRmSettings};
 use crate::agent::{self, RunAs};
 use crate::db::{ComputerUpdate, DeployOptions, Group, GroupRules, NewComputer, NewCredential, Schedule, TargetSpec};
-use crate::{gpo, inventory, update};
+use crate::{catalog, gpo, inventory, update};
 use crate::engine;
 use crate::package::{Package, Shell};
 use crate::scheduler;
@@ -97,6 +97,12 @@ pub async fn serve(
         .route("/packages/validate", post(validate_package))
         .route("/packages/{id}", get(get_package).put(save_package).delete(delete_package))
         .route("/repository", get(list_repository))
+        .route("/catalog", get(catalog_list))
+        .route("/catalog/check", post(catalog_check))
+        .route("/catalog/settings", put(catalog_settings))
+        .route("/catalog/{id}", put(catalog_save).delete(catalog_remove))
+        .route("/catalog/{id}/add", post(catalog_add))
+        .route("/catalog/{id}/update", post(catalog_update))
         .route("/credentials", get(list_credentials).post(add_credential))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/settings", get(get_settings))
@@ -523,6 +529,55 @@ async fn list_repository(State(st): State<St>) -> ApiResult {
         .map(|(path, size)| json!({ "path": path, "size": size }))
         .collect();
     Ok(Json(json!({ "dir": st.app.repo_dir(), "files": files })))
+}
+
+// ------------------------------------------------------------------ catalog
+
+async fn catalog_list(State(st): State<St>) -> ApiResult {
+    Ok(Json(catalog::overview(&st.app)?))
+}
+
+/// Runs in the background; the page polls `checking`.
+async fn catalog_check(State(st): State<St>) -> ApiResult {
+    catalog::start_check(&st.app, true);
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CatalogSettingsReq {
+    auto_check: bool,
+}
+
+async fn catalog_settings(State(st): State<St>, Json(r): Json<CatalogSettingsReq>) -> ApiResult {
+    catalog::set_auto_check(&st.app, r.auto_check)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct CatalogAppReq {
+    #[serde(default)]
+    deploy_groups: Vec<String>,
+}
+
+async fn catalog_save(State(st): State<St>, Path(id): Path<String>, Json(r): Json<CatalogAppReq>) -> ApiResult {
+    catalog::set_groups(&st.app, &id, r.deploy_groups)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Downloads run in the background; the page polls the app's `busy` progress.
+async fn catalog_add(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    catalog::start_refresh(&st.app, &id, true)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn catalog_update(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    catalog::start_refresh(&st.app, &id, false)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn catalog_remove(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    catalog::remove(&st.app, &id)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 // -------------------------------------------------------------- credentials
