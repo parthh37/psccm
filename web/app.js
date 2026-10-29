@@ -133,11 +133,12 @@ const ICON = {
   schedules: '<path d="M7 2h2v2h6V2h2v2h3v18H4V4h3zm-1 8v10h12V10zm0-4v2h12V6z"/>',
   settings: '<path d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm8.6 5.5l1.9 1.5-2 3.4-2.3-.9a7.7 7.7 0 0 1-2.1 1.2L15.8 21h-4l-.4-2.4a7.7 7.7 0 0 1-2.1-1.2l-2.3.9-2-3.4L7 13.4a7.8 7.8 0 0 1 0-2.8L5 9.1l2-3.4 2.3.9a7.7 7.7 0 0 1 2.1-1.2L11.8 3h4l.4 2.4a7.7 7.7 0 0 1 2.1 1.2l2.3-.9 2 3.4-1.9 1.5a7.8 7.8 0 0 1 0 2.9z"/>',
   agents: '<path d="M4 4h16v10H4zm2 2v6h12V6zm-3 11h18v2H3zm9-9a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/>',
+  updates: '<path d="M12 4a8 8 0 0 1 7.4 5H22l-3.5 4L15 9h2.2A6 6 0 0 0 6.3 10.1L4.4 9.4A8 8 0 0 1 12 4zm-7.5 7L8 15H5.8a6 6 0 0 0 10.9 1.9l1.9.7A8 8 0 0 1 3.6 15H1zm6.5-3h2v4.6l3 1.8-1 1.7-4-2.4z"/>',
 };
 
 const NAV = [
   ['dashboard', 'Dashboard'], ['deploy', 'Deploy'], ['history', 'Deployments'], ['computers', 'Computers'],
-  ['agents', 'Agents'], ['inventory', 'Inventory'], ['packages', 'Packages'], ['catalog', 'App catalog'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
+  ['agents', 'Agents'], ['inventory', 'Inventory'], ['updates', 'Updates'], ['packages', 'Packages'], ['catalog', 'App catalog'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
 ];
 
 // ------------------------------------------------------------------ router
@@ -273,6 +274,7 @@ function ruleText(r) {
   if (r.app) parts.push((r.app_missing ? 'without ' : 'has ') + r.app + (r.app_version ? ' ' + r.app_version : ''));
   if (r.pending_reboot) parts.push('reboot pending');
   if (r.low_disk_gb) parts.push(`a disk under ${r.low_disk_gb} GB free`);
+  if (r.missing_updates) parts.push(r.missing_updates === 'security' ? 'missing security updates' : 'missing updates');
   return parts.join(' and ');
 }
 
@@ -510,6 +512,11 @@ Object.assign(App, {
           <div class="field"><label>A disk has less free space than (GB)</label><input id="gr-disk" type="number" min="0" step="any" value="${r.low_disk_gb || ''}"></div>
           <div class="field"><label class="check"><input type="checkbox" id="gr-reboot" ${r.pending_reboot ? 'checked' : ''}> Reboot pending</label></div>
         </div>
+        <div class="row">
+          <div class="field"><label>Windows updates missing</label><select id="gr-wu">
+            ${[['', 'Don\'t care'], ['any', 'Any update'], ['security', 'Security or critical updates']].map(([v, l]) => `<option value="${v}" ${(r.missing_updates || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+            <div class="hint">From the last scan on the Updates page. Declined and optional updates don't count.</div></div>
+        </div>
         <div class="small" id="g-preview"></div>
       </div>`,
     [{ label: 'Cancel' }, {
@@ -531,7 +538,7 @@ Object.assign(App, {
       os_detail: $('#gr-osd').value.trim(), ad_group: $('#gr-ad').value.trim(),
       tags: $('#gr-tags').value.split(',').map((s) => s.trim()).filter(Boolean),
       app: $('#gr-app').value.trim(), app_version: $('#gr-appv').value.trim(), app_missing: $('#gr-appm').checked,
-      pending_reboot: $('#gr-reboot').checked, low_disk_gb: +$('#gr-disk').value || 0,
+      pending_reboot: $('#gr-reboot').checked, low_disk_gb: +$('#gr-disk').value || 0, missing_updates: $('#gr-wu').value,
     });
     let timer;
     const preview = () => {
@@ -684,6 +691,7 @@ function stepKind(s) {
   if (s.service) return `service ${s.service.action} ${s.service.name}`;
   if (s.reboot) return 'reboot';
   if (s.wait) return `wait ${s.wait}s`;
+  if (s.windows_update) return 'windows update';
   if (s.include) return 'include ' + s.include;
   return '';
 }
@@ -995,12 +1003,21 @@ Object.assign(App, {
 // --------------------------------------------------------------- schedules
 
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const WEEKS = [[1, '1st'], [2, '2nd'], [3, '3rd'], [4, '4th'], [5, 'last']];
+
+/** "2nd Tue of the month + 2 days" (2nd Tuesday is Patch Tuesday). */
+function monthlyText(s) {
+  const day = `${(WEEKS.find(([w]) => w === s.week) || [0, '?'])[1]} ${DAYS[s.weekdays[0]] || '?'}`;
+  const base = s.week === 2 && s.weekdays[0] === 1 ? 'Patch Tuesday' : `${day} of the month`;
+  return s.offset_days ? `${base} ${s.offset_days > 0 ? '+' : '−'} ${Math.abs(s.offset_days)} day${Math.abs(s.offset_days) === 1 ? '' : 's'}` : base;
+}
 
 async function pageSchedules(el) {
   const [list, { packages }] = await Promise.all([GET('/schedules'), loadPackages(true)]);
   const pname = (id) => (packages.find((p) => p.id === id) || { name: id }).name;
   const when = (s) => s.kind === 'once' ? 'once at ' + s.time : s.kind === 'daily' ? 'daily at ' + s.time
-    : s.kind === 'weekly' ? `${s.weekdays.map((d) => DAYS[d]).join(', ')} at ${s.time}` : `every ${s.interval_minutes} min`;
+    : s.kind === 'weekly' ? `${s.weekdays.map((d) => DAYS[d]).join(', ')} at ${s.time}`
+      : s.kind === 'monthly' ? `${monthlyText(s)} at ${s.time}` : `every ${s.interval_minutes} min`;
   el.innerHTML = `<div class="page-head"><h1>Schedules</h1><span class="sub">Recurring deployments (patch nights, compliance re-runs)</span>
     <div class="actions"><button class="primary" onclick="App.editSchedule()">New schedule</button></div></div>
     <div class="card"><div class="card-body flush">${list.length ? `<table><thead><tr><th>Name</th><th>Package</th><th>When</th><th>Targets</th><th>Next run</th><th>Last run</th><th></th></tr></thead><tbody>
@@ -1015,22 +1032,28 @@ async function pageSchedules(el) {
 }
 
 Object.assign(App, {
-  async editSchedule(id) {
+  async editSchedule(id, preset = {}) {
     const { packages } = await loadPackages();
     const [computers, gr] = await Promise.all([GET('/computers'), GET('/groups')]);
     const groupNames = gr.groups.map((g) => g.name);
     const tags = [...new Set(computers.flatMap((c) => c.tags))].sort();
-    const s = (App._schedules || []).find((x) => x.id === id) || {
-      id: 0, name: '', package_id: packages[0] && packages[0].id, kind: 'weekly', time: '02:00', weekdays: [5],
+    const s = (id && (App._schedules || []).find((x) => x.id === id)) || {
+      id: 0, name: '', package_id: packages[0] && packages[0].id, kind: 'weekly', time: '02:00', weekdays: [5], week: 2, offset_days: 0,
       interval_minutes: 60, enabled: true, targets: { computers: [], tags: [], groups: [] }, variables: {}, options: { concurrency: 10, batch_size: 0, max_failures: null, use_detect: true },
+      ...preset,
     };
     const m = modal(id ? 'Edit schedule' : 'New schedule', `
       <div class="row"><div class="field"><label>Name</label><input id="s-name" value="${esc(s.name)}" placeholder="Saturday patching"></div>
         <div class="field"><label>Package</label><select id="s-pkg">${packages.map((p) => `<option value="${esc(p.id)}" ${p.id === s.package_id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div></div>
       <div class="row"><div class="field"><label>Repeat</label><select id="s-kind">
-          ${[['once', 'Once'], ['daily', 'Daily'], ['weekly', 'Weekly'], ['interval', 'Every N minutes']].map(([v, l]) => `<option value="${v}" ${s.kind === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+          ${[['once', 'Once'], ['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly (e.g. Patch Tuesday)'], ['interval', 'Every N minutes']].map(([v, l]) => `<option value="${v}" ${s.kind === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
         <div class="field" id="s-time-f"><label>Time</label><input id="s-time" value="${esc(s.time)}" placeholder="02:00"></div>
         <div class="field" id="s-int-f"><label>Minutes</label><input id="s-int" type="number" min="1" value="${s.interval_minutes}"></div></div>
+      <div class="row" id="s-month-f">
+        <div class="field"><label>Week</label><select id="s-week">${WEEKS.map(([w, l]) => `<option value="${w}" ${s.week === w ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+        <div class="field"><label>Weekday</label><select id="s-wd">${DAYS.map((d, i) => `<option value="${i}" ${s.weekdays[0] === i ? 'selected' : ''}>${d}</option>`).join('')}</select></div>
+        <div class="field"><label>Days after</label><input id="s-off" type="number" min="-27" max="27" value="${s.offset_days || 0}">
+          <div class="hint">2nd Tue + 2 = the Thursday after Patch Tuesday.</div></div></div>
       <div class="field" id="s-days-f"><label>Days</label><div class="chips">${DAYS.map((d, i) => `<label class="chip ${s.weekdays.includes(i) ? 'on' : ''}"><input type="checkbox" data-day="${i}" ${s.weekdays.includes(i) ? 'checked' : ''} style="display:none">${d}</label>`).join('')}</div></div>
       <div class="field"><label>Groups</label><div class="chips">${groupNames.map((t) => `<label class="chip ${(s.targets.groups || []).includes(t) ? 'on' : ''}"><input type="checkbox" data-group="${esc(t)}" ${(s.targets.groups || []).includes(t) ? 'checked' : ''} style="display:none">${esc(t)}</label>`).join('') || '<span class="muted small">No groups yet</span>'}</div></div>
       <div class="field"><label>Tags</label><div class="chips">${tags.map((t) => `<label class="chip ${s.targets.tags.includes(t) ? 'on' : ''}"><input type="checkbox" data-tag="${esc(t)}" ${s.targets.tags.includes(t) ? 'checked' : ''} style="display:none">${esc(t)}</label>`).join('') || '<span class="muted small">No tags yet</span>'}</div></div>
@@ -1046,7 +1069,8 @@ Object.assign(App, {
         const body = {
           ...s, name: $('#s-name').value.trim(), package_id: $('#s-pkg').value, kind: $('#s-kind').value, time: $('#s-time').value.trim(),
           interval_minutes: +$('#s-int').value || 0, enabled: $('#s-en').checked,
-          weekdays: $$('[data-day]', root).filter((c) => c.checked).map((c) => +c.dataset.day),
+          weekdays: $('#s-kind').value === 'monthly' ? [+$('#s-wd').value] : $$('[data-day]', root).filter((c) => c.checked).map((c) => +c.dataset.day),
+          week: +$('#s-week').value, offset_days: +$('#s-off').value || 0,
           targets: { groups: $$('[data-group]', root).filter((c) => c.checked).map((c) => c.dataset.group), tags: $$('[data-tag]', root).filter((c) => c.checked).map((c) => c.dataset.tag), computers: $('#s-comps').value.split(/[\s,;]+/).filter(Boolean) },
           options: { ...s.options, batch_size: +$('#s-batch').value || 0, concurrency: +$('#s-conc').value || 10 },
           variables,
@@ -1061,6 +1085,7 @@ Object.assign(App, {
     const kindVis = () => {
       const k = $('#s-kind').value;
       $('#s-days-f').style.display = k === 'weekly' ? '' : 'none';
+      $('#s-month-f').style.display = k === 'monthly' ? '' : 'none';
       $('#s-int-f').style.display = k === 'interval' ? '' : 'none';
       $('#s-time-f').style.display = k === 'interval' ? 'none' : '';
       $('#s-time').placeholder = k === 'once' ? '2026-11-07 02:00' : '02:00';
@@ -2330,10 +2355,262 @@ function jattr(obj) {
   return `'${esc(JSON.stringify(obj)).replace(/&#39;/g, '\\u0027')}'`;
 }
 
+// ----------------------------------------------------------- windows update
+
+const WU_PKG = 'windows-update';
+const UP = { tab: 'computers', qs: { computers: '', updates: '' }, filter: '', cls: '', declined: false, data: null };
+const SEV_PILL = { Critical: 's-failed', Important: 's-partial', Moderate: 's-scheduled', Low: 's-skipped' };
+const sevPill = (s) => (s ? `<span class="pill ${SEV_PILL[s] || ''}">${esc(s)}</span>` : '');
+const WU_RESULT = { 2: ['installed', 's-success'], 3: ['with errors', 's-partial'], 4: ['failed', 's-failed'], 5: ['aborted', 's-cancelled'] };
+const wuSize = (b) => (b ? sizeFmt(b) : '');
+const WU_SIZE_HINT = 'The largest possible download; Windows usually downloads a much smaller delta';
+
+function pollUpdates(el) {
+  poll(async () => {
+    try {
+      const r = await GET('/updates');
+      if (r.scan.running) {
+        if ($('#up-progress')) $('#up-progress').innerHTML = scanProgress(r.scan);
+        pollUpdates(el);
+      } else {
+        toast(`Update scan finished${r.scan.failed ? ` (${r.scan.failed} not scanned)` : ''}`);
+        pageUpdates(el);
+      }
+    } catch { pollUpdates(el); }
+  }, 3000);
+}
+
+async function pageUpdates(el) {
+  const [r, computers] = await Promise.all([GET('/updates'), GET('/computers')]);
+  const windows = computers.filter((c) => c.os !== 'linux');
+  const st = Object.fromEntries(r.computers.map((s) => [s.computer.toLowerCase(), s]));
+  const scanned = r.computers.filter((s) => s.scanned_at);
+  UP.data = { r, windows, st };
+  const n = {
+    current: scanned.filter((s) => !s.missing).length,
+    security: scanned.filter((s) => s.security).length,
+    missing: scanned.filter((s) => s.missing).length,
+    reboot: scanned.filter((s) => s.info.reboot_pending === 'true').length,
+    failed: windows.filter((c) => { const s = st[c.name.toLowerCase()]; return !s || s.status !== 'ok'; }).length,
+  };
+  const s = r.settings;
+  const stat = (key, num, label, color) => `<div class="stat click ${UP.filter === key ? 'on' : ''}" onclick="App.upFilter('${key}')">
+    <div class="n" style="color:${num && color ? color : 'inherit'}">${num}</div><div class="l">${label}</div></div>`;
+  el.innerHTML = `
+    <div class="page-head"><h1>Updates</h1><span class="sub">Windows Update on ${scanned.length} of ${windows.length} Windows computers</span>
+      <div class="actions"><button onclick="App.upSchedule()" title="Install updates every month, e.g. two days after Patch Tuesday">New patch schedule</button>
+        <button class="primary" onclick="App.upScan()" ${r.scan.running || !windows.length ? 'disabled' : ''}>Scan all computers</button></div></div>
+    <div id="up-progress">${scanProgress(r.scan)}</div>
+    <div class="stats">
+      ${stat('current', n.current, 'Up to date', 'var(--ok)')}
+      ${stat('security', n.security, 'Missing security updates', 'var(--bad)')}
+      ${stat('missing', n.missing, 'Missing any update', 'var(--warn)')}
+      ${stat('reboot', n.reboot, 'Restart pending', 'var(--warn)')}
+      ${stat('failed', n.failed, 'Not scanned or last scan failed', 'var(--bad)')}
+    </div>
+    <div class="card"><div class="card-head">
+      <div class="tabs">${[['computers', 'Computers'], ['updates', `Missing updates (${r.updates.filter((u) => !u.declined).length})`]]
+        .map(([k, l]) => `<button class="${UP.tab === k ? 'on' : ''}" onclick="App.upTab('${k}')">${l}</button>`).join('')}</div>
+      <input class="search" id="up-q" placeholder="${UP.tab === 'computers' ? 'Search computer, OS build, update source…' : 'Search KB or title…'}" value="${esc(UP.qs[UP.tab])}" oninput="App.upSearch(this.value)">
+      ${UP.tab === 'updates' ? `<select onchange="App.upClass(this.value)"><option value="">All classifications</option>
+        ${r.classifications.map((c) => `<option ${UP.cls === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+        <label class="check small"><input type="checkbox" ${UP.declined ? 'checked' : ''} onchange="App.upShowDeclined(this.checked)"> Show declined</label>` : ''}
+      <div class="right" id="up-actions"></div>
+    </div><div class="card-body flush" id="up-body"></div></div>
+    <div class="card"><div class="card-head"><h2>Scan settings</h2>
+      ${s.last_scan ? `<span class="small muted">Last full scan started ${ago(s.last_scan)}</span>` : ''}</div><div class="card-body">
+      <div class="row">
+        <div class="field"><label>Scan all Windows computers every (hours)</label><input id="up-int" type="number" min="0" value="${s.interval_hours}">
+          <div class="hint">0 = only when you click Scan. 24 is a good start.</div></div>
+        <div class="field"><label>Computers scanned at the same time</label><input id="up-conc" type="number" min="1" max="128" value="${s.concurrency}"></div>
+        <div class="field"><label>Look for updates at</label><select id="up-src">
+          <option value="default" ${s.source === 'default' ? 'selected' : ''}>The computer's own source (WSUS if set, else Windows Update)</option>
+          <option value="windows-update" ${s.source === 'windows-update' ? 'selected' : ''}>Windows Update, ignoring WSUS</option></select></div>
+      </div>
+      <label class="check"><input type="checkbox" id="up-re" ${s.rescan_after_install ? 'checked' : ''}> Scan computers again after a deployment installs updates on them</label>
+      <p class="small muted">A scan asks the Windows Update Agent which updates are missing, over WinRM with the computer's credential. Nothing is
+        downloaded or installed. Because Windows does not let a remote session use Windows Update, the scan and the
+        <b>Windows Update - install updates</b> package run as SYSTEM through a short-lived scheduled task. Install from here, from Deploy,
+        or on a schedule. Use a batch size there to restart web farms one server at a time.</p>
+      <button onclick="App.upSave()">Save</button></div></div>`;
+  if (r.scan.running) pollUpdates(el);
+  renderUpdatesBody();
+}
+
+function updateComputerRows() {
+  const { windows, st } = UP.data;
+  const q = UP.qs.computers.toLowerCase();
+  return windows.map((c) => ({ c, s: st[c.name.toLowerCase()] })).filter(({ c, s }) => {
+    const ok = s && s.scanned_at;
+    if (UP.filter === 'current' && !(ok && !s.missing)) return false;
+    if (UP.filter === 'security' && !(ok && s.security)) return false;
+    if (UP.filter === 'missing' && !(ok && s.missing)) return false;
+    if (UP.filter === 'reboot' && !(ok && s.info.reboot_pending === 'true')) return false;
+    if (UP.filter === 'failed' && s && s.status === 'ok') return false;
+    const i = (s && s.info) || {};
+    return !q || [c.name, i.os_name, i.os_build, i.source].some((v) => (v || '').toLowerCase().includes(q));
+  });
+}
+
+function updateRows() {
+  const q = UP.qs.updates.toLowerCase();
+  return UP.data.r.updates.filter((u) => (UP.declined || !u.declined) && (!UP.cls || u.update.classification === UP.cls)
+    && (!q || u.key.toLowerCase().includes(q) || u.update.title.toLowerCase().includes(q)));
+}
+
+function renderUpdatesBody() {
+  if (UP.tab === 'updates') return renderMissingUpdates();
+  const rows = updateComputerRows();
+  const todo = rows.filter(({ s }) => s && s.missing);
+  $('#up-actions').innerHTML = `<button onclick="App.upExport()">Export CSV</button>
+    <button class="primary" onclick="App.upInstallComputers()" ${todo.length ? '' : 'disabled'}
+      title="Install the missing updates on the computers listed here">Install on ${todo.length} computer(s)…</button>`;
+  $('#up-body').innerHTML = !UP.data.windows.length
+    ? '<div class="empty"><b>No Windows computers yet</b>Add computers first, then scan them.</div>'
+    : `<div class="table-wrap"><table><thead><tr><th>Computer</th><th>Operating system</th><th>Missing</th>
+        <th>Last installed</th><th>Source</th><th>Scanned</th></tr></thead><tbody>
+      ${rows.map(({ c, s }) => {
+        const ok = s && s.scanned_at;
+        const i = (s && s.info) || {};
+        const missing = !ok ? '' : !s.missing ? '<span class="pill s-success">up to date</span>'
+          : `${s.security ? `<span class="pill s-failed">${s.security} security</span> ` : ''}<b>${s.missing}</b> missing`;
+        return `<tr class="click" onclick="App.upShow('${esc(c.name)}')">
+          <td><b>${esc(c.name)}</b>${i.reboot_pending === 'true' ? ' <span class="pill s-partial">restart pending</span>' : ''}</td>
+          <td>${ok ? `${esc(i.os_name || 'Windows')}<div class="os">${esc(i.os_build ? 'build ' + i.os_build : '')}</div>` : '<span class="muted">Windows</span>'}</td>
+          <td>${missing}${ok && (s.optional || s.declined) ? `<div class="small muted">${[s.optional && `${s.optional} optional`, s.declined && `${s.declined} declined`].filter(Boolean).join(' · ')}</div>` : ''}</td>
+          <td class="small" title="${esc(fmtTime(i.last_install))}">${i.last_install ? ago(i.last_install) : ''}</td>
+          <td class="small">${esc(i.source || '')}</td>
+          <td class="small">${!s ? '<span class="muted">never</span>'
+            : `${ok ? ago(s.scanned_at) : '<span class="muted">never</span>'}${s.status !== 'ok' ? `<div class="err" title="${esc(s.error || '')}">${esc(s.status)} ${ago(s.last_attempt)}</div>` : ''}`}</td></tr>`;
+      }).join('')}</tbody></table></div>
+      ${rows.length ? '' : '<div class="empty">No computers match.</div>'}`;
+}
+
+function renderMissingUpdates() {
+  const rows = updateRows();
+  $('#up-actions').innerHTML = `<button onclick="App.upExport()">Export CSV</button>
+    <button onclick="App.upDecline(true)" title="Never install these and don't count them as missing">Decline</button>
+    ${UP.declined ? '<button onclick="App.upDecline(false)">Undecline</button>' : ''}
+    <button class="primary" onclick="App.upInstallSelected()">Install selected…</button>`;
+  $('#up-body').innerHTML = rows.length ? `<div class="table-wrap"><table><thead><tr>
+      <th style="width:30px"><input type="checkbox" onclick="$$('input[data-k]', this.closest('table')).forEach((i) => { i.checked = this.checked; })"></th>
+      <th>Update</th><th>Classification</th><th>Severity</th><th title="${WU_SIZE_HINT}">Max size</th><th>Released</th><th class="num">Computers</th></tr></thead><tbody>
+    ${rows.map((u) => {
+      const x = u.update;
+      return `<tr><td><input type="checkbox" data-k="${esc(u.key)}"></td>
+        <td><b>${esc(x.kb || '')}</b> ${esc(x.title)}${u.declined ? ' <span class="tag">declined</span>' : ''}${x.optional ? ' <span class="tag">optional</span>' : ''}
+          ${x.reboot === 1 ? '<span class="tag" title="Needs a restart">restart</span>' : ''}</td>
+        <td class="small">${esc(x.classification)}</td><td>${sevPill(x.severity)}</td>
+        <td class="small">${wuSize(x.size)}</td><td class="small">${esc(x.released)}</td>
+        <td class="num" title="${esc(u.computers.join(', '))}">${u.computers.length}</td></tr>`;
+    }).join('')}</tbody></table></div>`
+    : `<div class="empty">${UP.data.r.updates.length ? 'No updates match.' : '<b>Nothing missing</b>Scan the computers to see which updates they need.'}</div>`;
+}
+
+const pickedUpdates = () => $$('input[data-k]:checked', $('#up-body')).map((i) => UP.data.r.updates.find((u) => u.key === i.dataset.k)).filter(Boolean);
+
+Object.assign(App, {
+  upTab(t) { UP.tab = t; route(); },
+  upFilter(f) { UP.filter = UP.filter === f ? '' : f; UP.tab = 'computers'; route(); },
+  upSearch(v) { UP.qs[UP.tab] = v; renderUpdatesBody(); },
+  upClass(c) { UP.cls = c; renderUpdatesBody(); },
+  upShowDeclined(on) { UP.declined = on; renderUpdatesBody(); },
+  upScan: act(async (names) => {
+    const r = await POST('/updates/scan', { names: names || null });
+    toast(`Scanning ${r.started} computer(s) for updates…`);
+    route();
+  }),
+  upSave: act(async () => {
+    await PUT('/settings/windows-update', {
+      interval_hours: +$('#up-int').value || 0, concurrency: +$('#up-conc').value || 16, source: $('#up-src').value,
+      rescan_after_install: $('#up-re').checked,
+    });
+    toast('Saved');
+  }),
+  upDecline: act(async (declined) => {
+    const picked = pickedUpdates();
+    if (!picked.length) throw new Error('Tick the updates first');
+    await POST('/updates/decline', { keys: picked.map((u) => u.key), declined });
+    toast(declined ? `Declined ${picked.length} update(s): PSCCM will not install them` : `${picked.length} update(s) no longer declined`);
+    route();
+  }),
+  upInstallSelected: act(async () => {
+    const picked = pickedUpdates().filter((u) => !u.declined);
+    if (!picked.length) throw new Error('Tick the updates to install (declined ones are never installed)');
+    const computers = [...new Set(picked.flatMap((u) => u.computers))];
+    await deployPrefilled(WU_PKG, computers, { kbs: picked.map((u) => u.key).join(', ') });
+  }),
+  upInstallComputers: act(async () => {
+    const names = updateComputerRows().filter(({ s }) => s && s.missing).map(({ c }) => c.name);
+    await deployPrefilled(WU_PKG, names);
+  }),
+  upSchedule: act(async () => {
+    const { packages } = await loadPackages(true);
+    if (!packages.some((p) => p.id === WU_PKG)) throw new Error(`The package '${WU_PKG}' is missing (deleted or disabled)`);
+    await App.editSchedule(0, {
+      name: 'Monthly Windows updates', package_id: WU_PKG, kind: 'monthly', time: '02:00', weekdays: [1], week: 2, offset_days: 2,
+      options: { concurrency: 10, batch_size: 0, max_failures: null, use_detect: false },
+    });
+  }),
+  upExport() {
+    if (UP.tab === 'computers') {
+      downloadCsv('update-status', ['Computer', 'OS', 'Build', 'Missing', 'Security', 'Optional', 'Declined', 'Restart pending', 'Last installed', 'Source', 'Scanned', 'Status', 'Error'],
+        updateComputerRows().map(({ c, s }) => {
+          const i = (s && s.info) || {};
+          return [c.name, i.os_name, i.os_build, s ? s.missing : '', s ? s.security : '', s ? s.optional : '', s ? s.declined : '',
+            i.reboot_pending, fmtTime(i.last_install), i.source, s ? fmtTime(s.scanned_at) : '', s ? s.status : 'never scanned', (s && s.error) || ''];
+        }));
+    } else {
+      downloadCsv('missing-updates', ['KB', 'Title', 'Classification', 'Severity', 'Max size bytes', 'Released', 'Declined', 'Optional', 'Computer'],
+        updateRows().flatMap((u) => u.computers.map((c) => [u.update.kb, u.update.title, u.update.classification, u.update.severity,
+          u.update.size, u.update.released, u.declined ? 'yes' : '', u.update.optional ? 'yes' : '', c])));
+    }
+  },
+  upShow: act(async (name) => {
+    const r = await GET('/updates/computer/' + encodeURIComponent(name)).catch(() => null);
+    const scanBtn = { label: 'Scan now', onClick: async () => { await App.upScan([name]); } };
+    if (!r) {
+      modal(name, '<p class="muted">This computer has not been scanned for updates yet.</p>', [{ label: 'Close' }, { ...scanBtn, cls: 'primary' }]);
+      return;
+    }
+    const { status: s, missing } = r;
+    const declined = new Set(r.declined.map((d) => d.toLowerCase()));
+    const key = (u) => (u.kb || u.update_id).toLowerCase();
+    const i = s.info;
+    const facts = [['OS', i.os_name], ['Build', i.os_build], ['Update source', i.source], ['Restart pending', i.reboot_pending === 'true' ? 'yes' : 'no'],
+      ['Last install', i.last_install ? `${fmtTime(i.last_install)} (${ago(i.last_install)})` : '']].filter(([, v]) => v);
+    modal(name, `
+      <div class="small muted" style="margin-bottom:10px">${s.scanned_at ? `Scanned ${fmtTime(s.scanned_at)} (${ago(s.scanned_at)})` : 'Never scanned successfully'}
+        ${s.status !== 'ok' ? `<div class="err">Last attempt ${ago(s.last_attempt)}: ${esc(s.status)} — ${esc(s.error || '')}</div>` : ''}</div>
+      <dl class="facts">${facts.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
+      <div class="cat">Missing updates (${missing.length})</div>
+      ${missing.length ? `<div class="table-wrap" style="max-height:40vh;overflow:auto"><table><thead><tr><th style="width:30px"></th><th>Update</th><th>Classification</th><th>Severity</th><th title="${WU_SIZE_HINT}">Max size</th></tr></thead><tbody>
+        ${missing.map((u) => {
+          const d = declined.has(key(u));
+          return `<tr><td><input type="checkbox" data-u="${esc(u.kb || u.update_id)}" ${d || u.optional ? '' : 'checked'} ${d ? 'disabled' : ''}></td>
+            <td><b>${esc(u.kb)}</b> ${esc(u.title)}${d ? ' <span class="tag">declined</span>' : ''}${u.optional ? ' <span class="tag">optional</span>' : ''}</td>
+            <td class="small">${esc(u.classification)}</td><td>${sevPill(u.severity)}</td><td class="small">${wuSize(u.size)}</td></tr>`;
+        }).join('')}</tbody></table></div>` : '<div class="small muted">Nothing missing.</div>'}
+      <div class="cat">Recent installs</div>
+      ${s.history.length ? `<div class="table-wrap" style="max-height:30vh;overflow:auto"><table><tbody>
+        ${s.history.map((h) => {
+          const [label, cls] = WU_RESULT[h.result] || ['unknown', ''];
+          return `<tr><td class="small" title="${esc(fmtTime(h.at))}">${ago(h.at)}</td><td><span class="pill ${cls}">${label}</span></td><td>${esc(h.title)}</td></tr>`;
+        }).join('')}</tbody></table></div>` : '<div class="small muted">No installs recorded.</div>'}`,
+    [{ label: 'Close' }, scanBtn, ...(missing.length ? [{
+      label: 'Install selected…', cls: 'primary', onClick: async (root) => {
+        const kbs = $$('input[data-u]:checked', root).map((c) => c.dataset.u);
+        if (!kbs.length) throw new Error('Tick the updates to install');
+        await deployPrefilled(WU_PKG, [name], { kbs: kbs.join(', ') });
+      },
+    }] : [])], { wide: true });
+  }),
+});
+
 const PAGES = {
   dashboard: pageDashboard, deploy: pageDeploy, history: pageHistory, deployment: pageDeployment,
   computers: pageComputers, packages: pagePackages, package: pagePackage, schedules: pageSchedules, settings: pageSettings,
-  gpo: pageGpo, agents: pageAgents, agent: pageAgent, inventory: pageInventory, catalog: pageCatalog,
+  gpo: pageGpo, agents: pageAgents, agent: pageAgent, inventory: pageInventory, catalog: pageCatalog, updates: pageUpdates,
 };
 
 route();

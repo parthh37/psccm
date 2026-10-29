@@ -1,0 +1,36 @@
+id: windows-update
+name: Windows Update - install updates
+category: Windows
+description: >-
+  Install missing Windows updates with the Windows Update Agent (from WSUS when the computer
+  uses one, else from Windows Update), restart when they need it and install what the restart
+  unlocked. Updates declined on the Updates page are never installed.
+platforms: [windows]
+variables:
+  classifications:
+    default: Security Updates, Critical Updates, Definition Updates, Update Rollups
+    description: >-
+      Comma-separated: Security Updates, Critical Updates, Definition Updates, Update Rollups,
+      Updates, Feature Packs, Service Packs, Tools, Drivers, Upgrades. '*' = all.
+  kbs:
+    default: ""
+    description: Only these updates (KB numbers or update IDs, comma-separated). Empty = by classification.
+  exclude_kbs:
+    default: ""
+    description: Never install these KB numbers (comma-separated).
+  reboot:
+    default: if-required
+    options: [if-required, never, always]
+    description: Restart when an update needs it, never (finish at the next restart), or always.
+  passes:
+    default: "2"
+    options: ["1", "2", "3"]
+    description: Install rounds; after a restart, the next round installs updates that needed it.
+steps:
+  - name: Install Windows updates
+    windows_update:
+      classifications: "{{classifications}}"
+      kbs: "{{kbs}}"
+      exclude: "{{exclude_kbs}}"
+      reboot: "{{reboot}}"
+      passes: "{{passes}}"
