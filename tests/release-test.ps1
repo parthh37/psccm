@@ -452,7 +452,7 @@ try {
         $u = Ok (Api GET '/update')
         Assert ($u.current -eq $script:Version) "current $($u.current) vs binary $script:Version"
     }
-    Test-Step 'Update' 'Latest release is found and verifiable' {
+    Test-Step 'Update' 'Latest release is found, signed and verifiable' {
         if (-not $UpdateRepo) { Skip 'pass -UpdateRepo owner/repo to test against published releases' }
         $u = Ok (Api GET '/update')
         $s = $u.settings
@@ -462,6 +462,7 @@ try {
         if ($ExpectedVersion) { Assert ($r.version -eq $ExpectedVersion) "latest release is $($r.version)" }
         Assert (-not $r.newer) 'this build thinks a newer version exists'
         Assert ($r.asset_name) 'no download for this platform in the release'
+        Assert (-not $r.signature_error) "signature not accepted: $($r.signature_error)"
         Assert ($r.sha256) 'release has no SHA256SUMS entry for the download'
         "latest $($r.version): $($r.asset_name)"
     }

@@ -1,10 +1,16 @@
 //! Auto-update from GitHub releases.
 //!
 //! A release carries `psccm-setup-<ver>.exe` (Windows installer),
-//! `psccm-x86_64-linux` (Linux binary) and `SHA256SUMS`. Updates are only
-//! installed when the downloaded file matches its checksum.
+//! `psccm-x86_64-linux` (Linux binary), `SHA256SUMS` and `SHA256SUMS.sig`.
+//! Updates are only installed when `SHA256SUMS.sig` is a valid signature by
+//! the release key built into this binary and the download matches its
+//! checksum, so a release published by anyone else (a stolen GitHub token, a
+//! changed `repo` setting) is refused.
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -17,6 +23,16 @@ pub const DEFAULT_REPO: &str = match option_env!("PSCCM_UPDATE_REPO") {
     Some(r) => r,
     None => "parthh37/psccm",
 };
+
+/// Public key (base64) that release signatures are checked against. Building
+/// with `PSCCM_UPDATE_PUBKEY` set (e.g. for a fork) replaces the default.
+pub const UPDATE_PUBKEY: &str = match option_env!("PSCCM_UPDATE_PUBKEY") {
+    Some(k) if !k.is_empty() => k,
+    _ => RELEASE_PUBKEY,
+};
+/// Public half of the `PSCCM_SIGNING_KEY` secret the release workflow signs
+/// with (README, "Release signing"). Empty: this build installs no updates.
+const RELEASE_PUBKEY: &str = "";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSettings {
@@ -58,6 +74,9 @@ pub struct Release {
     pub asset_url: Option<String>,
     pub sha256: Option<String>,
     pub newer: bool,
+    /// Why the release's signature could not be verified (it is not installed).
+    #[serde(default)]
+    pub signature_error: Option<String>,
 }
 
 /// Numeric version compare: "0.10.1" > "0.9.3". Pre-release suffixes are ignored.
@@ -144,13 +163,18 @@ pub async fn check(app: &App) -> Result<Release> {
     }
     let gh: GhRelease = resp.error_for_status()?.json().await.context("reading release info")?;
     let asset = gh.assets.iter().find(|a| wanted_asset(&a.name));
-    let mut sha256 = None;
-    if let (Some(a), Some(sums)) = (asset, gh.assets.iter().find(|a| a.name == "SHA256SUMS")) {
-        let text = http.get(&sums.browser_download_url).send().await?.error_for_status()?.text().await?;
-        sha256 = text.lines().find_map(|l| {
-            let (hash, name) = l.split_once(char::is_whitespace)?;
-            (name.trim().trim_start_matches('*') == a.name).then(|| hash.to_lowercase())
-        });
+    let named = |n: &str| gh.assets.iter().find(|a| a.name == n);
+    let (mut sha256, mut signature_error) = (None, None);
+    if let (Some(a), Some(sums)) = (asset, named("SHA256SUMS")) {
+        let sums = http.get(&sums.browser_download_url).send().await?.error_for_status()?.bytes().await?;
+        let sig = match named("SHA256SUMS.sig") {
+            Some(s) => http.get(&s.browser_download_url).send().await?.error_for_status()?.text().await?,
+            None => String::new(),
+        };
+        match verify_sums(UPDATE_PUBKEY, &gh.tag_name, &sums, &sig) {
+            Ok(()) => sha256 = sum_for(&String::from_utf8_lossy(&sums), &a.name),
+            Err(e) => signature_error = Some(format!("{e:#}")),
+        }
     }
     let version = gh.tag_name.trim_start_matches('v').to_string();
     let release = Release {
@@ -162,6 +186,7 @@ pub async fn check(app: &App) -> Result<Release> {
         asset_name: asset.map(|a| a.name.clone()),
         asset_url: asset.map(|a| a.browser_download_url.clone()),
         sha256,
+        signature_error,
     };
     s.last_check = Some(now());
     s.latest = Some(release.clone());
@@ -185,6 +210,9 @@ pub async fn install(app: &App) -> Result<String> {
         .clone()
         .zip(release.asset_url.clone())
         .ok_or_else(|| anyhow!("release {} has no download for this platform", release.version))?;
+    if let Some(e) = &release.signature_error {
+        bail!("refusing to install {}: {e}", release.version);
+    }
     let expected = release.sha256.clone().ok_or_else(|| anyhow!("release has no SHA256SUMS entry for {name}; refusing to install"))?;
     let bytes = client()?.get(&url).send().await?.error_for_status()?.bytes().await?;
     let got = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -198,6 +226,46 @@ pub async fn install(app: &App) -> Result<String> {
     info!("update {} downloaded and verified: {}", release.version, file.display());
     launch(&file, &dir)?;
     Ok(format!("Installing PSCCM {} — the console restarts in a minute.", release.version))
+}
+
+/// What the release workflow signs: a line naming the tag, then SHA256SUMS.
+/// Including the tag stops an old signed release from being re-published
+/// under a newer tag to downgrade installs.
+fn signed_message(tag: &str, sums: &[u8]) -> Vec<u8> {
+    [format!("psccm-release {tag}\n").as_bytes(), sums].concat()
+}
+
+/// Check `sig` (the base64 contents of SHA256SUMS.sig) over a release's tag
+/// and SHA256SUMS with the base64 ed25519 `pubkey`, given either as the raw
+/// 32 bytes or as the body of `openssl pkey -pubout`.
+fn verify_sums(pubkey: &str, tag: &str, sums: &[u8], sig: &str) -> Result<()> {
+    if pubkey.is_empty() {
+        bail!("this build has no release signing key, so it cannot verify updates; install new versions by hand");
+    }
+    // An SPKI public key is a fixed 12-byte header followed by the raw key.
+    const SPKI: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+    let key = B64.decode(pubkey.trim()).context("decoding the release signing key")?;
+    let raw: &[u8; 32] = key
+        .strip_prefix(&SPKI[..])
+        .unwrap_or(&key)
+        .try_into()
+        .map_err(|_| anyhow!("the release signing key is not an ed25519 key"))?;
+    let key = VerifyingKey::from_bytes(raw).map_err(|_| anyhow!("the release signing key is not a valid ed25519 key"))?;
+    if sig.trim().is_empty() {
+        bail!("the release is not signed (no SHA256SUMS.sig)");
+    }
+    let sig = B64.decode(sig.trim()).ok().and_then(|b| Signature::from_slice(&b).ok());
+    let sig = sig.ok_or_else(|| anyhow!("SHA256SUMS.sig is not an ed25519 signature"))?;
+    key.verify_strict(&signed_message(tag, sums), &sig)
+        .map_err(|_| anyhow!("SHA256SUMS.sig does not match: the release was not signed with the PSCCM release key"))
+}
+
+/// The hash for `name` in a SHA256SUMS list.
+fn sum_for(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|l| {
+        let (hash, file) = l.split_once(char::is_whitespace)?;
+        (file.trim().trim_start_matches('*') == name).then(|| hash.to_lowercase())
+    })
 }
 
 #[cfg(windows)]
@@ -263,7 +331,87 @@ pub async fn tick(app: &App) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const SUMS: &[u8] = b"abc123  psccm-setup-1.2.3.exe\ndef456  psccm-x86_64-linux\n";
+
+    fn keypair() -> (SigningKey, String) {
+        let sk = SigningKey::from_bytes(&[7; 32]);
+        let pk = B64.encode(sk.verifying_key().as_bytes());
+        (sk, pk)
+    }
+
+    fn sign(sk: &SigningKey, tag: &str, sums: &[u8]) -> String {
+        B64.encode(sk.sign(&signed_message(tag, sums)).to_bytes())
+    }
+
+    #[test]
+    fn valid_signature() {
+        let (sk, pk) = keypair();
+        verify_sums(&pk, "v1.2.3", SUMS, &sign(&sk, "v1.2.3", SUMS)).unwrap();
+        // With the trailing newline `base64` writes in the workflow.
+        verify_sums(&pk, "v1.2.3", SUMS, &format!("{}\n", sign(&sk, "v1.2.3", SUMS))).unwrap();
+    }
+
+    #[test]
+    fn tampered_release() {
+        let (sk, pk) = keypair();
+        let sig = sign(&sk, "v1.2.3", SUMS);
+        let evil = b"000000  psccm-setup-1.2.3.exe\ndef456  psccm-x86_64-linux\n";
+        assert!(verify_sums(&pk, "v1.2.3", evil, &sig).is_err());
+        // A signed old release re-published under a newer tag.
+        assert!(verify_sums(&pk, "v9.9.9", SUMS, &sig).is_err());
+        let mut bytes = B64.decode(&sig).unwrap();
+        bytes[10] ^= 1;
+        assert!(verify_sums(&pk, "v1.2.3", SUMS, &B64.encode(bytes)).is_err());
+    }
+
+    #[test]
+    fn wrong_key() {
+        let (_, pk) = keypair();
+        let other = SigningKey::from_bytes(&[9; 32]);
+        let err = verify_sums(&pk, "v1.2.3", SUMS, &sign(&other, "v1.2.3", SUMS)).unwrap_err();
+        assert!(err.to_string().contains("not signed with the PSCCM release key"), "{err}");
+    }
+
+    #[test]
+    fn missing_or_garbage_signature() {
+        let (_, pk) = keypair();
+        let err = verify_sums(&pk, "v1.2.3", SUMS, "").unwrap_err();
+        assert!(err.to_string().contains("not signed"), "{err}");
+        assert!(verify_sums(&pk, "v1.2.3", SUMS, "not base64!").is_err());
+        assert!(verify_sums(&pk, "v1.2.3", SUMS, &B64.encode([1u8; 32])).is_err());
+    }
+
+    #[test]
+    fn no_key_built_in() {
+        let (sk, _) = keypair();
+        let err = verify_sums("", "v1.2.3", SUMS, &sign(&sk, "v1.2.3", SUMS)).unwrap_err();
+        assert!(err.to_string().contains("no release signing key"), "{err}");
+        assert!(verify_sums("AAAA", "v1.2.3", SUMS, &sign(&sk, "v1.2.3", SUMS)).is_err());
+    }
+
+    /// A signature made the way the release workflow makes it, with
+    /// `openssl pkeyutl -sign -rawin` (throwaway key).
+    #[test]
+    fn openssl_signature() {
+        let sums = b"abc123  psccm-x86_64-linux\n";
+        let sig = "tKQQojm1XDEG4lr+XLdGgBGTnLaGwuc+zx5aqTn55cgEI+PYkyD9buuFxZ28XdXS3sWvcs/QK9249V4WDPPzAA==";
+        let raw = "kKQlq0qEUvIIuM/KfH2MMNNN1HEIkHRojCyX9IZC9RQ=";
+        let spki = "MCowBQYDK2VwAyEAkKQlq0qEUvIIuM/KfH2MMNNN1HEIkHRojCyX9IZC9RQ=";
+        verify_sums(raw, "v1.2.3", sums, sig).unwrap();
+        verify_sums(spki, "v1.2.3", sums, sig).unwrap();
+        assert!(verify_sums(spki, "v1.2.4", sums, sig).is_err());
+    }
+
+    #[test]
+    fn sums_lookup() {
+        let text = "ABC123  psccm-setup-1.2.3.exe\ndef456 *psccm-x86_64-linux\n";
+        assert_eq!(sum_for(text, "psccm-setup-1.2.3.exe").as_deref(), Some("abc123"));
+        assert_eq!(sum_for(text, "psccm-x86_64-linux").as_deref(), Some("def456"));
+        assert_eq!(sum_for(text, "psccm"), None);
+    }
 
     #[test]
     fn versions() {
