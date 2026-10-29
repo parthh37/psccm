@@ -127,6 +127,7 @@ const ICON = {
   history: '<path d="M13 3a9 9 0 1 0 8.94 10h-2.02A7 7 0 1 1 13 5V2l4 4-4 4V7a5 5 0 1 0 5 5h2a7 7 0 0 1-7 7zM12 8h2v5l4 2-1 1.7-5-2.7z"/>',
   computers: '<path d="M3 4h18v12H3zm2 2v8h14V6zM8 18h8v2H8z"/>',
   packages: '<path d="M12 2l9 5v10l-9 5-9-5V7zm0 2.3L5.5 8 12 11.6 18.5 8zM5 9.7v6.1l6 3.4v-6.2zm8 9.5l6-3.4V9.7l-6 3.3z"/>',
+  catalog: '<path d="M7 7V6a5 5 0 0 1 10 0v1h4l-1 15H4L3 7zm2 0h6V6a3 3 0 0 0-6 0zM5.1 9l.8 11h12.2l.8-11z"/>',
   inventory: '<path d="M9 2h6a1 1 0 0 1 1 1v1h3v18H5V4h3V3a1 1 0 0 1 1-1zm1 2v2h4V4zM7 6v14h10V6h-1v2H8V6zm2 5h6v2H9zm0 4h6v2H9z"/>',
   gpo: '<path d="M12 2l8 3v6c0 5-3.4 9.4-8 11-4.6-1.6-8-6-8-11V5zm0 2.2L6 6.4V11c0 3.9 2.5 7.4 6 8.9 3.5-1.5 6-5 6-8.9V6.4zM11 7h2v6h-2zm0 8h2v2h-2z"/>',
   schedules: '<path d="M7 2h2v2h6V2h2v2h3v18H4V4h3zm-1 8v10h12V10zm0-4v2h12V6z"/>',
@@ -135,7 +136,7 @@ const ICON = {
 
 const NAV = [
   ['dashboard', 'Dashboard'], ['deploy', 'Deploy'], ['history', 'Deployments'], ['computers', 'Computers'],
-  ['inventory', 'Inventory'], ['packages', 'Packages'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
+  ['inventory', 'Inventory'], ['packages', 'Packages'], ['catalog', 'App catalog'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
 ];
 
 // ------------------------------------------------------------------ router
@@ -1521,6 +1522,106 @@ Object.assign(App, {
   }),
 });
 
+// ------------------------------------------------------------- app catalog
+
+const catPill = (cls, text) => `<span class="pill s-${esc(cls)}">${esc(text)}</span>`;
+
+function catalogStatus(a) {
+  const cur = a.current;
+  if (a.busy) {
+    const { done, total } = a.busy;
+    return catPill('running', total ? `downloading ${Math.round((100 * done) / total)}%` : done ? `downloading ${sizeFmt(done)}` : 'looking up…');
+  }
+  if (!a.added) return '<span class="muted">not added</span>';
+  if (!cur) return catPill('failed', 'not downloaded');
+  return `${a.update_available ? catPill('scheduled', `${cur.version} → ${a.latest}`) : catPill('success', cur.version)}
+    <div class="small muted">${sizeFmt(cur.size)} · ${cur.verified ? 'SHA-256 matches the vendor' : 'HTTPS download'} · ${ago(cur.downloaded_at)}</div>`;
+}
+
+async function pageCatalog(el) {
+  const c = await GET('/catalog');
+  PKGS = null; // catalog packages come and go
+  if (!c.last_check && !c.checking) {
+    await POST('/catalog/check');
+    c.checking = true;
+  }
+  const row = (a) => `<tr>
+      <td style="min-width:240px"><b>${esc(a.name)}</b>${a.homepage ? ` <a class="small" href="${esc(a.homepage)}" target="_blank" rel="noopener">site</a>` : ''}
+        <div class="small muted">${esc(a.description)}</div>
+        ${a.error ? `<div class="small err">${esc(a.error)}</div>` : ''}</td>
+      <td class="small">${a.latest ? `<b>${esc(a.latest)}</b>` : '<span class="muted">—</span>'}${a.checked_at ? `<div class="muted">${ago(a.checked_at)}</div>` : ''}</td>
+      <td class="small">${catalogStatus(a)}</td>
+      <td class="small">${a.added ? (a.deploy_groups.length ? a.deploy_groups.map((g) => `<span class="tag">${esc(g)}</span>`).join(' ') : '<span class="muted">manual</span>') : ''}</td>
+      <td><div class="row" style="gap:6px;justify-content:flex-end">${!a.added
+        ? `<button class="primary" onclick="App.catAdd('${esc(a.id)}')" ${a.busy ? 'disabled' : ''}>Add</button>`
+        : `${a.update_available || !a.current || a.error ? `<button onclick="App.catUpdate('${esc(a.id)}')" ${a.busy ? 'disabled' : ''}>${a.current ? 'Update' : 'Retry'}</button>` : ''}
+          <button class="primary" onclick="App.deployPackage('${esc(a.package_id)}')" ${a.current && !a.busy ? '' : 'disabled'}>Deploy</button>
+          <button onclick="App.catGroups('${esc(a.id)}')">Auto-deploy</button>
+          <button class="danger" onclick="App.catRemove('${esc(a.id)}')" ${a.busy ? 'disabled' : ''}>Remove</button>`}</div></td></tr>`;
+  el.innerHTML = `<div class="page-head"><h1>App catalog</h1>
+      <span class="sub">Common apps at their latest version — downloaded once to the repository, checked and kept as ready-to-deploy packages</span>
+      <div class="actions"><button class="primary" onclick="App.catCheck()" ${c.checking ? 'disabled' : ''}>${c.checking ? 'Checking…' : 'Check for updates'}</button></div></div>
+    ${c.errors.length ? `<div class="card"><div class="card-body err">${c.errors.map(esc).join('<br>')}</div></div>` : ''}
+    <div class="card"><div class="card-body small">
+      <label class="check"><input type="checkbox" ${c.auto_check ? 'checked' : ''} onchange="App.catAuto(this.checked)">
+        Check daily and download new versions of added apps (and deploy them to their auto-deploy groups)</label>
+      <div class="muted" style="margin-top:6px">Last check: ${c.checking ? 'running now' : c.last_check ? ago(c.last_check) : 'never'}.
+        <b>Add</b> downloads the 64-bit installer and creates a package <code>catalog-…</code> in the "App catalog" category.
+        Computers get the installer pushed from the console, so they need no internet access, and computers that already have the version are skipped.
+        Add your own apps in <code>${esc(c.custom_file)}</code> (same format as the built-in catalog).</div>
+    </div></div>
+    <div class="card"><div class="card-body flush"><div class="table-wrap"><table><thead><tr>
+        <th>App</th><th>Latest</th><th>In PSCCM</th><th>Auto-deploy to</th><th></th></tr></thead><tbody>
+      ${groupByCategory(c.apps).map(([cat, apps]) => `<tr><td colspan="5"><div class="cat" style="margin:4px 0 0">${esc(cat || 'Other')}</div></td></tr>${apps.map(row).join('')}`).join('')}
+    </tbody></table></div></div></div>`;
+  if (c.checking || c.apps.some((a) => a.busy)) poll(() => pageCatalog(el).catch(() => {}), 1500);
+}
+
+Object.assign(App, {
+  catCheck: act(async () => {
+    await POST('/catalog/check');
+    toast('Looking up the latest versions…');
+    pageCatalog($('#main'));
+  }),
+  catAuto: act(async (on) => {
+    await PUT('/catalog/settings', { auto_check: on });
+    toast(on ? 'Daily check on' : 'Daily check off');
+  }),
+  catAdd: act(async (id) => {
+    await POST(`/catalog/${id}/add`);
+    toast('Downloading the latest version…');
+    pageCatalog($('#main'));
+  }),
+  catUpdate: act(async (id) => {
+    await POST(`/catalog/${id}/update`);
+    pageCatalog($('#main'));
+  }),
+  catRemove: act(async (id) => {
+    if (!confirm('Remove this app\'s package and downloaded installers? (Nothing is uninstalled from computers.)')) return;
+    await DEL('/catalog/' + id);
+    pageCatalog($('#main'));
+  }),
+  catGroups: act(async (id) => {
+    const [{ apps }, { groups }] = await Promise.all([GET('/catalog'), GET('/groups')]);
+    const a = apps.find((x) => x.id === id);
+    const on = new Set(a.deploy_groups);
+    modal('Auto-deploy ' + a.name, `
+      <p class="small">When a new version is downloaded, deploy it to these groups right away.
+        Computers that already have that version or newer are skipped, so this also installs it on new computers in the group.</p>
+      <div class="field"><label>Groups</label><div class="chips">
+        ${groups.map((g) => `<span class="chip ${on.has(g.name) ? 'on' : ''}" data-group="${esc(g.name)}" onclick="this.classList.toggle('on')">${g.kind === 'dynamic' ? '⚡ ' : ''}${esc(g.name)} <span class="small">${g.members.length}</span></span>`).join('')
+          || '<span class="muted small">No groups yet — create one on the <a href="#/computers">Computers</a> page.</span>'}
+      </div></div>
+      <p class="small muted">To roll out the current version now, use <b>Deploy</b>. For a fixed day and time instead, leave this empty and add a weekly schedule for <code>${esc(a.package_id)}</code>.</p>`,
+    [{ label: 'Cancel' }, { label: 'Save', cls: 'primary', onClick: async (root) => {
+      const deploy_groups = $$('.chip.on', root).map((x) => x.dataset.group);
+      await PUT('/catalog/' + id, { deploy_groups });
+      toast(deploy_groups.length ? `New versions go to ${deploy_groups.join(', ')}` : 'Auto-deploy off');
+      pageCatalog($('#main'));
+    } }]);
+  }),
+});
+
 // ----------------------------------------------------------------- updates
 
 async function loadUpdateBadge() {
@@ -1572,7 +1673,7 @@ function updateCard(u) {
 const PAGES = {
   dashboard: pageDashboard, deploy: pageDeploy, history: pageHistory, deployment: pageDeployment,
   computers: pageComputers, packages: pagePackages, package: pagePackage, schedules: pageSchedules, settings: pageSettings,
-  gpo: pageGpo, inventory: pageInventory,
+  gpo: pageGpo, inventory: pageInventory, catalog: pageCatalog,
 };
 
 route();

@@ -15,6 +15,7 @@ futures = "0.3"
 ldap3 = "0.12"
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+regex = "1"
 rpassword = "7"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
