@@ -386,6 +386,42 @@ try {
         [void](Ok (Api PUT '/settings/winrm' @{ use_ssl = $false; skip_ca_check = $false }))
         Assert ($s.version) 'no version in settings'
     }
+    if ($IsWindows -ne $false) {
+        Test-Step 'Agent' 'Enroll, report metrics and run a command' {
+            $tok = (Ok (Api PUT '/settings/agent' @{ enabled = $true; rotate = $true })).enroll_token
+            $apd = Join-Path $ReportDir 'agentpd'
+            New-Item -ItemType Directory -Force (Join-Path $apd 'PSCCM-Agent') | Out-Null
+            Write-Utf8 (Join-Path $apd 'PSCCM-Agent\agent.json') (@{ server_url = $Base; enroll_token = $tok } | ConvertTo-Json)
+            $old = $env:ProgramData
+            $env:ProgramData = $apd
+            try {
+                $ap = Start-Process -FilePath $Exe -ArgumentList @('agent', 'run') -PassThru -NoNewWindow `
+                    -RedirectStandardOutput (Join-Path $ReportDir 'agent-out.log') -RedirectStandardError (Join-Path $ReportDir 'agent-err.log')
+            }
+            finally { $env:ProgramData = $old }
+            try {
+                $id = $null
+                for ($i = 0; $i -lt 30 -and -not $id; $i++) {
+                    Start-Sleep 1
+                    $a = @(Ok (Api GET '/agents'))
+                    if ($a.Count) { $id = $a[0].id }
+                }
+                Assert $id 'agent did not enroll'
+                $j = Ok (Api POST "/agents/$id/jobs" @{ kind = 'command'; params = @{ shell = 'powershell'; script = 'Write-Output AGENT_RT_OK' } })
+                $out = ''
+                for ($i = 0; $i -lt 40; $i++) {
+                    Start-Sleep 1
+                    $job = Ok (Api GET "/jobs/$($j.job_id)")
+                    if ($job.status -eq 'success' -or $job.status -eq 'failed') { $out = $job.output; break }
+                }
+                Assert ($out -like '*AGENT_RT_OK*') "command output: $out"
+                $agent = @(Ok (Api GET '/agents'))[0]
+                Assert ($agent.online -and $agent.mem_total -gt 0) 'no metrics reported'
+                [void](Ok (Api DELETE "/agents/$id"))
+            }
+            finally { if ($ap -and -not $ap.HasExited) { $ap.Kill() } }
+        }
+    }
     Test-Step 'Deploy' 'Unreachable computer is reported offline' {
         $r = Invoke-Deploy @{ command = 'hostname'; targets = @{ computers = @('rt-a.invalid') } } 120
         Assert-Deploy $r 'failed' @('OFFLINE')

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::agent::{DiskUsage, EnrollReq, Job, JobResult, Metrics, STALE_SECS};
 use crate::secrets;
 
 const SCHEMA: &str = r#"
@@ -102,6 +103,55 @@ CREATE TABLE IF NOT EXISTS group_members (
     group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     computer_id INTEGER NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
     PRIMARY KEY (group_id, computer_id)
+);
+CREATE TABLE IF NOT EXISTS agents (
+    id TEXT PRIMARY KEY,
+    computer TEXT NOT NULL,
+    agent_key TEXT NOT NULL,
+    hostname TEXT NOT NULL DEFAULT '',
+    os TEXT NOT NULL DEFAULT 'unknown',
+    os_version TEXT NOT NULL DEFAULT '',
+    version TEXT NOT NULL DEFAULT '',
+    address TEXT,
+    enrolled_at TEXT NOT NULL,
+    last_checkin TEXT,
+    cpu_pct REAL,
+    mem_used INTEGER,
+    mem_total INTEGER,
+    uptime_secs INTEGER,
+    processes INTEGER,
+    disks TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS agent_jobs (
+    id INTEGER PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    params TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    data TEXT NOT NULL DEFAULT 'null',
+    source TEXT NOT NULL DEFAULT 'console',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_agent ON agent_jobs(agent_id, status);
+CREATE TABLE IF NOT EXISTS agent_metrics (
+    id INTEGER PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    ts TEXT NOT NULL,
+    cpu_pct REAL,
+    mem_used INTEGER,
+    mem_total INTEGER,
+    disks TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_agent ON agent_metrics(agent_id, ts);
+CREATE TABLE IF NOT EXISTS agent_inventory (
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    data TEXT NOT NULL,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, kind)
 );
 CREATE TABLE IF NOT EXISTS inventory (
     computer_id INTEGER PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
@@ -629,6 +679,219 @@ impl Db {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ agents
+
+    /// Create an agent record (called on enrollment) and return its id. The
+    /// caller is responsible for upserting the matching `computers` row.
+    pub fn create_agent(&self, id: &str, key: &str, req: &EnrollReq, address: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO agents(id,computer,agent_key,hostname,os,os_version,version,address,enrolled_at,last_checkin)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+                params![id, req.hostname, key, req.hostname, req.os, req.os_version, req.agent_version, address, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// If an agent already exists for this computer name, return its id so the
+    /// agent re-enrolls into the same record instead of piling up duplicates.
+    pub fn agent_id_for_computer(&self, computer: &str) -> Result<Option<String>> {
+        self.with(|c| {
+            c.query_row("SELECT id FROM agents WHERE computer=?1 COLLATE NOCASE", [computer], |r| r.get(0))
+                .optional()
+        })
+    }
+
+    /// Re-enroll: refresh the key and facts of an existing agent record.
+    pub fn reenroll_agent(&self, id: &str, key: &str, req: &EnrollReq, address: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE agents SET agent_key=?2, hostname=?3, os=?4, os_version=?5, version=?6, address=?7, last_checkin=?8 WHERE id=?1",
+                params![id, key, req.hostname, req.os, req.os_version, req.agent_version, address, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// The stored key for an agent, for authenticating its requests.
+    pub fn agent_key(&self, id: &str) -> Result<Option<String>> {
+        self.with(|c| {
+            c.query_row("SELECT agent_key FROM agents WHERE id=?1", [id], |r| r.get(0)).optional()
+        })
+    }
+
+    pub fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
+        self.with(|c| {
+            c.query_row("SELECT * FROM agents WHERE id=?1", [id], Agent::from_row).optional()
+        })
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<Agent>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM agents ORDER BY computer COLLATE NOCASE")?;
+            st.query_map([], Agent::from_row)?.collect()
+        })
+    }
+
+    pub fn delete_agent(&self, id: &str) -> Result<()> {
+        self.with(|c| c.execute("DELETE FROM agents WHERE id=?1", [id]))?;
+        Ok(())
+    }
+
+    /// Record a check-in: bump `last_checkin`, store the latest metrics snapshot
+    /// on the agent row and append a history point.
+    pub fn agent_checkin(&self, id: &str, version: &str, metrics: Option<&Metrics>) -> Result<()> {
+        self.with(|c| {
+            match metrics {
+                Some(m) => {
+                    let disks = serde_json::to_string(&m.disks).unwrap_or_else(|_| "[]".into());
+                    // SQLite integers are i64; u64 metrics are cast on the way in.
+                    let (used, total, uptime) = (m.mem_used as i64, m.mem_total as i64, m.uptime_secs as i64);
+                    c.execute(
+                        "UPDATE agents SET last_checkin=?2, version=CASE WHEN ?3<>'' THEN ?3 ELSE version END,
+                            cpu_pct=?4, mem_used=?5, mem_total=?6, uptime_secs=?7, processes=?8, disks=?9 WHERE id=?1",
+                        params![id, now(), version, m.cpu_pct, used, total, uptime, m.processes, disks],
+                    )?;
+                    c.execute(
+                        "INSERT INTO agent_metrics(agent_id,ts,cpu_pct,mem_used,mem_total,disks) VALUES(?1,?2,?3,?4,?5,?6)",
+                        params![id, now(), m.cpu_pct, used, total, disks],
+                    )?;
+                }
+                None => {
+                    c.execute(
+                        "UPDATE agents SET last_checkin=?2, version=CASE WHEN ?3<>'' THEN ?3 ELSE version END WHERE id=?1",
+                        params![id, now(), version],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Keep at most `keep` metric points per agent (called periodically).
+    pub fn prune_agent_metrics(&self, keep: usize) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM agent_metrics WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY ts DESC) AS rn FROM agent_metrics
+                    ) WHERE rn > ?1
+                )",
+                [keep as i64],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn agent_metrics_history(&self, id: &str, limit: usize) -> Result<Vec<MetricPoint>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT ts,cpu_pct,mem_used,mem_total,disks FROM agent_metrics WHERE agent_id=?1 ORDER BY ts DESC LIMIT ?2",
+            )?;
+            let mut v: Vec<MetricPoint> = st.query_map(params![id, limit as i64], MetricPoint::from_row)?.collect::<rusqlite::Result<_>>()?;
+            v.reverse();
+            Ok(v)
+        })
+    }
+
+    // -------------------------------------------------------------- agent jobs
+
+    pub fn queue_job(&self, agent_id: &str, kind: &str, params: &serde_json::Value, source: &str) -> Result<i64> {
+        let p = serde_json::to_string(params)?;
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO agent_jobs(agent_id,kind,params,source,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![agent_id, kind, p, source, now()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// Hand the agent its queued jobs, marking them running.
+    pub fn claim_jobs(&self, agent_id: &str) -> Result<Vec<Job>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id,kind,params FROM agent_jobs WHERE agent_id=?1 AND status='queued' ORDER BY id")?;
+            let jobs: Vec<Job> = st
+                .query_map([agent_id], |r| {
+                    Ok(Job {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        params: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or(serde_json::Value::Null),
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            for j in &jobs {
+                c.execute(
+                    "UPDATE agent_jobs SET status='running', started_at=?2 WHERE id=?1",
+                    params![j.id, now()],
+                )?;
+            }
+            Ok(jobs)
+        })
+    }
+
+    pub fn complete_job(&self, r: &JobResult) -> Result<()> {
+        let data = serde_json::to_string(&r.data).unwrap_or_else(|_| "null".into());
+        self.with(|c| {
+            c.execute(
+                "UPDATE agent_jobs SET status=?2, output=?3, data=?4, finished_at=?5 WHERE id=?1",
+                params![r.job_id, r.status, r.output, data, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn list_jobs(&self, agent_id: &str, limit: usize) -> Result<Vec<AgentJob>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT * FROM agent_jobs WHERE agent_id=?1 ORDER BY id DESC LIMIT ?2")?;
+            st.query_map(params![agent_id, limit as i64], AgentJob::from_row)?.collect()
+        })
+    }
+
+    pub fn get_job(&self, id: i64) -> Result<Option<AgentJob>> {
+        self.with(|c| {
+            c.query_row("SELECT * FROM agent_jobs WHERE id=?1", [id], AgentJob::from_row).optional()
+        })
+    }
+
+    /// Jobs left running when the console restarted are marked failed.
+    pub fn fail_interrupted_jobs(&self) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE agent_jobs SET status='failed', output='console restarted before the agent returned a result', finished_at=?1 WHERE status='running'",
+                [now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    // --------------------------------------------------------- agent inventory
+
+    pub fn set_agent_inventory(&self, agent_id: &str, kind: &str, data: &serde_json::Value) -> Result<()> {
+        let d = serde_json::to_string(data)?;
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO agent_inventory(agent_id,kind,data,synced_at) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(agent_id,kind) DO UPDATE SET data=excluded.data, synced_at=excluded.synced_at",
+                params![agent_id, kind, d, now()],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_agent_inventory(&self, agent_id: &str, kind: &str) -> Result<Option<(serde_json::Value, String)>> {
+        let row: Option<(String, String)> = self.with(|c| {
+            c.query_row(
+                "SELECT data, synced_at FROM agent_inventory WHERE agent_id=?1 AND kind=?2",
+                params![agent_id, kind],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })?;
+        Ok(row.map(|(d, ts)| (serde_json::from_str(&d).unwrap_or(serde_json::Value::Null), ts)))
+    }
+
     // --------------------------------------------------------------- inventory
 
     /// Store a successful scan, replacing the computer's previous inventory.
@@ -1050,6 +1313,113 @@ impl Schedule {
 
 pub fn not_found(what: &str) -> anyhow::Error {
     anyhow!("{what} not found")
+}
+
+/// A resident agent and its latest resource snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct Agent {
+    pub id: String,
+    pub computer: String,
+    #[serde(skip)]
+    pub agent_key: String,
+    pub hostname: String,
+    pub os: String,
+    pub os_version: String,
+    pub version: String,
+    pub address: Option<String>,
+    pub enrolled_at: String,
+    pub last_checkin: Option<String>,
+    /// True when the last check-in is recent (see [`STALE_SECS`]).
+    pub online: bool,
+    pub cpu_pct: Option<f32>,
+    pub mem_used: Option<u64>,
+    pub mem_total: Option<u64>,
+    pub uptime_secs: Option<u64>,
+    pub processes: Option<u32>,
+    pub disks: Vec<DiskUsage>,
+}
+
+impl Agent {
+    fn from_row(r: &Row) -> rusqlite::Result<Agent> {
+        let last_checkin: Option<String> = r.get("last_checkin")?;
+        let online = last_checkin
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .is_some_and(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds() < STALE_SECS);
+        Ok(Agent {
+            id: r.get("id")?,
+            computer: r.get("computer")?,
+            agent_key: r.get("agent_key")?,
+            hostname: r.get("hostname")?,
+            os: r.get("os")?,
+            os_version: r.get("os_version")?,
+            version: r.get("version")?,
+            address: r.get("address")?,
+            enrolled_at: r.get("enrolled_at")?,
+            last_checkin,
+            online,
+            cpu_pct: r.get("cpu_pct")?,
+            mem_used: r.get::<_, Option<i64>>("mem_used")?.map(|v| v as u64),
+            mem_total: r.get::<_, Option<i64>>("mem_total")?.map(|v| v as u64),
+            uptime_secs: r.get::<_, Option<i64>>("uptime_secs")?.map(|v| v as u64),
+            processes: r.get::<_, Option<i64>>("processes")?.map(|v| v as u32),
+            disks: serde_json::from_str(&r.get::<_, String>("disks")?).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentJob {
+    pub id: i64,
+    pub agent_id: String,
+    pub kind: String,
+    pub params: serde_json::Value,
+    pub status: String,
+    pub output: String,
+    pub data: serde_json::Value,
+    pub source: String,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+impl AgentJob {
+    fn from_row(r: &Row) -> rusqlite::Result<AgentJob> {
+        Ok(AgentJob {
+            id: r.get("id")?,
+            agent_id: r.get("agent_id")?,
+            kind: r.get("kind")?,
+            params: serde_json::from_str(&r.get::<_, String>("params")?).unwrap_or(serde_json::Value::Null),
+            status: r.get("status")?,
+            output: r.get("output")?,
+            data: serde_json::from_str(&r.get::<_, String>("data")?).unwrap_or(serde_json::Value::Null),
+            source: r.get("source")?,
+            created_at: r.get("created_at")?,
+            started_at: r.get("started_at")?,
+            finished_at: r.get("finished_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricPoint {
+    pub ts: String,
+    pub cpu_pct: Option<f32>,
+    pub mem_used: Option<u64>,
+    pub mem_total: Option<u64>,
+    pub disks: Vec<DiskUsage>,
+}
+
+impl MetricPoint {
+    fn from_row(r: &Row) -> rusqlite::Result<MetricPoint> {
+        Ok(MetricPoint {
+            ts: r.get(0)?,
+            cpu_pct: r.get(1)?,
+            mem_used: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+            mem_total: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+            disks: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+        })
+    }
 }
 
 /// A named set of computers: either a fixed member list ("static") or

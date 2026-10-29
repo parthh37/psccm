@@ -15,6 +15,9 @@ computers without installing an agent, similar to PDQ Deploy.
   software, with a software report across all computers.
 - **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
   apply their computer settings directly on chosen computers, with no GPO link or AD change.
+- **Optional agent** for computers with no WinRM/SSH: it connects out to the console and adds live
+  CPU/disk analytics, on-demand event-log capture, Task Scheduler, firewall and local-user
+  management, and an in-browser terminal — all with nothing opened inbound.
 - **Web console** for everyday use, plus a **CLI** for scripts and CI pipelines.
 - **YAML packages** with detection, variables, conditions, retries, rollback, rolling
   batches and steps delegated to another host (e.g. drain HAProxy while patching IIS).
@@ -192,6 +195,60 @@ Reading SYSVOL uses the service account (Windows mode) or the AD credential (LDA
 
 ---
 
+## Agent (for computers without WinRM/SSH)
+
+Most fleets have machines with neither WinRM nor SSH enabled, so the console cannot reach them
+inbound. The **PSCCM agent** solves this: it is the same `psccm` executable run as a small resident
+service that **connects out** to the console over HTTPS and long-polls for work. Nothing is opened
+inbound on the target. Because the agent runs as **LocalSystem**, it can do everything locally that
+would otherwise need remoting.
+
+With an agent you get, per computer:
+
+- **Analytics** — CPU, memory, disk/HDD usage, uptime and process count, updated continuously, shown
+  on the **Agents** page with live bars.
+- **On-demand event logs** — collect from System/Application/Security/Setup with level, time-range and
+  event-ID filters (`Get-WinEvent`).
+- **Scheduled Tasks** — sync the Task Scheduler inventory and run / enable / disable / delete tasks.
+- **Windows Firewall** — list rules and add / enable / disable / delete them.
+- **Local users & groups** (the lusrmgr jobs) — create / delete / enable / disable users, set
+  passwords, and change group membership.
+- **Web terminal** — an interactive `cmd`/PowerShell (or `bash`) session in the browser, run as
+  SYSTEM, as the logged-on user (no password), or as a specific account (password runas).
+- **Commands** — run an ad-hoc script and see its output, optionally under a chosen account.
+
+### Enrolling agents
+
+*Settings → Agents* holds the shared **enrollment token** and a ready-to-run installer. There are two
+ways to get the agent onto a machine:
+
+1. **Standalone / GPO (no remoting needed).** Copy the one-line PowerShell command from
+   *Settings → Agents* and run it as administrator on the target, or drop it into a **GPO startup /
+   login script** or any other push tool. It downloads the agent from the console
+   (`/download/agent`, gated by the enrollment token) and runs `psccm agent install`.
+2. **Deploy via WinRM/SSH.** For machines that still have remoting, put the `psccm` binary in the
+   repository folder (`psccm.exe` for Windows, `psccm` for Linux) and deploy the built-in
+   **Install PSCCM Agent** package with the console URL and token as variables.
+
+The agent registers as the Windows service **`PSCCMAgent`** (LocalSystem) or a Linux
+`psccm-agent` systemd unit, enrolls, and then appears under **Agents**. Re-running the installer on a
+known computer re-enrolls into the same record. Agents self-update from the same GitHub releases as
+the console.
+
+CLI: `psccm agent install --server https://console:8080 --token <tok>`, `psccm agent status`,
+`psccm agent run` (foreground, for testing), `psccm agent uninstall`.
+
+### Security
+
+The agent runs as LocalSystem, so anyone who can use the console can run commands and change the
+firewall, tasks and local accounts on every enrolled machine — protect the console like a domain
+admin account (bind to localhost or set a strong `--token`). Agent traffic authenticates with the
+enrollment token (to join) and then a per-agent key; the console accepts self-signed HTTPS. Run-as
+passwords are sent to the agent over the connection and masked in the console UI; impersonating the
+logged-on user needs no password and is preferred.
+
+---
+
 ## App catalog
 
 *App catalog* page. A list of common Windows applications that PSCCM keeps at their latest
@@ -236,6 +293,8 @@ and `installer: { url: https://.../{{version}}/setup.msi }` (also `{{version_nod
 
 CLI: `psccm catalog list`, `psccm catalog add 7zip google-chrome`, `psccm catalog update`,
 `psccm catalog check`. (The CLI downloads but does not auto-deploy; the console's daily check does.)
+
+---
 
 ## Deploy options
 
@@ -451,6 +510,7 @@ WinRM, which is useful to test packages on a dev box.
 
 Source map: `src/package.rs` (YAML format), `src/engine.rs` (deployment runner), `src/catalog.rs` (App catalog),
 `src/transport/` (WinRM, SSH), `src/ad.rs`, `src/gpo.rs`, `src/groups.rs`, `src/inventory.rs`
-(scan scripts in `src/assets/`), `src/update.rs`,
-`src/service.rs`, `src/scheduler.rs`, `src/web.rs` (API), `web/` (UI), `installer/` (Inno Setup),
+(scan scripts in `src/assets/`), `src/update.rs`, `src/service.rs`, `src/scheduler.rs`,
+`src/web.rs` (API), `src/agent/` (agent protocol, runtime, jobs, Win32 run-as and the web
+terminal), `web/` (UI), `installer/` (Inno Setup),
 `packages/` (built-ins).

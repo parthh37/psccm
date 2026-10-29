@@ -1,19 +1,22 @@
 //! Web console: JSON API plus the embedded single-page UI.
 
 use anyhow::{anyhow, bail};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRef, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use crate::ad::{self, AdComputer, AdSettings};
-use crate::app::{App, WinRmSettings};
+use crate::app::{AgentSettings, App, WinRmSettings};
+use crate::agent::{self, RunAs};
 use crate::db::{ComputerUpdate, DeployOptions, Group, GroupRules, NewComputer, NewCredential, Schedule, TargetSpec};
 use crate::{catalog, gpo, inventory, update};
 use crate::engine;
@@ -46,6 +49,13 @@ type ApiResult<T = Value> = Result<Json<T>, ApiError>;
 struct St {
     app: App,
     token: Option<String>,
+}
+
+/// Lets the agent handlers extract `State<App>` from the shared `St` state.
+impl FromRef<St> for App {
+    fn from_ref(st: &St) -> App {
+        st.app.clone()
+    }
 }
 
 pub async fn serve(
@@ -108,12 +118,31 @@ pub async fn serve(
         .route("/targets/{id}/log", get(target_log))
         .route("/schedules", get(list_schedules).post(save_schedule))
         .route("/schedules/{id}", delete(delete_schedule))
+        .route("/agents", get(list_agents))
+        .route("/agents/{id}", get(get_agent).delete(delete_agent))
+        .route("/agents/{id}/jobs", get(list_agent_jobs).post(create_agent_job))
+        .route("/agents/{id}/metrics", get(agent_metrics))
+        .route("/jobs/{id}", get(get_job))
+        .route("/agent/install-command", get(install_command))
+        .route("/settings/agent", put(save_agent_settings))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
+    // Agent-facing endpoints authenticate themselves (enrollment token, then
+    // the per-agent key) instead of the console bearer token.
+    let agent_api = Router::new()
+        .route("/agent/enroll", post(agent::server::enroll))
+        .route("/agents/{id}/terminal", get(terminal_ws))
+        .merge(
+            Router::new()
+                .route("/agent/checkin", post(agent::server::checkin))
+                .route("/agent/job-result", post(agent::server::job_result))
+                .layer(middleware::from_fn_with_state(st.app.clone(), agent::server::agent_auth)),
+        );
     let router = Router::new()
         .route("/", get(|| async { ([(header::CACHE_CONTROL, "no-cache")], Html(INDEX)) }))
         .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript"), (header::CACHE_CONTROL, "no-cache")], APP_JS) }))
         .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css"), (header::CACHE_CONTROL, "no-cache")], STYLE) }))
-        .nest("/api", api)
+        .route("/download/agent", get(download_agent))
+        .nest("/api", api.merge(agent_api))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
@@ -141,6 +170,7 @@ async fn summary(State(st): State<St>) -> ApiResult {
     let lib = app.library()?;
     let deployments = app.db.list_deployments(8)?;
     let running = deployments.iter().filter(|d| d.status == "running").count();
+    let agents = app.db.list_agents()?;
     Ok(Json(json!({
         "computers": computers.len(),
         "online": computers.iter().filter(|c| c.online == Some(true)).count(),
@@ -152,6 +182,8 @@ async fn summary(State(st): State<St>) -> ApiResult {
         "running": running,
         "recent": deployments,
         "credentials": app.db.list_credentials()?.len(),
+        "agents": agents.len(),
+        "agents_online": agents.iter().filter(|a| a.online).count(),
     })))
 }
 
@@ -582,6 +614,7 @@ async fn get_settings(State(st): State<St>) -> ApiResult {
     Ok(Json(json!({
         "ad": ad,
         "winrm": st.app.winrm_settings(),
+        "agent": st.app.agent_settings(),
         "data_dir": st.app.data_dir,
         "packages_dir": st.app.packages_dir(),
         "repo_dir": st.app.repo_dir(),
@@ -769,4 +802,231 @@ async fn save_schedule(State(st): State<St>, Json(mut s): Json<Schedule>) -> Api
 async fn delete_schedule(State(st): State<St>, Path(id): Path<i64>) -> ApiResult {
     st.app.db.delete_schedule(id)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ------------------------------------------------------------------- agents
+
+async fn list_agents(State(st): State<St>) -> ApiResult {
+    Ok(Json(json!(st.app.db.list_agents()?)))
+}
+
+async fn get_agent(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    let agent = st.app.db.get_agent(&id)?.ok_or_else(|| anyhow!("agent not found"))?;
+    let inv = |kind: &str| -> Value {
+        match st.app.db.get_agent_inventory(&id, kind) {
+            Ok(Some((data, synced_at))) => json!({ "data": data, "synced_at": synced_at }),
+            _ => Value::Null,
+        }
+    };
+    let jobs: Vec<Value> = st.app.db.list_jobs(&id, 50)?.into_iter().map(redact_job).collect();
+    Ok(Json(json!({
+        "agent": agent,
+        "jobs": jobs,
+        "tasks": inv("tasks"),
+        "firewall": inv("firewall"),
+        "users": inv("users"),
+        "eventlog": inv("eventlog"),
+    })))
+}
+
+async fn delete_agent(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    st.app.db.delete_agent(&id)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_agent_jobs(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    let jobs: Vec<Value> = st.app.db.list_jobs(&id, 100)?.into_iter().map(redact_job).collect();
+    Ok(Json(json!(jobs)))
+}
+
+const JOB_KINDS: &[&str] = &[
+    "command", "eventlog", "tasks_list", "task_control", "firewall_list", "firewall_set", "users_list", "user_control",
+];
+
+#[derive(Deserialize)]
+struct NewJob {
+    kind: String,
+    #[serde(default)]
+    params: Value,
+}
+
+async fn create_agent_job(State(st): State<St>, Path(id): Path<String>, Json(req): Json<NewJob>) -> ApiResult {
+    if st.app.db.get_agent(&id)?.is_none() {
+        return Err(anyhow!("agent not found").into());
+    }
+    if !JOB_KINDS.contains(&req.kind.as_str()) {
+        return Err(anyhow!("unknown job kind '{}'", req.kind).into());
+    }
+    let job_id = st.app.db.queue_job(&id, &req.kind, &req.params, "console")?;
+    st.app.agents.wake(&id);
+    Ok(Json(json!({ "job_id": job_id })))
+}
+
+async fn get_job(State(st): State<St>, Path(id): Path<i64>) -> ApiResult {
+    let job = st.app.db.get_job(id)?.ok_or_else(|| anyhow!("job not found"))?;
+    Ok(Json(redact_job(job)))
+}
+
+async fn agent_metrics(State(st): State<St>, Path(id): Path<String>, Query(q): Query<LimitQ>) -> ApiResult {
+    let points = st.app.db.agent_metrics_history(&id, q.limit.unwrap_or(120).min(2000))?;
+    Ok(Json(json!(points)))
+}
+
+/// Mask password fields before a job is shown in the console UI.
+fn redact_job(job: crate::db::AgentJob) -> Value {
+    let mut v = json!(job);
+    if let Some(params) = v.get_mut("params").and_then(|p| p.as_object_mut()) {
+        if params.contains_key("password") {
+            params.insert("password".into(), json!("********"));
+        }
+        if let Some(ra) = params.get_mut("run_as").and_then(|r| r.as_object_mut())
+            && ra.get("password").and_then(|p| p.as_str()).is_some_and(|s| !s.is_empty())
+        {
+            ra.insert("password".into(), json!("********"));
+        }
+    }
+    v
+}
+
+#[derive(Deserialize)]
+struct AgentSettingsReq {
+    #[serde(default = "yes_default")]
+    enabled: bool,
+    /// Generate a fresh enrollment token (old agents keep working).
+    #[serde(default)]
+    rotate: bool,
+}
+
+fn yes_default() -> bool {
+    true
+}
+
+async fn save_agent_settings(State(st): State<St>, Json(req): Json<AgentSettingsReq>) -> ApiResult {
+    let mut s: AgentSettings = st.app.agent_settings();
+    s.enabled = req.enabled;
+    if req.rotate || s.enroll_token.is_empty() {
+        s.enroll_token = uuid::Uuid::new_v4().simple().to_string();
+    }
+    st.app.db.set_setting("agent", &s)?;
+    Ok(Json(json!({ "enabled": s.enabled, "enroll_token": s.enroll_token })))
+}
+
+async fn install_command(State(st): State<St>) -> ApiResult {
+    Ok(Json(json!({ "enroll_token": st.app.enroll_token()?, "enabled": st.app.agent_settings().enabled })))
+}
+
+/// Serve the running PSCCM executable so an agent bootstrap can fetch it. The
+/// enrollment token gates the download (the bootstrap has no console token).
+async fn download_agent(State(st): State<St>, Query(q): Query<TokenQ>) -> Result<Response, ApiError> {
+    let expected = st.app.enroll_token()?;
+    if q.token.as_deref() != Some(expected.as_str()) {
+        return Err(anyhow!("invalid or missing enrollment token").into());
+    }
+    let exe = std::env::current_exe().map_err(|e| anyhow!("locating the executable: {e}"))?;
+    let bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading the executable: {e}"))?;
+    let name = if cfg!(windows) { "psccm.exe" } else { "psccm" };
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct TokenQ {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+// ------------------------------------------------------------ terminal (WS)
+
+async fn terminal_ws(
+    State(st): State<St>,
+    Path(id): Path<String>,
+    Query(q): Query<TokenQ>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(tok) = &st.token
+        && q.token.as_deref() != Some(tok.as_str())
+    {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    if st.app.db.get_agent(&id).ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, "agent not found").into_response();
+    }
+    ws.on_upgrade(move |socket| terminal_session(st.app, id, socket))
+}
+
+#[derive(Deserialize)]
+struct TermOpen {
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    run_as: RunAs,
+}
+
+#[derive(Deserialize)]
+struct TermMsg {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    data: String,
+}
+
+/// Bridge one browser WebSocket to an agent terminal session over the
+/// check-in channel.
+async fn terminal_session(app: App, agent_id: String, socket: WebSocket) {
+    let (mut tx, mut rx) = socket.split();
+    // First message opens the shell.
+    let open: TermOpen = match rx.next().await {
+        Some(Ok(Message::Text(t))) => match serde_json::from_str(t.as_str()) {
+            Ok(o) => o,
+            Err(_) => return,
+        },
+        _ => return,
+    };
+    let shell = open.shell.unwrap_or_default();
+    let session_id = app.agents.open_session(&agent_id, &shell, open.run_as);
+    let wake = match app.agents.browser_wake(&session_id) {
+        Some(w) => w,
+        None => return,
+    };
+    let _ = tx.send(Message::Text(json!({ "type": "ready", "session": session_id }).to_string().into())).await;
+
+    loop {
+        tokio::select! {
+            incoming = rx.next() => match incoming {
+                Some(Ok(Message::Text(t))) => {
+                    if let Ok(m) = serde_json::from_str::<TermMsg>(t.as_str()) {
+                        match m.kind.as_str() {
+                            "input" => { app.agents.send_input(&session_id, m.data); }
+                            "close" => break,
+                            _ => {}
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            },
+            _ = wake.notified() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {}
+        }
+        let (chunks, still_open) = app.agents.take_browser_output(&session_id);
+        for chunk in chunks {
+            if tx.send(Message::Text(json!({ "type": "output", "data": chunk }).to_string().into())).await.is_err() {
+                app.agents.close_session(&session_id);
+                app.agents.drop_session(&session_id);
+                return;
+            }
+        }
+        if !still_open {
+            let _ = tx.send(Message::Text(json!({ "type": "closed" }).to_string().into())).await;
+            break;
+        }
+    }
+    app.agents.close_session(&session_id);
+    app.agents.drop_session(&session_id);
 }

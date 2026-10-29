@@ -1,0 +1,44 @@
+id: install-agent
+name: Install PSCCM Agent
+version: "1.0"
+category: PSCCM
+description: >
+  Install the PSCCM management agent on computers that still have WinRM/SSH, so
+  afterwards they are managed over the agent's outbound connection (metrics,
+  event logs, Task Scheduler, firewall, local users and the web terminal) with
+  nothing opened inbound. Put the agent binary in the repository first:
+  `psccm.exe` for Windows, `psccm` for Linux (the same PSCCM executable).
+
+variables:
+  server:
+    required: true
+    description: Console URL the agent connects to, e.g. https://console.corp.local:8080
+  token:
+    required: true
+    secret: true
+    description: Enrollment token from Settings → Agents.
+
+steps:
+  - name: Create agent folder
+    os: windows
+    script: |
+      New-Item -ItemType Directory -Force -Path 'C:\Program Files\PSCCM-Agent' | Out-Null
+
+  - name: Copy agent binary (Windows)
+    os: windows
+    copy: { src: "psccm.exe", dest: 'C:\Program Files\PSCCM-Agent\psccm.exe' }
+
+  - name: Install and start agent (Windows)
+    os: windows
+    script: |
+      & 'C:\Program Files\PSCCM-Agent\psccm.exe' agent install --server '{{server}}' --token '{{token}}'
+
+  - name: Copy agent binary (Linux)
+    os: linux
+    copy: { src: "psccm", dest: "/usr/local/bin/psccm" }
+
+  - name: Install and start agent (Linux)
+    os: linux
+    script: |
+      chmod +x /usr/local/bin/psccm
+      /usr/local/bin/psccm agent install --server '{{server}}' --token '{{token}}'
