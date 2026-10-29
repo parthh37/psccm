@@ -77,5 +77,13 @@ Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue |
     Sort-Object DisplayName, DisplayVersion -Unique |
     ForEach-Object { Out-Inv 'app' @($_.DisplayName, $_.DisplayVersion, $_.Publisher) }
 
+# Store / MSIX apps (Teams, Company Portal...). The fact says they were read, so a computer
+# where reading them failed keeps the Store apps of its previous scan.
+try {
+    $store = @(Get-InstalledAppx | Sort-Object DisplayName, DisplayVersion -Unique)
+    foreach ($a in $store) { Out-Inv 'appx' @($a.DisplayName, $a.DisplayVersion, $a.Publisher) }
+    Fact store_apps $store.Count
+} catch {}
+
 Write-Output "@@inv`tdone"
 exit 0

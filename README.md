@@ -14,6 +14,8 @@ computers without installing an agent, similar to PDQ Deploy.
 - **Inventory**: agentless scans of OS, hardware, disks, logged-on user, pending reboot and installed
   software, with a software report across all computers, outdated App catalog software with one-click
   update, a change history (installed / removed / updated), uninstall from the report and CSV export.
+- **Windows Update**: scan for missing updates (from WSUS or Windows Update), decline problem KBs, and
+  install with automatic restarts on a monthly Patch Tuesday schedule, with no agent needed.
 - **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
   apply their computer settings directly on chosen computers, with no GPO link or AD change.
 - **Optional agent** for computers with no WinRM/SSH: it connects out to the console and adds live
@@ -24,14 +26,17 @@ computers without installing an agent, similar to PDQ Deploy.
   batches and steps delegated to another host (e.g. drain HAProxy while patching IIS).
 - **App catalog**: 7-Zip, Chrome, Firefox, Node.js, Python, Java, VS Code, Git and more at
   their latest version, downloaded once, checksum-verified and kept up to date automatically.
+- **Microsoft 365 Apps, new Teams and Store / MSIX apps**: Office through the Office Deployment
+  Tool, Teams through Microsoft's bootstrapper, and any `.msix`/`.appx` provisioned for all users.
+  Store apps show up in inventory and can be uninstalled from it.
 - **Windows installer** (Inno Setup) that runs PSCCM as a service, plus **auto-update** from
   GitHub releases (SHA-256 verified).
 
-Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, IIS
-install, IIS site deploy, IIS app-pool recycle, IIS zero-downtime deploy behind HAProxy,
-HAProxy install/upgrade, HAProxy config deploy, HAProxy drain/ready, generic MSI/EXE
-install, Windows uninstall, Linux package install/remove/upgrade, Linux full update,
-and reboot.
+Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, Microsoft 365
+Apps (Office), Microsoft Teams (new), IIS install, IIS site deploy, IIS app-pool recycle, IIS
+zero-downtime deploy behind HAProxy, HAProxy install/upgrade, HAProxy config deploy, HAProxy
+drain/ready, generic MSI/EXE/MSIX install, Windows uninstall, Windows Update, Linux package
+install/remove/upgrade, Linux full update, and reboot.
 
 ## Why not Ansible?
 
@@ -139,7 +144,8 @@ memberships are imported too, so they can drive dynamic groups.
 
 Dynamic groups can also use the [inventory](#inventory): installed software with an optional version
 condition (`Google Chrome*` with `<130`, or *without* `Notepad++*`), *reboot pending*, and *a disk
-has less than N GB free*. These rules only match computers that have been scanned.
+has less than N GB free*. These rules only match computers that have been scanned. The rule
+*Windows updates missing* uses the last [update scan](#windows-update).
 
 You can deploy and schedule to groups (and combine them with tags and single computers). CLI:
 `psccm deploy 7zip --group "Web farm"`, `psccm groups list`.
@@ -156,7 +162,7 @@ collects:
 | Hardware | manufacturer, model, serial number, CPU, logical CPUs, memory | the same, from `/sys/class/dmi` and `/proc` |
 | State | last boot, logged-on user, IPv4 addresses, domain, reboot pending (CBS, Windows Update, rename) | last boot, logged-on users, IPv4 addresses, reboot pending (`/var/run/reboot-required`, `needs-restarting`) |
 | Disks | fixed drives: size, free space, file system | mounted file systems (no tmpfs/overlay) |
-| Software | *Programs and Features* (64- and 32-bit, no system components or updates) | `dpkg` or `rpm` packages |
+| Software | *Programs and Features* (64- and 32-bit, no system components or updates) and Store / MSIX apps for any user or provisioned | `dpkg` or `rpm` packages |
 
 - **Scan all computers** or *Scan now* on one computer. Set *Scan all computers every N hours* for a
   periodic scan (off by default).
@@ -184,6 +190,54 @@ collects:
 CLI: `psccm inventory scan [names…]`, `psccm inventory show web01`,
 `psccm inventory software --name "Google Chrome*"`, `psccm inventory changes [web01] --days 7`,
 `psccm inventory outdated`.
+
+## Windows Update
+
+*Updates* page. PSCCM asks each Windows computer's own **Windows Update Agent** which updates are
+missing and installs them. The updates come from the computer's usual source: its **WSUS** server when
+one is set by policy, otherwise Windows Update. Nothing needs to be set up on the targets beyond WinRM.
+
+Windows does not let a remote (WinRM) session download or install updates. PSCCM therefore runs the
+update script as **SYSTEM** through a one-off scheduled task (`\PSCCM\Windows Update scan` / `… install`).
+The task's output is streamed back into the console while it runs, and the task is removed afterwards.
+
+- **Scan all computers**, or *Scan now* on one computer. Set *Scan all Windows computers every N hours*
+  for a periodic scan (off by default). A scan only searches: nothing is downloaded or installed.
+- The **Computers** tab shows each computer's missing updates (security/critical counted separately),
+  pending restart, OS build, last successful install and update source. Click a computer to see its
+  missing updates and recent install history (with failures).
+- The **Missing updates** tab lists every missing update across the fleet with its KB, classification,
+  MSRC severity, release date and the computers that need it. Filter by classification. Export to CSV.
+- **Install**: tick updates and choose *Install selected…*, or use *Install on N computer(s)…* on the
+  Computers tab. Both open *New deployment* with the **Windows Update - install updates** package and the
+  computers filled in, so you review it before anything runs.
+- **Decline** updates you never want (e.g. a problem KB): PSCCM never installs them, even through a
+  schedule by classification, and they no longer count as missing. *Show declined* → *Undecline* undoes it.
+  An update named explicitly in a deployment's `kbs` is still installed.
+- **Patch Tuesday schedules**: *New patch schedule* creates a **monthly** schedule, by default
+  2nd Tuesday + 2 days at 02:00. Pick groups and a batch size so web farms restart one server at a time.
+- **Dynamic groups**: the rule *Windows updates missing: any / security or critical* uses the last scan,
+  e.g. a group "Needs security patches" for a schedule or a report.
+- After a deployment of the update package, the computers it reached are scanned again (on by default).
+- *Look for updates at*: the computer's own source (WSUS if set, else Windows Update), or Windows Update
+  directly, ignoring WSUS (e.g. while a WSUS server is being retired).
+
+The **Windows Update - install updates** package (`windows-update`) has these variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `classifications` | Security Updates, Critical Updates, Definition Updates, Update Rollups | Also: Updates, Feature Packs, Service Packs, Tools, Drivers, Upgrades. `*` = all. |
+| `kbs` | (empty) | Install only these KBs (or update IDs). Empty = by classification. |
+| `exclude_kbs` | (empty) | Never install these. Declined updates are always left out. |
+| `reboot` | `if-required` | `never` leaves the restart to you; `always` restarts at the end. |
+| `passes` | `2` | After a restart, another round installs the updates that needed it. |
+
+Updates are downloaded and installed one at a time, so one failing update does not stop the rest. The
+log shows each one. A computer is marked failed if any update failed; it still restarts first when the
+updates that did install need it. Optional updates (such as feature updates offered as "download and
+install now") are only installed when named in `kbs`.
+
+CLI: `psccm updates scan [names…]`, `psccm updates list [--security]`, `psccm updates show web01`.
 
 ## Group Policy (GPO) import and injection
 
@@ -314,6 +368,36 @@ and `installer: { url: https://.../{{version}}/setup.msi }` (also `{{version_nod
 CLI: `psccm catalog list`, `psccm catalog add 7zip google-chrome`, `psccm catalog update`,
 `psccm catalog check`. (The CLI downloads but does not auto-deploy; the console's daily check does.)
 
+## Microsoft 365 Apps, Teams and Store apps
+
+- **Microsoft 365 Apps (Office)** — package `microsoft-365-apps`. Downloads the Office Deployment
+  Tool (checked to be Microsoft-signed), writes a `configuration.xml` from the package settings
+  (product, channel, 32/64-bit, languages, apps to leave out, shared computer activation, remove MSI
+  Office) and runs `setup.exe /configure`. Use your own file from
+  [config.office.com](https://config.office.com) by putting it in the repository and naming it in
+  *Configuration file*. Office comes from the Microsoft CDN, or from a share made with
+  `setup.exe /download` (*Source path*) to save bandwidth. Computers that already have the product
+  are skipped.
+- **Microsoft Teams (new)** — package `microsoft-teams`. Runs Microsoft's `teamsbootstrapper.exe -p`,
+  which provisions Teams for every user (they get it at their next sign-in). Put `MSTeams-x64.msix`
+  in the repository and name it in *MSIX file* to install without each computer downloading 280 MB.
+- **Any Store / MSIX app** — package `install-msix`, or an `install:` step with an `.msix`,
+  `.msixbundle`, `.appx` or `.appxbundle`. The package is provisioned for all users with
+  `Add-AppxProvisionedPackage` (a plain `Add-AppxPackage` over WinRM would only install it for the
+  deployment account). Get the files for a Store app with
+  `winget download --id <id> --source msstore`. Dependencies (VCLibs, UI.Xaml) go in a `.zip`, and
+  the ones for other processor types are left out.
+- **Inventory and uninstall.** Scans list Store / MSIX apps installed for any user or provisioned,
+  except frameworks and Windows system apps, so they work in software groups and the Software tab.
+  *Uninstall from selected* (package `uninstall-app`) removes them for all users and from the
+  provisioned apps. It removes Microsoft 365 Apps silently too. The first scan that reads Store
+  apps does not count them as newly installed, and a scan that cannot read them keeps the previous
+  ones.
+
+Installing straight from the Microsoft Store (`winget install --source msstore`) is not used.
+winget is a per-user app that is often missing from WinRM sessions, and the msstore source needs
+a signed-in user to accept its terms.
+
 ---
 
 ## Deploy options
@@ -324,7 +408,7 @@ CLI: `psccm catalog list`, `psccm catalog add 7zip google-chrome`, `psccm catalo
 | Batch size | Rolling deployment. `1` = one computer at a time (HA pairs, web farms). `0` = all. |
 | Stop after failures | Don't start more computers once this many failed. `0` = stop at the first failure. |
 | Skip computers that already have it | Run the package's `detect` script first; exit 0 = skip. |
-| Start at | Run later (one-off). For repeats use **Schedules** (daily/weekly/interval). |
+| Start at | Run later (one-off). For repeats use **Schedules** (daily/weekly/monthly/interval). |
 
 Tags are resolved when a deployment starts, so a schedule on tag `web` picks up new web servers
 imported from AD.
@@ -342,6 +426,7 @@ psccm packages list | show <id> | validate <file.yaml>
 psccm computers list | add <names> [--os linux] [--tag web] | remove <names> | check
 psccm groups list | create <name> --computers a,b
 psccm inventory scan [names…] | show <name> | software [--name "Chrome*"]
+psccm updates scan [names…] | list [--security] | show <name>
 psccm ad sync [--import]
 psccm gpo list | import <GUID> | import-folder <path> [--name N]
 psccm catalog list | check | add <ids> | update [ids] | remove <id>
@@ -409,6 +494,12 @@ steps:
   - name: Pause
     wait: 30               # seconds
 
+  - name: Patch
+    windows_update:        # install missing Windows updates (see Windows Update)
+      classifications: Security Updates, Critical Updates
+      exclude: KB5034441
+      reboot: if-required  # never | always
+
   - name: Shared steps
     include: other-package # run another package's steps (nested package)
 
@@ -425,13 +516,15 @@ rollback:                  # runs (best effort) when a step or verify fails
     script: ...
 ```
 
-**Every step** also accepts `os`, `when`, `timeout` (seconds, default 1800), `retries`,
+**Every step** also accepts `os`, `when`, `timeout` (seconds, default 1800; per install round for
+`windows_update`, default 4 hours), `retries`,
 `retry_delay` (default 10), `success_codes` (default `[0]`; install steps also accept `3010` and `1641`),
 `continue_on_error` and `delegate_to`.
 
 **Install** on Windows: `.msi` runs `msiexec /i … /qn /norestart /l*v` (the MSI log tail is shown on
-failure), `.msp` runs `msiexec /p`, `.msu` runs `wusa /quiet /norestart`, and anything else is executed
-with `args`. On Linux: `.deb` uses `apt-get install`, `.rpm` uses `dnf/yum install`, and `.sh/.run`
+failure), `.msp` runs `msiexec /p`, `.msu` runs `wusa /quiet /norestart`, `.msix`/`.msixbundle`/`.appx`/
+`.appxbundle` are provisioned for all users (`args`: dependency packages, folders or `.zip`s and an
+optional license `.xml`, separated by `;`), and anything else is executed with `args`. On Linux: `.deb` uses `apt-get install`, `.rpm` uses `dnf/yum install`, and `.sh/.run`
 runs with bash.
 
 **Built-in variables:** `{{host}}`, `{{host_short}}` (first DNS label), `{{os}}`, `{{workdir}}` (a temp
@@ -442,11 +535,13 @@ folder on the target, removed afterwards) and `{{deployment_id}}`. Variable defa
 
 PowerShell:
 
-- `Get-InstalledApp -Name 'Chrome*'`
+- `Get-InstalledApp -Name 'Chrome*'` (registry programs and Store / MSIX apps; `-NoStore` for the registry only)
+- `Get-InstalledAppx -Name 'MSTeams'` (Store / MSIX apps by display or package name)
 - `Test-AppInstalled -Name 'X*' -MinVersion 1.2`
 - `ConvertTo-PsccmVersion`
 - `Get-PsccmFile -Url -OutFile`
 - `Invoke-PsccmProcess -FilePath -Arguments` (returns the exit code)
+- `Install-PsccmAppx -Path x.msix -Arguments 'deps.zip'` (provision for all users; returns 0 or 1)
 - `Uninstall-App -Name 'X*'`
 
 Scripts run with `$ErrorActionPreference = 'Stop'`, and the last native exit code is the step result.
@@ -463,13 +558,16 @@ bash (runs with `set -eo pipefail`):
 | Job | Package | Tip |
 |---|---|---|
 | Common apps, always current | *App catalog* → Add, then Auto-deploy to a group | New versions are downloaded daily and rolled out; PCs that have it are skipped. |
-| New utility on all PCs | `7zip`, `google-chrome`, `notepad-plus-plus`, `install-msi`, `install-exe` | Target an AD tag; detect skips machines that already have it. |
+| New utility on all PCs | `7zip`, `google-chrome`, `notepad-plus-plus`, `install-msi`, `install-exe`, `install-msix` | Target an AD tag; detect skips machines that already have it. |
+| Office on new PCs | `microsoft-365-apps` | *Source path* on a local share saves each PC downloading ~3 GB. |
+| Move to the new Teams | `microsoft-teams`, then `uninstall-app` with `Teams Machine-Wide Installer` | Users get the new Teams at their next sign-in. |
 | Node.js upgrade | `nodejs` (`version` = `lts`, `22`, or `22.11.0`) | Set `restart_services` to restart your Node services. |
 | IIS server build | `iis-install` | `reboot_if_needed: yes` to finish in one go. |
 | Website release | `iis-site-deploy` | Zip in `repository\web\`; backups kept next to the site folder. |
 | Zero-downtime web farm release | `iis-rolling-deploy` | Batch size 1, Stop after failures 0. |
 | HAProxy upgrade | `haproxy-upgrade` | Batch size 1 on HA pairs; config backup restored on failure. |
 | HAProxy config change | `haproxy-config` | Validated with `haproxy -c` before it goes live. |
+| Patch Windows | `windows-update` | *Updates* → *New patch schedule* (Patch Tuesday + 2), batch size for farms. |
 | Patch Linux | `linux-update` | Use a weekly schedule. |
 
 ## Security notes
@@ -494,14 +592,17 @@ bash (runs with `set -eo pipefail`):
 - SSH host keys are pinned on first use (TOFU).
 - Catalog downloads are HTTPS-only (redirects included); installers without a vendor checksum are not
   auto-deployed. Package `install.url`s over `http://` need a `sha256`.
-- Updates are only installed when the download matches the release's `SHA256SUMS`. Release assets
-  also carry a signed build-provenance attestation: `gh attestation verify <file> --repo parthh37/psccm`.
+- Updates are only installed when the release's `SHA256SUMS` is signed by the release key built into
+  PSCCM and the download matches it ([Release signing](#release-signing)). Release assets also carry a
+  signed build-provenance attestation: `gh attestation verify <file> --repo parthh37/psccm`.
 
 ## Updates
 
 *Settings → Updates*. PSCCM checks the GitHub releases of `parthh37/psccm` once a day (configurable)
 and shows a notice in the sidebar when a newer version exists. **Install** downloads the new release
-and verifies its SHA-256. On Windows it then runs the setup silently: the setup stops the service,
+and checks that the release is signed with the PSCCM release key and that the download matches its
+signed SHA-256 (a release without a valid signature is never installed, whoever published it). On
+Windows it then runs the setup silently: the setup stops the service,
 replaces the files and starts it again with the same account and settings. On Linux it replaces the
 binary and exits, so systemd restarts it. *Install updates automatically* does this unattended, but
 never while a deployment is running. CLI: `psccm update [--install]`.
@@ -514,7 +615,7 @@ the tag). Running it by hand with the tag of an existing release only re-runs th
 [Release workflow](.github/workflows/release.yml):
 
 1. runs the tests and builds `psccm.exe`, the Inno Setup installer and the Linux binary;
-2. publishes a GitHub release with `SHA256SUMS`;
+2. publishes a GitHub release with `SHA256SUMS` and its signature `SHA256SUMS.sig`;
 3. **tests the published release** on fresh CI machines with
    [tests/release-test.ps1](tests/release-test.ps1):
    - **Windows:** silent install, service, upgrade in place, real WinRM deployments to the runner,
@@ -533,6 +634,49 @@ pwsh ./tests/release-test.ps1 -Exe ./psccm-x86_64-linux -LinuxTarget 10.0.0.5 -L
 
 Results go to `test-report/report.html` (also `report.json` and `junit.xml`). `-RealInstalls`
 installs software and changes the targets, so use it on test machines only.
+
+### Release signing
+
+PSCCM installs an update only if `SHA256SUMS.sig` is a valid ed25519 signature over the line
+`psccm-release <tag>` followed by `SHA256SUMS`, made with the key whose public half is built into
+the running PSCCM. A stolen GitHub token or a changed *Release source* can publish a release, but not
+one that installs. Including the tag stops an old signed release being re-published as a newer one.
+
+One-time setup (keep the private key offline, e.g. in a password manager):
+
+```bash
+openssl genpkey -algorithm ed25519 -out psccm-signing.pem                # private key: never commit it
+openssl pkey -in psccm-signing.pem -pubout -out psccm-signing.pub && cat psccm-signing.pub
+```
+
+1. In the repository on GitHub, *Settings → Secrets and variables → Actions*: add the **secret**
+   `PSCCM_SIGNING_KEY` with the whole contents of `psccm-signing.pem` (including the `BEGIN`/`END`
+   lines).
+2. Build the public key into PSCCM: paste the middle line of `psccm-signing.pub`
+   (`MCowBQYDK2VwAyEA…`) into
+   `RELEASE_PUBKEY` in [src/update.rs](src/update.rs) and commit it. (Alternatively, a fork can set
+   the repository **variable** `PSCCM_UPDATE_PUBKEY`; the release build uses it instead.)
+
+The *Sign checksums* step of the release workflow fails if the secret is missing or does not match
+the public key the binaries were built with, so a release is never published unsigned. A build without
+a key (e.g. a local `cargo build`) cannot verify releases and so installs no updates.
+
+Installs keep trusting the key they were built with. To rotate it, commit the new public key, set the
+repository variable `PSCCM_KEY_ROTATION` to `true` and release once with the *old* secret (installs
+accept it and now trust the new key; that release's own update test fails, as expected); then put the new private key in the secret and delete the
+variable. If the old private key is lost or leaked, installs must be updated by hand once with a build
+that has the new key.
+
+To check a download by hand, verify the signature and then the checksum, or check the build
+provenance GitHub attests for each release:
+
+```bash
+{ printf 'psccm-release %s\n' v0.2.3; cat SHA256SUMS; } > signed
+base64 -d SHA256SUMS.sig > sig
+openssl pkeyutl -verify -rawin -pubin -inkey psccm-signing.pub -in signed -sigfile sig
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify psccm-x86_64-linux --repo parthh37/psccm
+```
 
 ## Development
 

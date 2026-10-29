@@ -133,6 +133,32 @@ pub struct ServiceSpec {
     pub action: ServiceAction,
 }
 
+/// Install missing Windows updates through the Windows Update Agent (see `wu.rs`).
+/// Every field may use `{{variables}}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsUpdateSpec {
+    /// Comma-separated classifications ("Security Updates, Critical Updates"); "*" = all.
+    /// Default: security, critical and definition updates and update rollups.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub classifications: String,
+    /// Only these KBs or update IDs, comma-separated (empty = by classification).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kbs: String,
+    /// Never these KBs or update IDs. Updates declined in the console are always left out.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub exclude: String,
+    /// "if-required" (default), "never" or "always".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reboot: String,
+    /// Install rounds: after a restart, look again for updates that needed it (default 2).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub passes: String,
+    /// "default" (WSUS when the computer has one, else Windows Update) or "windows-update".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -174,6 +200,8 @@ pub struct Step {
     pub reboot: bool,
     #[serde(default)]
     pub wait: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_update: Option<WindowsUpdateSpec>,
     /// Run all steps of another package (nested package).
     #[serde(default)]
     pub include: Option<String>,
@@ -192,6 +220,7 @@ impl Step {
             self.service.is_some(),
             self.reboot,
             self.wait.is_some(),
+            self.windows_update.is_some(),
             self.include.is_some(),
         ]
         .iter()
@@ -201,7 +230,8 @@ impl Step {
 
     pub fn runs_on(&self, os: Os) -> bool {
         let shell_ok = self.shell.map(|s| s.os() == os).unwrap_or(true);
-        self.os.map(|o| o == os).unwrap_or(true) && shell_ok
+        let wu_ok = self.windows_update.is_none() || os == Os::Windows;
+        self.os.map(|o| o == os).unwrap_or(true) && shell_ok && wu_ok
     }
 
     pub fn success_codes(&self) -> Vec<i32> {
@@ -231,6 +261,9 @@ impl Step {
         }
         if let Some(s) = &self.service {
             v.push(&s.name);
+        }
+        if let Some(w) = &self.windows_update {
+            v.extend([&w.classifications, &w.kbs, &w.exclude, &w.reboot, &w.passes, &w.source].map(String::as_str));
         }
         v
     }
@@ -311,7 +344,7 @@ impl Package {
             }
             match step.action_count() {
                 1 => {}
-                0 => bail!("{label}: needs one action (script, install, copy, service, reboot, wait or include)"),
+                0 => bail!("{label}: needs one action (script, install, copy, service, reboot, wait, windows_update or include)"),
                 _ => bail!("{label}: has more than one action; split it into separate steps"),
             }
             if step.shell.is_some() && step.script.is_none() {

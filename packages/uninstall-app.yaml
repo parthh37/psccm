@@ -3,7 +3,9 @@ name: Uninstall a Windows program
 category: Generic
 description: >-
   Uninstall every program whose name matches (wildcards ok, e.g. "Java 8*"). MSI products
-  are removed with msiexec /x; others run their uninstaller with the given switches.
+  are removed with msiexec /x, Microsoft 365 Apps with Click-to-Run, and Store / MSIX apps
+  (e.g. "Microsoft Teams" or "MSTeams") for all users and from the provisioned apps; others
+  run their uninstaller with the given switches.
 platforms: [windows]
 variables:
   name:

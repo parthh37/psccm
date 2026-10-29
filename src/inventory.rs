@@ -12,7 +12,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::app::{App, WinRmSettings};
-use crate::db::{Computer, Disk, InstalledApp, Scan, now};
+use crate::db::{Computer, Disk, InstalledApp, STORE_APPS_FACT, Scan, now};
 use crate::engine::{Target, build_transport};
 use crate::package::{Os, Shell};
 use crate::transport::{LogFn, default_port, detect_os, port_open, wrap_script};
@@ -90,6 +90,10 @@ pub fn parse_output(lines: &[String], unescape: bool) -> Result<Scan> {
                 scan.facts.insert(get(1), get(2));
             }
             "app" if !get(1).is_empty() => scan.apps.push(InstalledApp { name: get(1), version: get(2), publisher: get(3) }),
+            "appx" if !get(1).is_empty() => {
+                scan.store_apps.insert(get(1).to_lowercase());
+                scan.apps.push(InstalledApp { name: get(1), version: get(2), publisher: get(3) });
+            }
             "disk" if !get(1).is_empty() => scan.disks.push(Disk {
                 mount: get(1),
                 size: get(2).parse().unwrap_or(0),
@@ -107,7 +111,7 @@ pub fn parse_output(lines: &[String], unescape: bool) -> Result<Scan> {
 }
 
 /// Turn `\u00e9` sequences back into characters.
-fn decode_escapes(s: &str) -> String {
+pub(crate) fn decode_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find("\\u") {
@@ -188,9 +192,15 @@ pub fn changes(old_facts: &BTreeMap<String, String>, old_apps: &[InstalledApp], 
         }
         m
     };
+    // The first scan that reads Store apps is their baseline, not a burst of installs.
+    let store_baseline = !old_facts.contains_key(STORE_APPS_FACT) && new.facts.contains_key(STORE_APPS_FACT);
+    let store_apps = &new.store_apps;
     let (old, new) = (index(old_apps), index(&new.apps));
     let none = (String::new(), BTreeSet::new());
     for key in old.keys().chain(new.keys().filter(|k| !old.contains_key(*k))) {
+        if store_baseline && !old.contains_key(key) && store_apps.contains(key) {
+            continue;
+        }
         let (o, n) = (old.get(key).unwrap_or(&none), new.get(key).unwrap_or(&none));
         let name = if n.0.is_empty() { &o.0 } else { &n.0 };
         let gone: Vec<&String> = o.1.difference(&n.1).collect();
@@ -209,7 +219,7 @@ pub fn changes(old_facts: &BTreeMap<String, String>, old_apps: &[InstalledApp], 
     out
 }
 
-fn target_of(c: &Computer) -> Target {
+pub(crate) fn target_of(c: &Computer) -> Target {
     Target {
         name: c.name.clone(),
         host: c.connect_host().to_string(),
@@ -417,14 +427,17 @@ mod tests {
         let out = lines(
             "noise before\n@@inv\tfact\tos_name\tWindows Server 2022 Datacenter\n@@inv\tfact\tram_mb\t16384\n\
              @@inv\tdisk\tC:\t127434190848\t52428800000\tNTFS\n@@inv\tapp\tGoogle Chrome\t130.0.6723.92\tGoogle LLC\n\
-             @@inv\tapp\tCaf\\u00e9 Tool \\u005c x\t1.0\t\n@@inv\tdone",
+             @@inv\tapp\tCaf\\u00e9 Tool \\u005c x\t1.0\t\n@@inv\tappx\tMicrosoft Teams\t25275.2601.3920.6551\tMicrosoft\n\
+             @@inv\tfact\tstore_apps\t1\n@@inv\tdone",
         );
         let s = parse_output(&out, true).unwrap();
         assert_eq!(s.facts["os_name"], "Windows Server 2022 Datacenter");
         assert_eq!(s.facts["ram_mb"], "16384");
         assert_eq!(s.disks[0].mount, "C:");
         assert_eq!(s.disks[0].free, 52_428_800_000);
-        assert_eq!(s.apps.len(), 2);
+        assert_eq!(s.apps.len(), 3);
+        assert_eq!(s.apps[2].name, "Microsoft Teams");
+        assert_eq!(s.store_apps.iter().collect::<Vec<_>>(), ["microsoft teams"]);
         assert_eq!(s.apps[0].publisher, "Google LLC");
         assert_eq!(s.apps[1].name, "Café Tool \\ x");
         assert!(parse_output(&lines("@@inv\tfact\tos_name\tx"), false).is_err(), "no done marker");
@@ -475,6 +488,24 @@ mod tests {
         // A scan without any software is a failed read, not "everything removed".
         new.apps.clear();
         assert_eq!(changes(&old_facts, &old_apps, &new).len(), 1);
+    }
+
+    #[test]
+    fn first_store_read_is_a_baseline() {
+        let old_apps = vec![app("Google Chrome", "130.0")];
+        let mut new = Scan {
+            apps: vec![app("Google Chrome", "130.0"), app("Microsoft Teams", "25275.1"), app("7-Zip", "24.09")],
+            ..Default::default()
+        };
+        new.store_apps.insert("microsoft teams".into());
+        new.facts.insert(STORE_APPS_FACT.into(), "1".into());
+        let names = |old_facts: &BTreeMap<String, String>| -> Vec<String> {
+            changes(old_facts, &old_apps, &new).into_iter().map(|c| format!("{} {}", c.kind, c.name)).collect()
+        };
+        // Teams was there before, just not read; 7-Zip really is new.
+        assert_eq!(names(&BTreeMap::new()), ["installed 7-Zip"]);
+        let read_before: BTreeMap<String, String> = [(STORE_APPS_FACT.to_string(), "0".to_string())].into();
+        assert_eq!(names(&read_before), ["installed 7-Zip", "installed Microsoft Teams"]);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::ad::{self, AdComputer, AdSettings};
 use crate::app::{AgentSettings, App, WinRmSettings};
 use crate::agent::{self, RunAs};
 use crate::db::{ComputerUpdate, DeployOptions, Group, GroupRules, NewComputer, NewCredential, Schedule, TargetSpec};
-use crate::{catalog, gpo, inventory, update};
+use crate::{catalog, gpo, inventory, update, wu};
 use crate::engine;
 use crate::package::{Package, Shell};
 use crate::scheduler;
@@ -91,6 +91,11 @@ pub async fn serve(
         .route("/inventory/outdated", get(outdated_software))
         .route("/inventory/computer/{name}", get(get_inventory))
         .route("/settings/inventory", put(save_inventory_settings))
+        .route("/updates", get(list_updates))
+        .route("/updates/scan", post(scan_updates))
+        .route("/updates/decline", post(decline_updates))
+        .route("/updates/computer/{name}", get(get_computer_updates))
+        .route("/settings/windows-update", put(save_wu_settings))
         .route("/gpos", get(list_gpos))
         .route("/gpos/imported", get(list_imported_gpos))
         .route("/gpos/import-folder", post(import_gpo_folder))
@@ -468,6 +473,55 @@ async fn save_inventory_settings(State(st): State<St>, Json(mut s): Json<invento
     s.last_scan = old.last_scan;
     s.concurrency = s.concurrency.clamp(1, 128);
     st.app.db.set_setting("inventory", &s)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ----------------------------------------------------------- windows update
+
+async fn list_updates(State(st): State<St>) -> ApiResult {
+    Ok(Json(wu::report(&st.app)?))
+}
+
+async fn get_computer_updates(State(st): State<St>, Path(name): Path<String>) -> ApiResult {
+    let (status, missing) = st.app.db.get_wu_status(&name)?.ok_or_else(|| anyhow!("update scan not found"))?;
+    let declined: Vec<String> = wu::UpdateSettings::load(&st.app).declined;
+    Ok(Json(json!({ "status": status, "missing": missing, "declined": declined })))
+}
+
+async fn scan_updates(State(st): State<St>, Json(req): Json<Names>) -> ApiResult {
+    let n = wu::start(&st.app, req.names)?;
+    Ok(Json(json!({ "started": n })))
+}
+
+#[derive(Deserialize)]
+struct DeclineReq {
+    /// Update keys: KB numbers, or update IDs for updates without one.
+    keys: Vec<String>,
+    declined: bool,
+}
+
+async fn decline_updates(State(st): State<St>, Json(req): Json<DeclineReq>) -> ApiResult {
+    let mut s = wu::UpdateSettings::load(&st.app);
+    for key in req.keys.iter().map(|k| wu::normalize_id(k)).filter(|k| !k.is_empty()) {
+        s.declined.retain(|d| !d.eq_ignore_ascii_case(&key));
+        if req.declined {
+            s.declined.push(key);
+        }
+    }
+    s.declined.sort();
+    st.app.db.set_setting("updates", &s)?;
+    Ok(Json(json!({ "declined": s.declined })))
+}
+
+async fn save_wu_settings(State(st): State<St>, Json(mut s): Json<wu::UpdateSettings>) -> ApiResult {
+    let old = wu::UpdateSettings::load(&st.app);
+    s.last_scan = old.last_scan;
+    s.declined = old.declined;
+    s.concurrency = s.concurrency.clamp(1, 128);
+    if !matches!(s.source.as_str(), "default" | "windows-update") {
+        return Err(anyhow!("source must be 'default' or 'windows-update'").into());
+    }
+    st.app.db.set_setting("updates", &s)?;
     Ok(Json(json!({ "ok": true })))
 }
 
