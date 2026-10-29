@@ -17,6 +17,9 @@ use super::{RunAs, TerminalChunk, TerminalCtl};
 
 pub mod shell;
 
+/// Most terminal output held for a browser (oldest output is dropped first).
+const MAX_BUFFERED: usize = 1 << 20;
+
 /// Per-agent wakeups and the set of live terminal sessions.
 #[derive(Default)]
 pub struct Hub {
@@ -146,12 +149,18 @@ impl Hub {
         out
     }
 
-    /// Output (or a close) the agent reported for a session.
-    pub fn push_output(&self, chunk: &TerminalChunk) {
+    /// Output (or a close) the agent reported for a session. Chunks for a
+    /// session that belongs to another agent are ignored.
+    pub fn push_output(&self, agent_id: &str, chunk: &TerminalChunk) {
         let mut s = self.sessions.lock().unwrap();
-        if let Some(sess) = s.get_mut(&chunk.session_id) {
+        if let Some(sess) = s.get_mut(&chunk.session_id).filter(|s| s.agent_id == agent_id) {
             if !chunk.data.is_empty() {
                 sess.to_browser.push_back(chunk.data.clone());
+                // A browser that stopped reading must not grow memory forever.
+                let mut total: usize = sess.to_browser.iter().map(String::len).sum();
+                while total > MAX_BUFFERED && sess.to_browser.len() > 1 {
+                    total -= sess.to_browser.pop_front().map_or(0, |c| c.len());
+                }
             }
             if chunk.closed {
                 sess.open = false;

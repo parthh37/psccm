@@ -101,15 +101,6 @@ begin
   Result := 'http://localhost:' + GetPort('') + '/';
 end;
 
-function RandomToken(): string;
-var
-  i: Integer;
-begin
-  Result := '';
-  for i := 1 to 40 do
-    Result := Result + Copy('abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789', Random(56) + 1, 1);
-end;
-
 procedure InitializeWizard();
 begin
   Upgrading := ServiceExists();
@@ -172,6 +163,8 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Code: Integer;
   Params: string;
+  TokenFile: string;
+  TokenText: AnsiString;
 begin
   if CurStep <> ssPostInstall then exit;
   if Upgrading then begin
@@ -179,10 +172,10 @@ begin
     exit;
   end;
   Params := '--data-dir "' + ExpandConstant('{commonappdata}\PSCCM') + '" service install --port ' + GetPort('');
-  if NetworkPage.SelectedValueIndex = 1 then begin
-    Token := RandomToken();
-    Params := Params + ' --bind 0.0.0.0 --token ' + Token;
-  end;
+  { psccm generates the token from the OS random number generator. }
+  TokenFile := ExpandConstant('{tmp}\psccm-token.txt');
+  if NetworkPage.SelectedValueIndex = 1 then
+    Params := Params + ' --bind 0.0.0.0 --new-token-file "' + TokenFile + '"';
   if Trim(AccountPage.Values[0]) <> '' then begin
     Params := Params + ' --account "' + Trim(AccountPage.Values[0]) + '"';
     SetEnvironmentVariable('PSCCM_SERVICE_PASSWORD', AccountPage.Values[1]);
@@ -191,6 +184,9 @@ begin
     SuppressibleMsgBox('The PSCCM service could not be installed (exit code ' + IntToStr(Code) + ').' + #13#10 +
       'Check the account name and password, or run "psccm service install" from an administrator prompt.', mbError, MB_OK, IDOK);
   SetEnvironmentVariable('PSCCM_SERVICE_PASSWORD', '');
+  if (NetworkPage.SelectedValueIndex = 1) and LoadStringFromFile(TokenFile, TokenText) then
+    Token := Trim(String(TokenText));
+  DeleteFile(TokenFile);
 end;
 
 procedure CurPageChanged(CurPageID: Integer);

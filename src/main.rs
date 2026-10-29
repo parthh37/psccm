@@ -248,6 +248,9 @@ enum ServiceCmd {
         /// Access token (required when binding to a non-loopback address).
         #[arg(long, env = "PSCCM_TOKEN")]
         token: Option<String>,
+        /// Generate a random access token, use it, and write it to this file (for the installer).
+        #[arg(long, conflicts_with = "token")]
+        new_token_file: Option<PathBuf>,
         /// Run the service as this account (e.g. CORP\svc-psccm); password from PSCCM_SERVICE_PASSWORD.
         #[arg(long)]
         account: Option<String>,
@@ -269,6 +272,12 @@ enum AgentCmd {
         /// Enrollment token from the console (Settings → Agents).
         #[arg(long, default_value = "")]
         token: String,
+        /// PEM certificate (or CA) to trust for a console with a self-signed HTTPS certificate.
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        /// Accept any HTTPS certificate (unsafe: the console can be impersonated).
+        #[arg(long)]
+        insecure_tls: bool,
     },
     /// Stop and remove the agent.
     Uninstall,
@@ -401,6 +410,16 @@ fn main() {
     }
 }
 
+/// Refuse console tokens short enough to guess.
+fn check_token(token: Option<&str>) -> Result<()> {
+    if let Some(t) = token.filter(|t| !t.is_empty())
+        && t.len() < web::MIN_TOKEN_LEN
+    {
+        bail!("--token must be at least {} characters; use a long random string", web::MIN_TOKEN_LEN);
+    }
+    Ok(())
+}
+
 async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
     let app = Ctx::open(&data_dir)?;
     let command = cli.command.unwrap_or(Cmd::Serve {
@@ -411,6 +430,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
     });
     match command {
         Cmd::Serve { bind, port, token, no_browser } => {
+            check_token(token.as_deref())?;
             let addr: std::net::SocketAddr = format!("{bind}:{port}").parse().context("invalid --bind/--port")?;
             app.db.fail_interrupted()?;
             app.db.fail_interrupted_jobs()?;
@@ -427,8 +447,14 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
             web::serve(app, addr, token.filter(|t| !t.is_empty()), shutdown).await
         }
         Cmd::Service { cmd } => match cmd {
-            ServiceCmd::Install { bind, port, token, account } => {
-                let token = token.filter(|t| !t.is_empty());
+            ServiceCmd::Install { bind, port, token, new_token_file, account } => {
+                let mut token = token.filter(|t| !t.is_empty());
+                check_token(token.as_deref())?;
+                if let Some(file) = &new_token_file {
+                    let t = secrets::random_token();
+                    std::fs::write(file, &t).with_context(|| format!("writing {}", file.display()))?;
+                    token = Some(t);
+                }
                 let ip: std::net::IpAddr = bind.parse().context("invalid --bind")?;
                 if !ip.is_loopback() && token.is_none() {
                     bail!("binding to {bind} needs --token");
@@ -447,7 +473,9 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
             ServiceCmd::Run => bail!("'service run' is started by the Windows service manager"),
         },
         Cmd::Agent { cmd } => match cmd {
-            AgentCmd::Install { server, token } => agent::runtime::install(&server, &token),
+            AgentCmd::Install { server, token, ca_cert, insecure_tls } => {
+                agent::runtime::install(&server, &token, ca_cert.as_deref(), insecure_tls)
+            }
             AgentCmd::Uninstall => agent::runtime::uninstall(),
             AgentCmd::Enroll => agent::runtime::enroll_now().await,
             AgentCmd::Status => agent::runtime::status(),

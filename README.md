@@ -301,21 +301,25 @@ ways to get the agent onto a machine:
    **Install PSCCM Agent** package with the console URL and token as variables.
 
 The agent registers as the Windows service **`PSCCMAgent`** (LocalSystem) or a Linux
-`psccm-agent` systemd unit, enrolls, and then appears under **Agents**. Re-running the installer on a
-known computer re-enrolls into the same record. Agents self-update from the same GitHub releases as
-the console.
+`psccm-agent` systemd unit, enrolls, and then appears under **Agents**. A computer that already has
+an agent cannot enroll again (so the shared token cannot be used to take over another machine's
+agent): to reinstall, remove the agent under **Agents** first. Agents self-update from the same
+GitHub releases as the console.
 
-CLI: `psccm agent install --server https://console:8080 --token <tok>`, `psccm agent status`,
-`psccm agent run` (foreground, for testing), `psccm agent uninstall`.
+CLI: `psccm agent install --server https://console:8080 --token <tok> [--ca-cert console.pem]`,
+`psccm agent status`, `psccm agent run` (foreground, for testing), `psccm agent uninstall`. The agent
+checks the console's HTTPS certificate; for a self-signed one pass it with `--ca-cert`
+(`--insecure-tls` turns the check off, for labs only).
 
 ### Security
 
 The agent runs as LocalSystem, so anyone who can use the console can run commands and change the
 firewall, tasks and local accounts on every enrolled machine — protect the console like a domain
 admin account (bind to localhost or set a strong `--token`). Agent traffic authenticates with the
-enrollment token (to join) and then a per-agent key; the console accepts self-signed HTTPS. Run-as
-passwords are sent to the agent over the connection and masked in the console UI; impersonating the
-logged-on user needs no password and is preferred.
+enrollment token (to join) and then a per-agent key, stored only as a hash on the console. Use an
+HTTPS console URL: over plain `http://` the agent key, commands and run-as passwords cross the network
+unencrypted. Run-as passwords are masked in the console UI; impersonating the logged-on user needs no
+password and is preferred.
 
 ---
 
@@ -568,15 +572,29 @@ bash (runs with `set -eo pipefail`):
 
 ## Security notes
 
-- The console binds to localhost unless a token is set. Anyone who can use the console can run commands
-  as admin on every managed computer, so protect it like a domain admin account.
-- Passwords are encrypted with DPAPI (Windows) and never returned by the API; secret variables are
-  masked in logs. On a Linux console, secrets are only base64-encoded, so prefer SSH keys there and keep
-  `data/` at mode 700.
+- The console binds to localhost unless a token is set (at least 16 characters; the installer
+  generates a random one). Anyone who can use the console can run commands as admin on every managed
+  computer, so protect it like a domain admin account. The console itself speaks plain HTTP: when other
+  computers use it, put it behind an HTTPS reverse proxy that forwards `Host` or `X-Forwarded-Host`.
+- Browser protections: requests from other sites (a different `Origin`) are refused, including the
+  terminal WebSocket; without a token only `localhost` / `127.0.0.1` host names are accepted (DNS
+  rebinding); responses carry a Content-Security-Policy and refuse framing.
+- The data folder is restricted to the account running PSCCM, SYSTEM and Administrators (mode 700 on
+  Linux). Passwords are encrypted with DPAPI (Windows) and never returned by the API; secret variables
+  are masked in the API and logs. On a Linux console, secrets are only base64-encoded, so prefer SSH
+  keys there.
+- Computer names may only contain letters, digits, `.`, `-`, `_` and `:`; anything else (from AD,
+  agents or typed in) is refused, because names end up in scripts. In package scripts, write
+  `{{name|ps}}` / `{{name|sh}}` instead of `'{{name}}'` for any value that could come from outside the
+  package: the filters quote the value as a PowerShell / sh string.
+- Scripts and uploads go to fresh, randomly named folders on targets, never a shared fixed folder.
 - WinRM over HTTP in a domain is encrypted by Kerberos. Use HTTPS for workgroup machines.
 - SSH host keys are pinned on first use (TOFU).
+- Catalog downloads are HTTPS-only (redirects included); installers without a vendor checksum are not
+  auto-deployed. Package `install.url`s over `http://` need a `sha256`.
 - Updates are only installed when the release's `SHA256SUMS` is signed by the release key built into
-  PSCCM and the download matches it ([Release signing](#release-signing)).
+  PSCCM and the download matches it ([Release signing](#release-signing)). Release assets also carry a
+  signed build-provenance attestation: `gh attestation verify <file> --repo parthh37/psccm`.
 
 ## Updates
 
@@ -591,7 +609,10 @@ never while a deployment is running. CLI: `psccm update [--install]`.
 
 ## Releases and release tests
 
-Push a tag `vX.Y.Z` (matching `Cargo.toml`). The [Release workflow](.github/workflows/release.yml):
+Bump `version` in `Cargo.toml` (and `Cargo.lock`), merge to `main`, then either push a tag `vX.Y.Z`
+or run the workflow by hand (*Actions → Release → Run workflow* on `main`, tag `vX.Y.Z`; it creates
+the tag). Running it by hand with the tag of an existing release only re-runs the release tests. The
+[Release workflow](.github/workflows/release.yml):
 
 1. runs the tests and builds `psccm.exe`, the Inno Setup installer and the Linux binary;
 2. publishes a GitHub release with `SHA256SUMS` and its signature `SHA256SUMS.sig`;

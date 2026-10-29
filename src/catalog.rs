@@ -333,6 +333,8 @@ struct GhAsset {
 
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        // Every hop, redirects included, must be HTTPS.
+        .https_only(true)
         .user_agent(format!("psccm/{CURRENT}"))
         .connect_timeout(Duration::from_secs(30))
         .build()?)
@@ -732,7 +734,11 @@ async fn refresh_inner(app: &App, a: &CatalogApp, busy: &Busy, deploy: bool) -> 
     keep.extend(have.as_ref().map(|p| p.file.as_str()));
     prune(app, &a.id, &keep);
     let mut msg = format!("Downloaded {} {} ({:.1} MB)", a.name, d.version, size as f64 / 1_048_576.0);
-    if deploy && !groups.is_empty() {
+    if deploy && !groups.is_empty() && !d.verified {
+        // Without a published checksum nothing vouches for the download, so a
+        // person deploys it (after checking it) rather than the timer.
+        msg += "; not auto-deployed: the vendor publishes no checksum for this download, deploy it by hand";
+    } else if deploy && !groups.is_empty() {
         match deploy_to_groups(app, a, &d, groups) {
             Ok(id) => msg += &format!("; deploying to its groups ({})", &id[..8]),
             Err(e) => msg += &format!("; auto-deploy failed: {e:#}"),

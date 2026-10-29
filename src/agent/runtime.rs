@@ -31,6 +31,14 @@ pub struct Config {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub agent_key: Option<String>,
+    /// PEM certificate (or CA) to trust for the console's HTTPS, for consoles
+    /// with a self-signed certificate. Normal certificate checks still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+    /// Skip HTTPS certificate checks entirely. Anyone on the network path can
+    /// then impersonate the console and run commands as SYSTEM; labs only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_tls: bool,
 }
 
 /// `%ProgramData%\PSCCM-Agent` on Windows, `/var/lib/psccm-agent` on Linux.
@@ -59,16 +67,64 @@ pub fn load_config() -> Result<Config> {
 }
 
 fn save_config(c: &Config) -> Result<()> {
-    std::fs::create_dir_all(data_dir())?;
-    std::fs::write(config_path(), serde_json::to_string_pretty(c)?)?;
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    restrict_dir(&dir);
+    let path = config_path();
+    std::fs::write(&path, serde_json::to_string_pretty(c)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
-fn http() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        // Internal consoles often use a self-signed HTTPS certificate.
-        .danger_accept_invalid_certs(true)
-        .user_agent(format!("psccm-agent/{VERSION}"))
+/// On Linux, make one of the agent's folders private to its owner (mode 700).
+/// On Windows the data folder is locked down once, at install
+/// ([`protect_data_dir`]), and what is created in it inherits that.
+pub fn restrict_dir(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            warn!("restricting {}: {e}", dir.display());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// Windows: make the data folder owned by Administrators and accessible only
+/// to SYSTEM and Administrators, replacing whatever ACL it had. This also
+/// defeats a folder an ordinary user created in advance to read or edit
+/// agent.json.
+#[cfg(windows)]
+fn protect_data_dir() -> Result<()> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let icacls = |args: &[&str]| -> Result<()> {
+        let st = std::process::Command::new("icacls.exe").arg(&dir).args(args).args(["/T", "/C", "/Q"]).status()?;
+        if !st.success() {
+            bail!("icacls {} failed ({st})", args.join(" "));
+        }
+        Ok(())
+    };
+    icacls(&["/setowner", "*S-1-5-32-544"])
+        .and_then(|_| icacls(&["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"]))
+        .context("locking down the agent data folder (run as administrator)")
+}
+
+fn http(cfg: &Config) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder();
+    if let Some(pem) = cfg.ca_cert.as_deref().filter(|p| !p.trim().is_empty()) {
+        b = b.add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes()).context("agent.json ca_cert")?);
+    }
+    if cfg.insecure_tls {
+        warn!("HTTPS certificate checks are off (insecure_tls); the console can be impersonated");
+        b = b.danger_accept_invalid_certs(true);
+    }
+    Ok(b.user_agent(format!("psccm-agent/{VERSION}"))
         .timeout(Duration::from_secs(60))
         .build()?)
 }
@@ -234,7 +290,7 @@ async fn serve_loop(stop: impl std::future::Future<Output = ()>) {
             return;
         }
     };
-    let client = match http() {
+    let client = match http(&cfg) {
         Ok(c) => c,
         Err(e) => {
             error!("{e:#}");
@@ -280,15 +336,37 @@ async fn serve_loop(stop: impl std::future::Future<Output = ()>) {
 
 /// `psccm agent install --server <url> --token <tok>`: store the config and
 /// register the service so the agent starts now and on boot.
-pub fn install(server: &str, token: &str) -> Result<()> {
-    if server.trim().is_empty() {
+pub fn install(server: &str, token: &str, ca_cert: Option<&std::path::Path>, insecure_tls: bool) -> Result<()> {
+    let server_url = server.trim().trim_end_matches('/').to_string();
+    if server_url.is_empty() {
         bail!("--server is required (e.g. https://console.corp.local:8080)");
     }
+    if !server_url.starts_with("https://") && !server_url.starts_with("http://") {
+        bail!("--server must start with https:// or http://");
+    }
+    if server_url.starts_with("http://") {
+        eprintln!(
+            "warning: {server_url} is plain HTTP, so the agent key, commands and run-as passwords cross the \
+             network unencrypted. Put the console behind HTTPS unless this network is trusted."
+        );
+    }
+    let ca_cert = match ca_cert {
+        Some(p) => {
+            let pem = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            reqwest::Certificate::from_pem(pem.as_bytes()).context("--ca-cert is not a PEM certificate")?;
+            Some(pem)
+        }
+        None => None,
+    };
     let cfg = Config {
-        server_url: server.trim().trim_end_matches('/').to_string(),
+        server_url,
         enroll_token: Some(token.trim().to_string()).filter(|t| !t.is_empty()),
+        ca_cert,
+        insecure_tls,
         ..Default::default()
     };
+    #[cfg(windows)]
+    protect_data_dir()?;
     save_config(&cfg)?;
     install_service()?;
     println!("PSCCM agent installed; it will enroll with {} shortly.", cfg.server_url);
@@ -304,8 +382,8 @@ pub fn uninstall() -> Result<()> {
 
 /// `psccm agent enroll`: enroll once, in the foreground (for testing).
 pub async fn enroll_now() -> Result<()> {
-    let client = http()?;
     let mut cfg = load_config()?;
+    let client = http(&cfg)?;
     ensure_enrolled(&client, &mut cfg).await?;
     println!("Enrolled as agent {}", cfg.agent_id.unwrap_or_default());
     Ok(())

@@ -317,10 +317,23 @@ async fn user_control(job: &Job) -> Result<(String, serde_json::Value)> {
 
 // ---------------------------------------------------------------- runners
 
+/// Where job scripts are written before they run. On Linux this is inside the
+/// agent's own root-only data folder rather than the shared /tmp, so no local
+/// user can pre-create the folder and read or swap a script; on Windows the
+/// temp folder of LocalSystem is already private to it.
+pub(crate) fn work_dir() -> Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    let dir = std::env::temp_dir().join("psccm-agent");
+    #[cfg(not(windows))]
+    let dir = crate::agent::runtime::data_dir().join("work");
+    std::fs::create_dir_all(&dir)?;
+    crate::agent::runtime::restrict_dir(&dir);
+    Ok(dir)
+}
+
 /// Run a PowerShell script (default identity) and return `(exit_code, output)`.
 async fn run_powershell(script: &str, env: &[(&str, String)]) -> Result<(i32, String)> {
-    let dir = std::env::temp_dir().join("psccm-agent");
-    std::fs::create_dir_all(&dir)?;
+    let dir = work_dir()?;
     let file = dir.join(format!("{}.ps1", uuid::Uuid::new_v4().simple()));
     std::fs::write(&file, [b"\xEF\xBB\xBF".as_slice(), script.as_bytes()].concat())?;
     let _guard = RemoveOnDrop(file.clone());
@@ -377,8 +390,7 @@ async fn run_shell_capture(shell: &str, script: &str, run_as: &RunAs) -> Result<
 }
 
 async fn run_script_file(script: &str, program: &str, pre: &[&str], ext: &str) -> Result<(i32, String)> {
-    let dir = std::env::temp_dir().join("psccm-agent");
-    std::fs::create_dir_all(&dir)?;
+    let dir = work_dir()?;
     let file = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()));
     std::fs::write(&file, script)?;
     let _guard = RemoveOnDrop(file.clone());

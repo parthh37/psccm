@@ -358,6 +358,13 @@ impl Package {
                 && inst.file.is_some() == inst.url.is_some() {
                     bail!("{label}: install needs exactly one of 'file' or 'url'");
                 }
+            // Over plain HTTP anyone on the path can swap the installer.
+            if let Some(inst) = &step.install
+                && inst.url.as_deref().is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("http://"))
+                && inst.sha256.as_deref().is_none_or(|h| h.trim().is_empty())
+            {
+                bail!("{label}: an http:// download needs a sha256 (or use https://)");
+            }
             for s in step.templated_strings() {
                 check(&label, s)?;
             }
@@ -459,13 +466,28 @@ pub fn template_vars(s: &str) -> Result<Vec<String>> {
     while let Some(start) = rest.find("{{") {
         let after = &rest[start + 2..];
         let end = after.find("}}").ok_or_else(|| anyhow!("unclosed '{{{{' in: {s}"))?;
-        out.push(after[..end].trim().to_string());
+        out.push(split_filter(&after[..end])?.0.to_string());
         rest = &after[end + 2..];
     }
     Ok(out)
 }
 
-/// Replace `{{name}}` with values from `vars`. Unknown names are an error.
+/// Split `name | filter` into the variable name and its optional filter.
+/// `ps` and `sh` quote the value as a complete PowerShell / POSIX sh string
+/// literal; use them for any value that may come from outside the package
+/// (computer names, inventory, user input) instead of writing '{{x}}'.
+fn split_filter(expr: &str) -> Result<(&str, Option<&str>)> {
+    match expr.split_once('|') {
+        None => Ok((expr.trim(), None)),
+        Some((name, filter)) => match filter.trim() {
+            f @ ("ps" | "sh") => Ok((name.trim(), Some(f))),
+            f => bail!("unknown filter '{f}' in '{{{{{expr}}}}}' (use ps or sh)"),
+        },
+    }
+}
+
+/// Replace `{{name}}` (or `{{name | ps}}` / `{{name | sh}}`, quoted) with
+/// values from `vars`. Unknown names are an error.
 pub fn render(s: &str, vars: &BTreeMap<String, String>) -> Result<String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -473,9 +495,13 @@ pub fn render(s: &str, vars: &BTreeMap<String, String>) -> Result<String> {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let end = after.find("}}").ok_or_else(|| anyhow!("unclosed '{{{{'"))?;
-        let key = after[..end].trim();
+        let (key, filter) = split_filter(&after[..end])?;
         let val = vars.get(key).ok_or_else(|| anyhow!("unknown variable '{key}'"))?;
-        out.push_str(val);
+        match filter {
+            Some("ps") => out.push_str(&crate::transport::ps_quote(val)),
+            Some("sh") => out.push_str(&crate::transport::sh_quote(val)),
+            _ => out.push_str(val),
+        }
         rest = &after[end + 2..];
     }
     out.push_str(rest);
@@ -531,6 +557,11 @@ mod tests {
         assert_eq!(render("node-{{ ver }}.msi", &v).unwrap(), "node-1.2.msi");
         assert!(render("{{nope}}", &v).is_err());
         assert!(render("{{ver", &v).is_err());
+        v.insert("n".to_string(), "x'; rm -rf /; '".to_string());
+        assert_eq!(render("{{ n | sh }}", &v).unwrap(), r"'x'\''; rm -rf /; '\'''");
+        assert_eq!(render("{{n|ps}}", &v).unwrap(), "'x''; rm -rf /; '''");
+        assert!(render("{{n|bad}}", &v).is_err());
+        assert_eq!(template_vars("a {{ n | ps }} {{ver}}").unwrap(), ["n", "ver"]);
     }
 
     #[test]

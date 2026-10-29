@@ -419,6 +419,10 @@ fn encode_command(script: &str) -> String {
 pub fn import(app: &App, s: &AdSettings, list: &[AdComputer]) -> Result<usize> {
     let mut n = 0;
     for c in list {
+        if !crate::db::valid_computer_name(&c.name) {
+            tracing::warn!("skipping AD computer with an invalid name: {:?}", c.name);
+            continue;
+        }
         let os_lower = c.os.to_lowercase();
         let os = if os_lower.contains("windows") {
             Some("windows".to_string())

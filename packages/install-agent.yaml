@@ -31,7 +31,7 @@ steps:
   - name: Install and start agent (Windows)
     os: windows
     script: |
-      & 'C:\Program Files\PSCCM-Agent\psccm.exe' agent install --server '{{server}}' --token '{{token}}'
+      & 'C:\Program Files\PSCCM-Agent\psccm.exe' agent install --server {{server|ps}} --token {{token|ps}}
 
   - name: Copy agent binary (Linux)
     os: linux
@@ -41,4 +41,4 @@ steps:
     os: linux
     script: |
       chmod +x /usr/local/bin/psccm
-      /usr/local/bin/psccm agent install --server '{{server}}' --token '{{token}}'
+      /usr/local/bin/psccm agent install --server {{server|sh}} --token {{token|sh}}

@@ -233,8 +233,28 @@ fn snapshots_dir(app: &App) -> PathBuf {
     app.data_dir.join("gpos")
 }
 
+/// The GUID in canonical form. Only hex digits and dashes survive, so the
+/// result is always safe to use as a folder name.
 fn clean_guid(g: &str) -> String {
-    g.trim().trim_matches(|c| c == '{' || c == '}').to_uppercase()
+    g.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect::<String>().to_uppercase()
+}
+
+/// gPCFileSysPath must be `\\<domain>\SYSVOL\<domain>\Policies\{<guid>}` for
+/// this GPO. Anyone allowed to edit a GPO can change that attribute, and the
+/// console reads from (and authenticates to) whatever host it names.
+fn check_sysvol_path(path: &str, guid: &str) -> Result<()> {
+    let parts: Vec<&str> = path.strip_prefix(r"\\").unwrap_or("").split('\\').collect();
+    let ok = matches!(parts.as_slice(), [host, sysvol, domain, policies, g]
+        if host.eq_ignore_ascii_case(domain)
+            && sysvol.eq_ignore_ascii_case("SYSVOL")
+            && policies.eq_ignore_ascii_case("Policies")
+            && g.len() == 38
+            && clean_guid(g) == guid
+            && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'));
+    if !ok {
+        bail!("GPO {guid} has an unexpected SYSVOL path ({path}); refusing to read it");
+    }
+    Ok(())
 }
 
 /// Parse a gPLink value: "[LDAP://cn={GUID},cn=policies,...;0][...]".
@@ -406,6 +426,7 @@ pub async fn import(app: &App, guid: &str) -> Result<SnapshotMeta> {
     if gpo.path.is_empty() {
         bail!("GPO {} has no SYSVOL path", gpo.name);
     }
+    check_sysvol_path(&gpo.path, &guid)?;
     let dir = snapshots_dir(app).join(&guid);
     let tmp = dir.join("files.new");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -447,6 +468,9 @@ pub fn import_folder(app: &App, src: &Path, name: Option<String>) -> Result<Snap
 
 /// Move the freshly copied files.new into place, write meta.json and the package.
 fn finish_import(app: &App, guid: &str, name: &str, version: u32, source: &str) -> Result<SnapshotMeta> {
+    // The name comes from AD or a backup file and ends up in a YAML package.
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let name = name.as_str();
     let dir = snapshots_dir(app).join(guid);
     let files = dir.join("files");
     let _ = std::fs::remove_dir_all(&files);
@@ -558,7 +582,7 @@ fn package_id_for(name: &str, guid: &str) -> String {
         slug = slug.replace("--", "-");
     }
     let slug: String = slug.trim_matches('-').chars().take(40).collect();
-    format!("gpo-{}-{}", slug.trim_end_matches('-'), guid[..8].to_lowercase())
+    format!("gpo-{}-{}", slug.trim_end_matches('-'), guid.get(..8).unwrap_or(guid).to_lowercase())
 }
 
 const REGISTRY_SCRIPT: &str = r#"$entries = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
@@ -640,8 +664,8 @@ variables:
     description: Run gpupdate /target:computer afterwards
 steps:
 "#,
-        name = meta.name.replace('"', "'"),
-        name_q = meta.name.replace('"', "'"),
+        name = meta.name.replace(|c: char| c == '"' || c.is_control(), "'"),
+        name_q = meta.name.replace(|c: char| c == '"' || c == '\\' || c.is_control(), "'"),
         guid = meta.guid,
         id = meta.package_id,
         ver = meta.computer_version,
@@ -656,7 +680,7 @@ steps:
     }
     if let Some(raw) = &snap.security_raw {
         let script = format!(
-            "$dir = Join-Path $env:windir 'Temp\\psccm-gpo'\nNew-Item -ItemType Directory -Force -Path $dir | Out-Null\n$inf = Join-Path $dir 'gpo.inf'\n$db = Join-Path $dir 'gpo.sdb'\n$log = Join-Path $dir 'secedit.log'\nRemove-Item $db, $log -ErrorAction SilentlyContinue\n[IO.File]::WriteAllBytes($inf, [Convert]::FromBase64String('{}'))\n& secedit.exe /configure /db $db /cfg $inf /log $log /quiet\n$code = $LASTEXITCODE\nGet-Content $log -Tail 20 -ErrorAction SilentlyContinue\nRemove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue\nexit $code",
+            "$dir = Join-Path $env:windir ('Temp\\psccm-gpo-' + [guid]::NewGuid().ToString('N'))\nNew-Item -ItemType Directory -Path $dir | Out-Null\n$inf = Join-Path $dir 'gpo.inf'\n$db = Join-Path $dir 'gpo.sdb'\n$log = Join-Path $dir 'secedit.log'\nRemove-Item $db, $log -ErrorAction SilentlyContinue\n[IO.File]::WriteAllBytes($inf, [Convert]::FromBase64String('{}'))\n& secedit.exe /configure /db $db /cfg $inf /log $log /quiet\n$code = $LASTEXITCODE\nGet-Content $log -Tail 20 -ErrorAction SilentlyContinue\nRemove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue\nexit $code",
             B64.encode(raw)
         );
         y += &format!(

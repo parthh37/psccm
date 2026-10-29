@@ -239,7 +239,7 @@ async function pageComputers(el) {
     <div class="card"><div class="card-head"><h2>Groups</h2>
       <div class="chips" style="flex:1">
         <span class="chip ${!CS.group ? 'on' : ''}" onclick="App.cGroup('')">All computers <span class="small">${CS.list.length}</span></span>
-        ${CS.groups.map((x) => `<span class="chip ${CS.group === x.name ? 'on' : ''}" onclick="App.cGroup('${esc(x.name)}')" title="${esc(x.description)}">
+        ${CS.groups.map((x) => `<span class="chip ${CS.group === x.name ? 'on' : ''}" onclick="App.cGroup(${jstr(x.name)})" title="${esc(x.description)}">
           ${x.kind === 'dynamic' ? '⚡ ' : ''}${esc(x.name)} <span class="small">${x.members.length}</span></span>`).join('')}
       </div>
       <div class="right">
@@ -299,7 +299,7 @@ function renderComputerTable() {
       ${list.map((c) => {
         const groups = CS.groups.filter((g) => g.members.some((m) => m.toLowerCase() === c.name.toLowerCase())).map((g) => g.name);
         return `<tr class="${CS.sel.has(c.name) ? 'sel' : ''}">
-        <td><input type="checkbox" ${CS.sel.has(c.name) ? 'checked' : ''} onchange="App.cSel('${esc(c.name)}', this.checked)"></td>
+        <td><input type="checkbox" ${CS.sel.has(c.name) ? 'checked' : ''} onchange="App.cSel(${jstr(c.name)}, this.checked)"></td>
         <td><b>${esc(c.name)}</b>${c.address ? `<div class="small muted">${esc(c.address)}</div>` : ''}${c.description ? `<div class="small muted">${esc(c.description)}</div>` : ''}</td>
         <td>${osLabel(c.os)}<div class="os">${esc(c.os_detail || '')}</div></td>
         <td class="small"><span class="dot ${c.online === true ? 'on' : c.online === false ? 'off' : ''}"></span>${c.online === true ? 'online' : c.online === false ? 'offline' : 'not checked'}
@@ -593,7 +593,7 @@ async function pagePackages(el) {
       ${errors.map(([f, e]) => `<div><b>${esc(f)}</b>: <span class="err">${esc(e)}</span></div>`).join('')}</div></div>` : ''}
     <div class="card"><div class="card-body">
       ${groupByCategory(packages).map(([cat, list]) => `<div class="cat">${esc(cat)}</div><div class="pkg-grid">
-        ${list.map((p) => `<div class="pkg" onclick="location.hash='#/package/${esc(p.id)}'">
+        ${list.map((p) => `<div class="pkg" onclick="location.hash=${jstr('#/package/' + p.id)}">
           <div class="t">${esc(p.name)}</div><div class="d">${esc(p.description)}</div>
           <div class="m">${platformText(p)} · ${p.steps} step${p.steps === 1 ? '' : 's'}${p.builtin ? ' · built-in' : ''}</div></div>`).join('')}
       </div>`).join('')}
@@ -649,8 +649,8 @@ async function pagePackage(el, id) {
       <div class="actions">
         <button onclick="location.hash='#/packages'">Back</button>
         <button onclick="App.dupPackage()">Duplicate</button>
-        <button class="danger" onclick="App.delPackage('${esc(p.id)}')">Delete</button>
-        <button class="primary" onclick="App.deployPackage('${esc(p.id)}')">Deploy</button>
+        <button class="danger" onclick="App.delPackage(${jstr(p.id)})">Delete</button>
+        <button class="primary" onclick="App.deployPackage(${jstr(p.id)})">Deploy</button>
       </div></div>
     <div class="split">
       <div>
@@ -675,7 +675,7 @@ async function pagePackage(el, id) {
       <div class="card"><div class="card-head"><h2>Definition (YAML)</h2><div class="right">
           <span id="pk-status" class="small"></span>
           <button onclick="App.validatePackage()">Validate</button>
-          <button class="primary" onclick="App.savePackage('${esc(p.id)}')">Save</button></div></div>
+          <button class="primary" onclick="App.savePackage(${jstr(p.id)})">Save</button></div></div>
         <div class="card-body"><textarea id="pk-yaml" class="code" spellcheck="false">${esc(yaml)}</textarea></div></div>
     </div>`;
   $('#pk-yaml').addEventListener('keydown', (e) => {
@@ -773,7 +773,7 @@ function renderWhat() {
     const list = DEP.packages.filter((p) => !q || (p.name + ' ' + p.description + ' ' + p.category).toLowerCase().includes(q));
     box.innerHTML = `<div class="field"><input class="search" placeholder="Search packages…" value="${esc(W.q)}" oninput="App.wSearch(this.value)" id="w-q"></div>
       ${groupByCategory(list).map(([cat, ps]) => `<div class="cat">${esc(cat)}</div><div class="pkg-grid">
-        ${ps.map((p) => `<div class="pkg ${W.pkg === p.id ? 'on' : ''}" onclick="App.wPick('${esc(p.id)}')">
+        ${ps.map((p) => `<div class="pkg ${W.pkg === p.id ? 'on' : ''}" onclick="App.wPick(${jstr(p.id)})">
           <div class="t">${esc(p.name)}</div><div class="d">${esc(p.description)}</div><div class="m">${platformText(p)}</div></div>`).join('')}
       </div>`).join('') || '<div class="muted">No packages match.</div>'}`;
   }
@@ -786,10 +786,10 @@ function renderWhere() {
   const list = DEP.computers.filter((c) => (!W.cos || c.os === W.cos) && (!q || (c.name + ' ' + c.tags.join(' ') + ' ' + (c.ad_ou || '')).toLowerCase().includes(q)));
   $('#w-where').innerHTML = `
     ${DEP.groups.length ? `<div class="field"><label>Groups</label><div class="chips">
-      ${DEP.groups.map((g) => `<span class="chip ${W.groups.has(g.name) ? 'on' : ''}" onclick="App.wGroup('${esc(g.name)}')">${g.kind === 'dynamic' ? '⚡ ' : ''}${esc(g.name)} <span class="small">${g.members.length}</span></span>`).join('')}
+      ${DEP.groups.map((g) => `<span class="chip ${W.groups.has(g.name) ? 'on' : ''}" onclick="App.wGroup(${jstr(g.name)})">${g.kind === 'dynamic' ? '⚡ ' : ''}${esc(g.name)} <span class="small">${g.members.length}</span></span>`).join('')}
     </div></div>` : ''}
     ${tags.length ? `<div class="field"><label>Tags <span class="muted small">(all computers with the tag, resolved when the deployment starts)</span></label><div class="chips">
-      ${tags.map((t) => `<span class="chip ${W.tags.has(t) ? 'on' : ''}" onclick="App.wTag('${esc(t)}')">${esc(t)} <span class="small">${DEP.computers.filter((c) => c.tags.includes(t)).length}</span></span>`).join('')}
+      ${tags.map((t) => `<span class="chip ${W.tags.has(t) ? 'on' : ''}" onclick="App.wTag(${jstr(t)})">${esc(t)} <span class="small">${DEP.computers.filter((c) => c.tags.includes(t)).length}</span></span>`).join('')}
     </div></div>` : ''}
     <div class="field"><label>Computers</label>
       <div class="row" style="margin-bottom:8px"><input class="search" placeholder="Filter…" value="${esc(W.cq)}" oninput="App.wCq(this.value)" id="w-cq">
@@ -797,7 +797,7 @@ function renderWhere() {
           <option value="">All OS</option><option value="windows" ${W.cos === 'windows' ? 'selected' : ''}>Windows</option><option value="linux" ${W.cos === 'linux' ? 'selected' : ''}>Linux</option></select>
         <button onclick="App.wAll(true)">Select shown</button><button onclick="App.wAll(false)">Clear</button></div>
       ${DEP.computers.length ? `<div class="table-wrap" style="max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:8px"><table><tbody>
-        ${list.map((c) => `<tr class="click ${W.computers.has(c.name) ? 'sel' : ''}" onclick="App.wComp('${esc(c.name)}')">
+        ${list.map((c) => `<tr class="click ${W.computers.has(c.name) ? 'sel' : ''}" onclick="App.wComp(${jstr(c.name)})">
           <td style="width:30px"><input type="checkbox" ${W.computers.has(c.name) ? 'checked' : ''} onclick="event.preventDefault()"></td>
           <td><b>${esc(c.name)}</b></td><td class="small">${osLabel(c.os)}</td>
           <td class="small"><span class="dot ${c.online === true ? 'on' : c.online === false ? 'off' : ''}"></span></td><td>${tagsHtml(c.tags)}</td></tr>`).join('')}
@@ -816,8 +816,8 @@ function renderOpts() {
       ${vars.map(([k, v]) => {
         const val = W.vars[k] ?? v.default ?? '';
         const input = v.options && v.options.length
-          ? `<select onchange="App.wVar('${esc(k)}', this.value)">${v.options.map((o) => `<option ${o === val ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`
-          : `<input type="${v.secret ? 'password' : 'text'}" value="${esc(val)}" oninput="App.wVar('${esc(k)}', this.value)" ${v.required ? 'required' : ''}>`;
+          ? `<select onchange="App.wVar(${jstr(k)}, this.value)">${v.options.map((o) => `<option ${o === val ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`
+          : `<input type="${v.secret ? 'password' : 'text'}" value="${esc(val)}" oninput="App.wVar(${jstr(k)}, this.value)" ${v.required ? 'required' : ''}>`;
         return `<div class="field" style="min-width:240px"><label>${esc(k)}${v.required ? ' <span class="err">*</span>' : ''}</label>${input}
           ${v.description ? `<div class="hint">${esc(v.description)}</div>` : ''}</div>`;
       }).join('')}</div>` : ''}
@@ -1341,7 +1341,7 @@ function changeRow(c, withComputer) {
   const what = c.kind === 'changed' ? esc(factLabel(c.name)) : `<b>${esc(c.name)}</b>`;
   const [o, n] = [changeValue(c, c.old), changeValue(c, c.new)];
   return `<tr><td class="small" title="${esc(fmtTime(c.at))}">${ago(c.at)}</td>
-    ${withComputer ? `<td><a href="javascript:void(0)" onclick="App.invShow('${esc(c.computer)}')">${esc(c.computer)}</a></td>` : ''}
+    ${withComputer ? `<td><a href="javascript:void(0)" onclick="App.invShow(${jstr(c.computer)})">${esc(c.computer)}</a></td>` : ''}
     <td><span class="pill ${CHANGE_PILL[c.kind] || ''}">${esc(c.kind)}</span></td><td>${what}</td>
     <td class="small">${o ? esc(o) : ''}${o && n ? ' → ' : ''}${n ? esc(n) : ''}</td></tr>`;
 }
@@ -1476,7 +1476,7 @@ function renderInventoryBody() {
         const f = (i && i.facts) || {};
         const d = i && worstDisk(i);
         const ok = i && i.scanned_at;
-        return `<tr class="click" onclick="App.invShow('${esc(c.name)}')">
+        return `<tr class="click" onclick="App.invShow(${jstr(c.name)})">
           <td><b>${esc(c.name)}</b>${f.pending_reboot === 'true' ? ' <span class="pill s-partial">reboot pending</span>' : ''}
             ${f.ip_addresses ? `<div class="small muted">${esc(f.ip_addresses)}</div>` : ''}</td>
           <td>${ok ? `${esc(f.os_name || osLabel(c.os))}<div class="os">${esc([f.os_version, f.os_build || f.kernel].filter(Boolean).join(' · '))}</div>` : `<span class="muted">${osLabel(c.os)}</span>`}</td>
@@ -1520,7 +1520,7 @@ function renderOutdated() {
     <button onclick="App.invCatalogCheck()">Check for updates</button></div>`;
   const action = (a, idx) => {
     if (!a.outdated.length) return '';
-    if (!a.added) return `<button onclick="event.stopPropagation(); App.invCatalogAdd('${esc(a.id)}')" title="Download the installer and create its package">Add to catalog</button>`;
+    if (!a.added) return `<button onclick="event.stopPropagation(); App.invCatalogAdd(${jstr(a.id)})" title="Download the installer and create its package">Add to catalog</button>`;
     if (!a.package_version) return '<span class="small muted">downloading…</span>';
     return `<button class="primary" onclick="event.stopPropagation(); App.invUpdate(${idx})">Update ${a.outdated.length}</button>`;
   };
@@ -1776,9 +1776,9 @@ async function pageGpo(el) {
           <td class="small">${m ? `${pill(outdated ? 'partial' : 'success').replace(/>(partial|success)</, `>${outdated ? 'outdated' : 'v' + m.computer_version}<`)}
             <div class="muted">${m.machine_settings} registry · ${m.has_security ? 'security · ' : ''}${m.has_audit ? 'audit · ' : ''}${ago(m.imported_at)}</div>` : '<span class="muted">no</span>'}</td>
           <td style="white-space:nowrap">
-            ${g.computer_version !== null ? `<button onclick="App.gpoImport('${esc(g.guid)}')">${m ? 'Re-import' : 'Import'}</button>` : ''}
-            ${m ? `<button onclick="App.gpoView('${esc(g.guid)}')">View</button>
-              <button class="primary" onclick="App.deployPackage('${esc(m.package_id)}')">Deploy</button>` : ''}
+            ${g.computer_version !== null ? `<button onclick="App.gpoImport(${jstr(g.guid)})">${m ? 'Re-import' : 'Import'}</button>` : ''}
+            ${m ? `<button onclick="App.gpoView(${jstr(g.guid)})">View</button>
+              <button class="primary" onclick="App.deployPackage(${jstr(m.package_id)})">Deploy</button>` : ''}
           </td></tr>`;
       }).join('')}</tbody></table></div>`
       : '<div class="empty"><b>No GPOs imported yet</b>Click "Load GPOs from AD" (uses the Active Directory settings).</div>'}</div></div>`;
@@ -1862,11 +1862,11 @@ async function pageCatalog(el) {
       <td class="small">${catalogStatus(a)}</td>
       <td class="small">${a.added ? (a.deploy_groups.length ? a.deploy_groups.map((g) => `<span class="tag">${esc(g)}</span>`).join(' ') : '<span class="muted">manual</span>') : ''}</td>
       <td><div class="row" style="gap:6px;justify-content:flex-end">${!a.added
-        ? `<button class="primary" onclick="App.catAdd('${esc(a.id)}')" ${a.busy ? 'disabled' : ''}>Add</button>`
-        : `${a.update_available || !a.current || a.error ? `<button onclick="App.catUpdate('${esc(a.id)}')" ${a.busy ? 'disabled' : ''}>${a.current ? 'Update' : 'Retry'}</button>` : ''}
-          <button class="primary" onclick="App.deployPackage('${esc(a.package_id)}')" ${a.current && !a.busy ? '' : 'disabled'}>Deploy</button>
-          <button onclick="App.catGroups('${esc(a.id)}')">Auto-deploy</button>
-          <button class="danger" onclick="App.catRemove('${esc(a.id)}')" ${a.busy ? 'disabled' : ''}>Remove</button>`}</div></td></tr>`;
+        ? `<button class="primary" onclick="App.catAdd(${jstr(a.id)})" ${a.busy ? 'disabled' : ''}>Add</button>`
+        : `${a.update_available || !a.current || a.error ? `<button onclick="App.catUpdate(${jstr(a.id)})" ${a.busy ? 'disabled' : ''}>${a.current ? 'Update' : 'Retry'}</button>` : ''}
+          <button class="primary" onclick="App.deployPackage(${jstr(a.package_id)})" ${a.current && !a.busy ? '' : 'disabled'}>Deploy</button>
+          <button onclick="App.catGroups(${jstr(a.id)})">Auto-deploy</button>
+          <button class="danger" onclick="App.catRemove(${jstr(a.id)})" ${a.busy ? 'disabled' : ''}>Remove</button>`}</div></td></tr>`;
   el.innerHTML = `<div class="page-head"><h1>App catalog</h1>
       <span class="sub">Common apps at their latest version — downloaded once to the repository, checked and kept as ready-to-deploy packages</span>
       <div class="actions"><button class="primary" onclick="App.catCheck()" ${c.checking ? 'disabled' : ''}>${c.checking ? 'Checking…' : 'Check for updates'}</button></div></div>
@@ -2352,6 +2352,13 @@ Object.assign(App, {
 });
 
 /// JSON for an inline onclick attribute (single-quoted, HTML-escaped).
+/** A string as a JS string literal that is safe inside a double-quoted HTML
+ *  attribute (inline handlers). esc() alone is not enough there: the browser
+ *  decodes &#39; back to ' before the handler's JavaScript is parsed. */
+function jstr(s) {
+  return esc(JSON.stringify(String(s ?? '')));
+}
+
 function jattr(obj) {
   return `'${esc(JSON.stringify(obj)).replace(/&#39;/g, '\\u0027')}'`;
 }
@@ -2475,7 +2482,7 @@ function renderUpdatesBody() {
         const i = (s && s.info) || {};
         const missing = !ok ? '' : !s.missing ? '<span class="pill s-success">up to date</span>'
           : `${s.security ? `<span class="pill s-failed">${s.security} security</span> ` : ''}<b>${s.missing}</b> missing`;
-        return `<tr class="click" onclick="App.upShow('${esc(c.name)}')">
+        return `<tr class="click" onclick="App.upShow(${jstr(c.name)})">
           <td><b>${esc(c.name)}</b>${i.reboot_pending === 'true' ? ' <span class="pill s-partial">restart pending</span>' : ''}</td>
           <td>${ok ? `${esc(i.os_name || 'Windows')}<div class="os">${esc(i.os_build ? 'build ' + i.os_build : '')}</div>` : '<span class="muted">Windows</span>'}</td>
           <td>${missing}${ok && (s.optional || s.declined) ? `<div class="small muted">${[s.optional && `${s.optional} optional`, s.declined && `${s.declined} declined`].filter(Boolean).join(' · ')}</div>` : ''}</td>
