@@ -1,5 +1,5 @@
-//! Background loop: starts scheduled deployments, recurring schedules and
-//! AD auto-sync.
+//! Background loop: starts scheduled deployments, recurring schedules,
+//! AD auto-sync and periodic inventory scans.
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
@@ -22,6 +22,9 @@ pub fn spawn(app: App) {
             // Keep roughly a day of per-agent metric points (one per minute).
             if let Err(e) = app.db.prune_agent_metrics(1440) {
                 error!("pruning agent metrics: {e:#}");
+            }
+            if let Err(e) = crate::inventory::tick(&app) {
+                error!("inventory: {e:#}");
             }
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
         }

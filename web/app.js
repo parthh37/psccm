@@ -127,6 +127,7 @@ const ICON = {
   history: '<path d="M13 3a9 9 0 1 0 8.94 10h-2.02A7 7 0 1 1 13 5V2l4 4-4 4V7a5 5 0 1 0 5 5h2a7 7 0 0 1-7 7zM12 8h2v5l4 2-1 1.7-5-2.7z"/>',
   computers: '<path d="M3 4h18v12H3zm2 2v8h14V6zM8 18h8v2H8z"/>',
   packages: '<path d="M12 2l9 5v10l-9 5-9-5V7zm0 2.3L5.5 8 12 11.6 18.5 8zM5 9.7v6.1l6 3.4v-6.2zm8 9.5l6-3.4V9.7l-6 3.3z"/>',
+  inventory: '<path d="M9 2h6a1 1 0 0 1 1 1v1h3v18H5V4h3V3a1 1 0 0 1 1-1zm1 2v2h4V4zM7 6v14h10V6h-1v2H8V6zm2 5h6v2H9zm0 4h6v2H9z"/>',
   gpo: '<path d="M12 2l8 3v6c0 5-3.4 9.4-8 11-4.6-1.6-8-6-8-11V5zm0 2.2L6 6.4V11c0 3.9 2.5 7.4 6 8.9 3.5-1.5 6-5 6-8.9V6.4zM11 7h2v6h-2zm0 8h2v2h-2z"/>',
   schedules: '<path d="M7 2h2v2h6V2h2v2h3v18H4V4h3zm-1 8v10h12V10zm0-4v2h12V6z"/>',
   settings: '<path d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm8.6 5.5l1.9 1.5-2 3.4-2.3-.9a7.7 7.7 0 0 1-2.1 1.2L15.8 21h-4l-.4-2.4a7.7 7.7 0 0 1-2.1-1.2l-2.3.9-2-3.4L7 13.4a7.8 7.8 0 0 1 0-2.8L5 9.1l2-3.4 2.3.9a7.7 7.7 0 0 1 2.1-1.2L11.8 3h4l.4 2.4a7.7 7.7 0 0 1 2.1 1.2l2.3-.9 2 3.4-1.9 1.5a7.8 7.8 0 0 1 0 2.9z"/>',
@@ -135,7 +136,7 @@ const ICON = {
 
 const NAV = [
   ['dashboard', 'Dashboard'], ['deploy', 'Deploy'], ['history', 'Deployments'], ['computers', 'Computers'],
-  ['agents', 'Agents'], ['packages', 'Packages'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
+  ['agents', 'Agents'], ['inventory', 'Inventory'], ['packages', 'Packages'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
 ];
 
 // ------------------------------------------------------------------ router
@@ -268,6 +269,9 @@ function ruleText(r) {
   if (r.os_detail) parts.push('OS contains ' + r.os_detail);
   if (r.tags && r.tags.length) parts.push('tag ' + r.tags.join('/'));
   if (r.ad_group) parts.push('AD group ' + r.ad_group);
+  if (r.app) parts.push((r.app_missing ? 'without ' : 'has ') + r.app + (r.app_version ? ' ' + r.app_version : ''));
+  if (r.pending_reboot) parts.push('reboot pending');
+  if (r.low_disk_gb) parts.push(`a disk under ${r.low_disk_gb} GB free`);
   return parts.join(' and ');
 }
 
@@ -463,8 +467,9 @@ Object.assign(App, {
     CS.group = '';
     route();
   }),
-  editGroup(id) {
-    const g = CS.groups.find((x) => x.id === id) || { id: 0, name: '', description: '', kind: 'static', rules: { tags: [] }, members: [] };
+  /** `preset` pre-fills a new group (e.g. from the Inventory page). */
+  editGroup(id, preset) {
+    const g = CS.groups.find((x) => x.id === id) || { id: 0, name: '', description: '', kind: 'static', rules: { tags: [] }, members: [], ...preset };
     const r = g.rules || {};
     const m = modal(id ? 'Edit group ' + g.name : 'New group', `
       <div class="row"><div class="field"><label>Name</label><input id="g-name" value="${esc(g.name)}" placeholder="Web servers"></div>
@@ -494,6 +499,16 @@ Object.assign(App, {
             <div class="hint">Groups seen on imported AD computers.</div></div>
           <div class="field"><label>Has tag</label><input id="gr-tags" value="${esc((r.tags || []).join(', '))}" placeholder="prod"></div>
         </div>
+        <div class="cat">From inventory <span style="text-transform:none;letter-spacing:0;font-weight:400">— only scanned computers match these</span></div>
+        <div class="row">
+          <div class="field"><label>Installed software</label><input id="gr-app" value="${esc(r.app || '')}" placeholder="Google Chrome*"><div class="hint">Program name, * and ?</div></div>
+          <div class="field"><label>Version</label><input id="gr-appv" value="${esc(r.app_version || '')}" placeholder="<130 or >=22.11"><div class="hint">Empty = any version.</div></div>
+        </div>
+        <label class="check"><input type="checkbox" id="gr-appm" ${r.app_missing ? 'checked' : ''}> Computers that do <b>not</b> have this software (at this version)</label>
+        <div class="row" style="align-items:end">
+          <div class="field"><label>A disk has less free space than (GB)</label><input id="gr-disk" type="number" min="0" step="any" value="${r.low_disk_gb || ''}"></div>
+          <div class="field"><label class="check"><input type="checkbox" id="gr-reboot" ${r.pending_reboot ? 'checked' : ''}> Reboot pending</label></div>
+        </div>
         <div class="small" id="g-preview"></div>
       </div>`,
     [{ label: 'Cancel' }, {
@@ -505,7 +520,8 @@ Object.assign(App, {
         };
         await POST('/groups', body);
         CS.group = body.name;
-        route();
+        if (preset && location.hash !== '#/computers') location.hash = '#/computers';
+        else route();
       },
     }]);
     const root = m.root;
@@ -513,17 +529,23 @@ Object.assign(App, {
       os: $('#gr-os').value || null, name: $('#gr-name').value.trim(), ou: $('#gr-ou').value.trim(),
       os_detail: $('#gr-osd').value.trim(), ad_group: $('#gr-ad').value.trim(),
       tags: $('#gr-tags').value.split(',').map((s) => s.trim()).filter(Boolean),
+      app: $('#gr-app').value.trim(), app_version: $('#gr-appv').value.trim(), app_missing: $('#gr-appm').checked,
+      pending_reboot: $('#gr-reboot').checked, low_disk_gb: +$('#gr-disk').value || 0,
     });
     let timer;
     const preview = () => {
       clearTimeout(timer);
       timer = setTimeout(async () => {
+        if (!$('#g-preview')) return; // dialog closed
+        const body = rules();
         try {
-          const r2 = await POST('/groups/preview', rules());
-          $('#g-preview').innerHTML = r2.members.length
+          const r2 = await POST('/groups/preview', body);
+          const out = $('#g-preview');
+          if (!out) return;
+          out.innerHTML = r2.members.length
             ? `<b>${r2.members.length}</b> computer(s) match: <span class="muted">${esc(r2.members.slice(0, 12).join(', '))}${r2.members.length > 12 ? '…' : ''}</span>`
             : '<span class="muted">No computers match yet.</span>';
-        } catch (e) { $('#g-preview').textContent = e.message; }
+        } catch (e) { if ($('#g-preview')) $('#g-preview').textContent = e.message; }
       }, 250);
     };
     const kindVis = () => {
@@ -1234,6 +1256,224 @@ Object.assign(App, {
   }),
 });
 
+// --------------------------------------------------------------- inventory
+
+const IV = { tab: 'computers', q: '', sq: '', filter: '', sw: null };
+const gbFmt = (b) => (b / 1073741824).toFixed(b < 10737418240 ? 1 : 0) + ' GB';
+const lowDisk = (d) => d.size > 0 && d.free / d.size < 0.1;
+
+/** The fixed disk with the least free space (by share). */
+function worstDisk(inv) {
+  return (inv.disks || []).filter((d) => d.size > 0).sort((a, b) => a.free / a.size - b.free / b.size)[0];
+}
+
+function diskBar(d) {
+  const low = lowDisk(d);
+  return `<div class="progress" title="${esc(d.mount)}: ${gbFmt(d.free)} free of ${gbFmt(d.size)}">
+      <span class="${low ? 'p-bad' : 'p-ok'}" style="width:${(100 * (1 - d.free / d.size)).toFixed(0)}%"></span></div>
+    <div class="small ${low ? 'err' : 'muted'}">${esc(d.mount)} ${gbFmt(d.free)} free of ${gbFmt(d.size)}</div>`;
+}
+
+function scanProgress(sc) {
+  if (!sc.running) return '';
+  const pct = sc.total ? (100 * sc.done) / sc.total : 0;
+  return `<div class="card"><div class="card-body"><b>Scanning…</b> ${sc.done} of ${sc.total} computers done${sc.failed ? ` · <span class="err">${sc.failed} not reachable or failed</span>` : ''}
+    <div class="progress" style="margin-top:8px"><span class="p-ok" style="width:${pct.toFixed(0)}%"></span></div></div></div>`;
+}
+
+function pollInventory(el) {
+  poll(async () => {
+    try {
+      const r = await GET('/inventory');
+      if (r.scan.running) {
+        if ($('#inv-progress')) $('#inv-progress').innerHTML = scanProgress(r.scan);
+        pollInventory(el);
+      } else {
+        IV.sw = null;
+        toast(`Inventory scan finished${r.scan.failed ? ` (${r.scan.failed} not scanned)` : ''}`);
+        pageInventory(el);
+      }
+    } catch { pollInventory(el); }
+  }, 3000);
+}
+
+async function pageInventory(el) {
+  const [r, computers] = await Promise.all([GET('/inventory'), GET('/computers')]);
+  const inv = Object.fromEntries(r.inventory.map((i) => [i.computer.toLowerCase(), i]));
+  const scanned = r.inventory.filter((i) => i.scanned_at);
+  const n = {
+    reboot: scanned.filter((i) => i.facts.pending_reboot === 'true').length,
+    disk: scanned.filter((i) => (i.disks || []).some(lowDisk)).length,
+    failed: computers.filter((c) => { const i = inv[c.name.toLowerCase()]; return !i || i.status !== 'ok'; }).length,
+  };
+  const s = r.settings;
+  const stat = (key, num, label, color) => `<div class="stat click ${IV.filter === key ? 'on' : ''}" onclick="App.invFilter('${key}')">
+    <div class="n" style="color:${num && color ? color : 'inherit'}">${num}</div><div class="l">${label}</div></div>`;
+  el.innerHTML = `
+    <div class="page-head"><h1>Inventory</h1><span class="sub">${scanned.length} of ${computers.length} computers scanned</span>
+      <div class="actions"><button class="primary" onclick="App.invScan()" ${r.scan.running || !computers.length ? 'disabled' : ''}>Scan all computers</button></div></div>
+    <div id="inv-progress">${scanProgress(r.scan)}</div>
+    <div class="stats">
+      ${stat('', scanned.length, 'Scanned computers')}
+      ${stat('reboot', n.reboot, 'Reboot pending', 'var(--warn)')}
+      ${stat('disk', n.disk, 'A disk under 10% free', 'var(--bad)')}
+      ${stat('failed', n.failed, 'Not scanned or last scan failed', 'var(--bad)')}
+    </div>
+    <div class="card"><div class="card-head">
+      <div class="tabs"><button class="${IV.tab === 'computers' ? 'on' : ''}" onclick="App.invTab('computers')">Computers</button>
+        <button class="${IV.tab === 'software' ? 'on' : ''}" onclick="App.invTab('software')">Software</button></div>
+      <input class="search" id="inv-q" placeholder="${IV.tab === 'computers' ? 'Search name, OS, model, user, IP…' : 'Search program or publisher…'}"
+        value="${esc(IV.tab === 'computers' ? IV.q : IV.sq)}" oninput="App.invSearch(this.value)">
+    </div><div class="card-body flush" id="inv-body"></div></div>
+    <div class="card"><div class="card-head"><h2>Scan settings</h2>
+      ${s.last_scan ? `<span class="small muted">Last full scan started ${ago(s.last_scan)}</span>` : ''}</div><div class="card-body">
+      <div class="row">
+        <div class="field"><label>Scan all computers every (hours)</label><input id="iv-int" type="number" min="0" value="${s.interval_hours}">
+          <div class="hint">0 = only when you click Scan. 24 is a good start.</div></div>
+        <div class="field"><label>Computers scanned at the same time</label><input id="iv-conc" type="number" min="1" max="128" value="${s.concurrency}"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="iv-re" ${s.rescan_after_deploy ? 'checked' : ''}> Re-scan computers after a deployment succeeds on them (only computers scanned before)</label>
+      <p class="small muted">A scan runs a read-only script over WinRM/SSH with the computer's credential: OS, hardware, disks, logged-on user,
+        pending reboot and installed programs. Nothing is installed or changed. Use the results in dynamic groups (e.g. "Chrome older than 130").</p>
+      <button onclick="App.invSave()">Save</button></div></div>`;
+  IV.data = { computers, inv };
+  if (r.scan.running) pollInventory(el);
+  await renderInventoryBody();
+}
+
+function renderInventoryBody() {
+  if (IV.tab === 'software') return renderSoftware();
+  const { computers, inv } = IV.data;
+  const q = IV.q.toLowerCase();
+  const rows = computers.map((c) => ({ c, i: inv[c.name.toLowerCase()] })).filter(({ c, i }) => {
+    const f = (i && i.facts) || {};
+    if (IV.filter === 'reboot' && f.pending_reboot !== 'true') return false;
+    if (IV.filter === 'disk' && !(i && i.scanned_at && (i.disks || []).some(lowDisk))) return false;
+    if (IV.filter === 'failed' && i && i.status === 'ok') return false;
+    return !q || [c.name, f.os_name, f.model, f.manufacturer, f.user, f.ip_addresses, f.cpu].some((v) => (v || '').toLowerCase().includes(q));
+  });
+  $('#inv-body').innerHTML = !computers.length
+    ? '<div class="empty"><b>No computers yet</b>Add computers first, then scan them.</div>'
+    : `<div class="table-wrap"><table><thead><tr><th>Computer</th><th>Operating system</th><th>Hardware</th><th>Lowest disk</th>
+        <th>Last boot</th><th>Logged on</th><th>Software</th><th>Scanned</th></tr></thead><tbody>
+      ${rows.map(({ c, i }) => {
+        const f = (i && i.facts) || {};
+        const d = i && worstDisk(i);
+        const ok = i && i.scanned_at;
+        return `<tr class="click" onclick="App.invShow('${esc(c.name)}')">
+          <td><b>${esc(c.name)}</b>${f.pending_reboot === 'true' ? ' <span class="pill s-partial">reboot pending</span>' : ''}
+            ${f.ip_addresses ? `<div class="small muted">${esc(f.ip_addresses)}</div>` : ''}</td>
+          <td>${ok ? `${esc(f.os_name || osLabel(c.os))}<div class="os">${esc([f.os_version, f.os_build || f.kernel].filter(Boolean).join(' · '))}</div>` : `<span class="muted">${osLabel(c.os)}</span>`}</td>
+          <td class="small">${ok ? `${esc(f.model || '')}<div class="muted">${f.cpu_count ? esc(f.cpu_count) + ' CPU · ' : ''}${f.ram_mb ? (f.ram_mb / 1024).toFixed(0) + ' GB RAM' : ''}</div>` : ''}</td>
+          <td style="min-width:150px">${d ? diskBar(d) : ''}</td>
+          <td class="small" title="${esc(fmtTime(f.last_boot))}">${f.last_boot ? ago(f.last_boot) : ''}</td>
+          <td class="small">${esc(f.user || '')}</td>
+          <td class="num">${ok ? i.app_count : ''}</td>
+          <td class="small">${!i ? '<span class="muted">never</span>'
+            : `${ok ? ago(i.scanned_at) : '<span class="muted">never</span>'}${i.status !== 'ok' ? `<div class="err" title="${esc(i.error || '')}">${esc(i.status)} ${ago(i.last_attempt)}</div>` : ''}`}</td></tr>`;
+      }).join('')}</tbody></table></div>
+      ${rows.length ? '' : '<div class="empty">No computers match.</div>'}`;
+}
+
+async function renderSoftware() {
+  if (!IV.sw) {
+    $('#inv-body').innerHTML = '<div class="empty">Loading…</div>';
+    IV.sw = (await GET('/inventory/software')).software;
+  }
+  const q = IV.sq.toLowerCase();
+  const list = IV.sw.filter((s) => !q || s.name.toLowerCase().includes(q) || (s.publisher || '').toLowerCase().includes(q));
+  const shown = list.slice(0, 500);
+  $('#inv-body').innerHTML = !IV.sw.length
+    ? '<div class="empty"><b>No software inventory yet</b>Scan computers to see what is installed.</div>'
+    : `<div class="table-wrap"><table><thead><tr><th>Program</th><th>Publisher</th><th>Versions</th><th>Computers</th></tr></thead><tbody>
+      ${shown.map((s, i) => `<tr class="click" onclick="App.invSoftware(${IV.sw.indexOf(list[i])})">
+        <td><b>${esc(s.name)}</b></td><td class="small muted">${esc(s.publisher)}</td>
+        <td>${s.versions.slice(0, 6).map((v) => `<span class="tag" title="${v.computers} computer(s)">${esc(v.version || '?')} · ${v.computers}</span>`).join('')}${s.versions.length > 6 ? `<span class="small muted"> +${s.versions.length - 6} more</span>` : ''}</td>
+        <td class="num">${s.computers}</td></tr>`).join('')}</tbody></table></div>
+      ${list.length > shown.length ? `<div class="empty">Showing ${shown.length} of ${list.length}; refine the search.</div>` : ''}
+      ${list.length ? '' : '<div class="empty">No programs match.</div>'}`;
+}
+
+const FACTS = [
+  ['os_name', 'Operating system'], ['os_version', 'Version'], ['os_build', 'Build'], ['kernel', 'Kernel'], ['arch', 'Architecture'],
+  ['manufacturer', 'Manufacturer'], ['model', 'Model'], ['serial', 'Serial number'], ['cpu', 'Processor'], ['cpu_count', 'Logical CPUs'],
+  ['ram_mb', 'Memory'], ['domain', 'Domain'], ['user', 'Logged-on user'], ['ip_addresses', 'IPv4 addresses'], ['last_boot', 'Last boot'],
+  ['install_date', 'OS installed'], ['last_patch', 'Last update installed'], ['last_patch_id', 'Last update'],
+  ['pending_reboot', 'Reboot pending'], ['package_manager', 'Package manager'],
+];
+
+function factValue(k, v) {
+  if (k === 'ram_mb') return `${(v / 1024).toFixed(1)} GB`;
+  if (k === 'last_boot' || k === 'install_date') return `${esc(fmtTime(v))} <span class="muted">(${ago(v)})</span>`;
+  if (k === 'pending_reboot') return v === 'true' ? '<span class="pill s-partial">yes</span>' : 'no';
+  return esc(v);
+}
+
+Object.assign(App, {
+  invTab(t) { IV.tab = t; route(); },
+  invFilter(f) { IV.filter = IV.filter === f ? '' : f; IV.tab = 'computers'; route(); },
+  invSearch(v) { if (IV.tab === 'computers') IV.q = v; else IV.sq = v; renderInventoryBody(); },
+  invScan: act(async (names) => {
+    const r = await POST('/inventory/scan', { names: names || null });
+    toast(`Scanning ${r.started} computer(s)…`);
+    route();
+  }),
+  invSave: act(async () => {
+    await PUT('/settings/inventory', {
+      interval_hours: +$('#iv-int').value || 0, concurrency: +$('#iv-conc').value || 16, rescan_after_deploy: $('#iv-re').checked,
+    });
+    toast('Saved');
+  }),
+  invShow: act(async (name) => {
+    let i;
+    try { i = await GET('/inventory/computer/' + encodeURIComponent(name)); } catch { i = null; }
+    const scanBtn = { label: 'Scan now', cls: 'primary', onClick: async () => { await App.invScan([name]); } };
+    if (!i) {
+      modal(name, '<p class="muted">This computer has not been scanned yet.</p>', [{ label: 'Close' }, scanBtn]);
+      return;
+    }
+    const f = i.facts;
+    const known = new Set(FACTS.map(([k]) => k));
+    const rows = FACTS.filter(([k]) => f[k]).concat(Object.keys(f).filter((k) => !known.has(k)).map((k) => [k, k]));
+    const m = modal(name, `
+      <div class="small muted" style="margin-bottom:10px">${i.scanned_at ? `Scanned ${fmtTime(i.scanned_at)} (${ago(i.scanned_at)})` : 'Never scanned successfully'}
+        ${i.status !== 'ok' ? `<div class="err">Last attempt ${ago(i.last_attempt)}: ${esc(i.status)} — ${esc(i.error || '')}</div>` : ''}</div>
+      <div class="grid two" style="gap:18px">
+        <dl class="facts">${rows.map(([k, l]) => `<dt>${esc(l)}</dt><dd>${factValue(k, f[k])}</dd>`).join('')}</dl>
+        <div>${(i.disks || []).map((d) => `<div style="margin-bottom:10px">${diskBar(d)}</div>`).join('') || '<span class="muted small">No disks reported</span>'}</div>
+      </div>
+      <div class="cat">Installed software (${i.apps.length})</div>
+      <input class="search" id="inv-apps-q" placeholder="Filter…" style="margin-bottom:8px">
+      <div class="table-wrap" style="max-height:40vh;overflow:auto"><table><thead><tr><th>Program</th><th>Version</th><th>Publisher</th></tr></thead><tbody>
+        ${i.apps.map((a) => `<tr data-q="${esc((a.name + ' ' + a.publisher).toLowerCase())}"><td>${esc(a.name)}</td><td class="small">${esc(a.version)}</td>
+          <td class="small muted">${esc(a.publisher)}</td></tr>`).join('')}</tbody></table></div>`,
+    [{ label: 'Close' }, scanBtn], { wide: true });
+    $('#inv-apps-q', m.root).oninput = (e) => {
+      const q = e.target.value.toLowerCase();
+      $$('tbody tr', m.root).forEach((tr) => { tr.style.display = tr.dataset.q.includes(q) ? '' : 'none'; });
+    };
+  }),
+  invSoftware: act(async (idx) => {
+    const s = IV.sw[idx];
+    const r = await GET('/inventory/software/computers?name=' + encodeURIComponent(s.name));
+    const group = (missing) => ({
+      label: missing ? 'Group: computers without it' : 'Group: computers with it',
+      onClick: () => {
+        setTimeout(() => App.editGroup(0, {
+          name: `${missing ? 'Without' : 'With'} ${s.name}`.slice(0, 60), kind: 'dynamic',
+          description: 'Created from the software inventory', rules: { tags: [], app: s.name, app_missing: missing },
+        }), 0);
+      },
+    });
+    modal(s.name, `
+      <div class="small muted" style="margin-bottom:10px">${esc(s.publisher || '')} · installed on ${r.computers.length} computer(s).
+        Groups made here are dynamic: add a version condition (e.g. <code>&lt;130</code>) to find outdated copies.</div>
+      <div class="table-wrap" style="max-height:50vh;overflow:auto"><table><thead><tr><th>Computer</th><th>Version</th></tr></thead><tbody>
+        ${r.computers.map((c) => `<tr><td><b>${esc(c.computer)}</b></td><td class="small">${esc(c.version)}</td></tr>`).join('')}</tbody></table></div>`,
+    [group(true), group(false), { label: 'Close' }], { wide: true });
+  }),
+});
+
 // ------------------------------------------------------------- group policy
 
 let GPO_AD = null; // GPO list from AD (loaded on demand)
@@ -1746,7 +1986,7 @@ function jattr(obj) {
 const PAGES = {
   dashboard: pageDashboard, deploy: pageDeploy, history: pageHistory, deployment: pageDeployment,
   computers: pageComputers, packages: pagePackages, package: pagePackage, schedules: pageSchedules, settings: pageSettings,
-  gpo: pageGpo, agents: pageAgents, agent: pageAgent,
+  gpo: pageGpo, agents: pageAgents, agent: pageAgent, inventory: pageInventory,
 };
 
 route();

@@ -18,7 +18,7 @@ use crate::ad::{self, AdComputer, AdSettings};
 use crate::app::{AgentSettings, App, WinRmSettings};
 use crate::agent::{self, RunAs};
 use crate::db::{ComputerUpdate, DeployOptions, Group, GroupRules, NewComputer, NewCredential, Schedule, TargetSpec};
-use crate::{gpo, update};
+use crate::{gpo, inventory, update};
 use crate::engine;
 use crate::package::{Package, Shell};
 use crate::scheduler;
@@ -78,6 +78,12 @@ pub async fn serve(
         .route("/groups/preview", post(preview_group))
         .route("/groups/{id}", delete(delete_group))
         .route("/groups/{id}/members", post(group_members))
+        .route("/inventory", get(list_inventory))
+        .route("/inventory/scan", post(scan_inventory))
+        .route("/inventory/software", get(list_software))
+        .route("/inventory/software/computers", get(software_computers))
+        .route("/inventory/computer/{name}", get(get_inventory))
+        .route("/settings/inventory", put(save_inventory_settings))
         .route("/gpos", get(list_gpos))
         .route("/gpos/imported", get(list_imported_gpos))
         .route("/gpos/import-folder", post(import_gpo_folder))
@@ -248,13 +254,12 @@ async fn check_computers(State(st): State<St>, Json(req): Json<Names>) -> ApiRes
 
 async fn list_groups(State(st): State<St>) -> ApiResult {
     let all = st.app.db.list_computers()?;
-    let groups: Vec<Value> = st
-        .app
-        .db
-        .list_groups()?
+    let list = st.app.db.list_groups()?;
+    let inv = crate::groups::load_inventory(&st.app.db, list.iter().map(|g| &g.rules))?;
+    let groups: Vec<Value> = list
         .into_iter()
         .map(|g| {
-            let members: Vec<&str> = crate::groups::members(&g, &all).into_iter().map(|c| c.name.as_str()).collect();
+            let members: Vec<&str> = crate::groups::members(&g, &all, &inv).into_iter().map(|c| c.name.as_str()).collect();
             let mut v = json!(g);
             v["members"] = json!(members);
             v
@@ -276,6 +281,7 @@ async fn save_group(State(st): State<St>, Json(g): Json<Group>) -> ApiResult {
     if g.kind == "dynamic" && g.rules.is_empty() {
         return Err(anyhow!("a dynamic group needs at least one rule").into());
     }
+    g.rules.validate()?;
     let id = st.app.db.save_group(&g)?;
     if g.kind == "static" && g.id == 0 && !g.members.is_empty() {
         st.app.db.set_group_members(id, &g.members, true)?;
@@ -284,9 +290,75 @@ async fn save_group(State(st): State<St>, Json(g): Json<Group>) -> ApiResult {
 }
 
 async fn preview_group(State(st): State<St>, Json(rules): Json<GroupRules>) -> ApiResult {
+    rules.validate()?;
     let all = st.app.db.list_computers()?;
-    let names: Vec<&str> = all.iter().filter(|c| rules.matches(c)).map(|c| c.name.as_str()).collect();
+    let inv = crate::groups::load_inventory(&st.app.db, [&rules])?;
+    let names: Vec<&str> = all.iter().filter(|c| rules.matches(c, inv.get(&c.id))).map(|c| c.name.as_str()).collect();
     Ok(Json(json!({ "members": names })))
+}
+
+// ---------------------------------------------------------------- inventory
+
+async fn list_inventory(State(st): State<St>) -> ApiResult {
+    let settings: inventory::InventorySettings = st.app.db.get_setting("inventory")?;
+    let scan = st.app.scan.lock().unwrap().clone();
+    Ok(Json(json!({
+        "inventory": st.app.db.list_inventory(false)?,
+        "scan": scan,
+        "settings": settings,
+    })))
+}
+
+async fn get_inventory(State(st): State<St>, Path(name): Path<String>) -> ApiResult {
+    let inv = st.app.db.get_inventory(&name)?.ok_or_else(|| anyhow!("inventory not found"))?;
+    Ok(Json(json!(inv)))
+}
+
+async fn scan_inventory(State(st): State<St>, Json(req): Json<Names>) -> ApiResult {
+    let n = inventory::start(&st.app, req.names)?;
+    Ok(Json(json!({ "started": n })))
+}
+
+async fn list_software(State(st): State<St>) -> ApiResult {
+    // One entry per program name, with the computer count of each version.
+    let mut out: Vec<Value> = Vec::new();
+    for (name, version, publisher, count) in st.app.db.software_summary()? {
+        let same = out.last().is_some_and(|v| v["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&name)));
+        if !same {
+            out.push(json!({ "name": name, "publisher": publisher, "computers": 0, "versions": [] }));
+        }
+        let e = out.last_mut().unwrap();
+        e["computers"] = json!(e["computers"].as_i64().unwrap_or(0) + count);
+        if e["publisher"].as_str().is_some_and(str::is_empty) {
+            e["publisher"] = json!(publisher);
+        }
+        e["versions"].as_array_mut().unwrap().push(json!({ "version": version, "computers": count }));
+    }
+    Ok(Json(json!({ "software": out })))
+}
+
+#[derive(Deserialize)]
+struct NameQ {
+    name: String,
+}
+
+async fn software_computers(State(st): State<St>, Query(q): Query<NameQ>) -> ApiResult {
+    let list: Vec<Value> = st
+        .app
+        .db
+        .software_computers(&q.name)?
+        .into_iter()
+        .map(|(computer, version)| json!({ "computer": computer, "version": version }))
+        .collect();
+    Ok(Json(json!({ "computers": list })))
+}
+
+async fn save_inventory_settings(State(st): State<St>, Json(mut s): Json<inventory::InventorySettings>) -> ApiResult {
+    let old: inventory::InventorySettings = st.app.db.get_setting("inventory")?;
+    s.last_scan = old.last_scan;
+    s.concurrency = s.concurrency.clamp(1, 128);
+    st.app.db.set_setting("inventory", &s)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn delete_group(State(st): State<St>, Path(id): Path<i64>) -> ApiResult {
@@ -686,7 +758,7 @@ async fn list_agents(State(st): State<St>) -> ApiResult {
 async fn get_agent(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
     let agent = st.app.db.get_agent(&id)?.ok_or_else(|| anyhow!("agent not found"))?;
     let inv = |kind: &str| -> Value {
-        match st.app.db.get_inventory(&id, kind) {
+        match st.app.db.get_agent_inventory(&id, kind) {
             Ok(Some((data, synced_at))) => json!({ "data": data, "synced_at": synced_at }),
             _ => Value::Null,
         }

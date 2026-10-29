@@ -51,12 +51,19 @@ pub fn resolve_targets(app: &App, spec: &TargetSpec) -> Result<Vec<Target>> {
     };
     if !spec.groups.is_empty() {
         let groups = app.db.list_groups()?;
-        for name in &spec.groups {
-            let g = groups
-                .iter()
-                .find(|g| g.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| anyhow!("computer group '{name}' not found"))?;
-            for c in crate::groups::members(g, &all) {
+        let wanted: Vec<&crate::db::Group> = spec
+            .groups
+            .iter()
+            .map(|name| {
+                groups
+                    .iter()
+                    .find(|g| g.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| anyhow!("computer group '{name}' not found"))
+            })
+            .collect::<Result<_>>()?;
+        let inv = crate::groups::load_inventory(&app.db, wanted.iter().map(|g| &g.rules))?;
+        for g in wanted {
+            for c in crate::groups::members(g, &all, &inv) {
                 push(from_db(c));
             }
         }
@@ -262,6 +269,8 @@ pub async fn run_deployment(app: &App, id: &str) -> Result<String> {
     };
     app.db.set_deployment_status(id, status)?;
     info!("deployment {id}: {status}");
+    let succeeded = results.into_iter().filter(|t| t.status == "success").map(|t| t.computer).collect();
+    crate::inventory::after_deployment(app, succeeded);
     Ok(status.to_string())
 }
 
@@ -661,6 +670,15 @@ async fn run_step(cx: &StepCx<'_>, step: &Step) -> Result<()> {
     if let Some(copy) = &step.copy {
         let tmp = cx.push(&render(&copy.src, vars)?, timeout).await?;
         let dest = render(&copy.dest, vars)?;
+        // The upload already landed where it should (e.g. dest '{{workdir}}\file.zip').
+        let same = match cx.os {
+            Os::Windows => tmp.replace('/', "\\").eq_ignore_ascii_case(&dest.replace('/', "\\")),
+            Os::Linux => tmp == dest,
+        };
+        if same {
+            (cx.log)(&format!("Copied to {dest}"));
+            return Ok(());
+        }
         let body = match cx.os {
             Os::Windows => format!(
                 "$d = {d}\nNew-Item -ItemType Directory -Force -Path (Split-Path $d) | Out-Null\nCopy-Item -LiteralPath {t} -Destination $d -Force\nWrite-Output \"Copied to $d\"",
@@ -759,16 +777,12 @@ async fn install_script(cx: &StepCx<'_>, inst: &Install, timeout: Duration) -> R
 }
 
 const WIN_INSTALL: &str = r#"switch ([IO.Path]::GetExtension($f).ToLower()) {
-    '.msi' { $code = Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "/i `"$f`" /qn /norestart /l*v `"$f.log`" $a" }
-    '.msp' { $code = Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "/p `"$f`" /qn /norestart /l*v `"$f.log`" $a" }
+    '.msi' { $code = Invoke-PsccmMsi -Path $f -Arguments $a }
+    '.msp' { $code = Invoke-PsccmMsi -Path $f -Arguments $a -Verb '/p' }
     '.msu' { $code = Invoke-PsccmProcess -FilePath 'wusa.exe' -Arguments "`"$f`" /quiet /norestart $a" }
     default { $code = Invoke-PsccmProcess -FilePath $f -Arguments $a }
 }
 Write-Output "Installer exit code: $code"
-if ($code -notin 0, 3010, 1641 -and (Test-Path "$f.log")) {
-    Write-Output '--- end of MSI log ---'
-    Get-Content "$f.log" -Tail 25
-}
 exit $code
 "#;
 

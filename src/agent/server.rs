@@ -134,7 +134,7 @@ pub async fn job_result(
     if result.status == "success"
         && let Some(inv) = inventory_kind(&kind)
     {
-        app.db.set_inventory(&id, inv, &result.data)?;
+        app.db.set_agent_inventory(&id, inv, &result.data)?;
     }
     Ok(Json(json!({ "ok": true })))
 }

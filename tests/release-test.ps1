@@ -6,11 +6,11 @@
     Runs against a built or installed PSCCM and, optionally, real target computers:
       - installer: silent install, Windows service, upgrade in place, uninstall   (-Setup)
       - binary:    version, help, built-in packages
-      - API:       auth, packages, computers, groups, credentials, schedules,
+      - API:       auth, packages, computers, groups, inventory, credentials, schedules,
                    deployments, redeploy, cancel, updates, GPO backup import
-      - Windows:   WinRM commands, every step type, rollback, detect, GPO
+      - Windows:   WinRM commands, inventory scan, every step type, rollback, detect, GPO
                    apply/remove, rolling batches, real installs (7-Zip, Node.js, IIS)
-      - Linux:     SSH + sudo, every step type, rollback, real installs
+      - Linux:     SSH + sudo, inventory scan, every step type, rollback, real installs
                    (7-Zip, Node.js, HAProxy upgrade/config/drain)
     Tests that need something not provided are reported as "skip".
 
@@ -129,6 +129,20 @@ function Wait-Deployment([string]$Id, [int]$TimeoutSec = 1800) {
     }
 }
 
+# Scan computers' inventory and return each one's stored inventory (by name).
+function Invoke-Scan([string[]]$Names, [int]$TimeoutSec = 600) {
+    [void](Ok (Api POST '/inventory/scan' @{ names = $Names }))
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    do {
+        Start-Sleep -Milliseconds 1500
+        $r = Ok (Api GET '/inventory')
+    } while ($r.scan.running -and (Get-Date) -lt $deadline)
+    Assert (-not $r.scan.running) 'inventory scan did not finish'
+    $out = @{}
+    foreach ($n in $Names) { $out[$n] = @($r.inventory) | Where-Object { $_.computer -eq $n } }
+    $out
+}
+
 function Invoke-Deploy([hashtable]$Body, [int]$TimeoutSec = 1800) {
     $r = Ok (Api POST '/deployments' $Body)
     Wait-Deployment $r.id $TimeoutSec
@@ -245,7 +259,7 @@ Test-Step 'Binary' 'Version' {
 }
 Test-Step 'Binary' 'Help lists the commands' {
     $out = (& $Exe --help) -join "`n"
-    foreach ($c in 'serve', 'deploy', 'run', 'packages', 'computers', 'groups', 'gpo', 'update', 'service') {
+    foreach ($c in 'serve', 'deploy', 'run', 'packages', 'computers', 'groups', 'inventory', 'gpo', 'update', 'service') {
         Assert ($out -match "(?m)^\s+$c\b") "help does not mention '$c'"
     }
 }
@@ -337,6 +351,18 @@ try {
         [void](Ok (Api POST "/groups/$($s.id)/members" @{ remove = @('rt-b.invalid') }))
         $st = (Ok (Api GET '/groups')).groups | Where-Object { $_.name -eq 'RT static' }
         Assert (@($st.members).Count -eq 1) 'remove member failed'
+    }
+    Test-Step 'API' 'Inventory: settings, unreachable scan, rule validation' {
+        [void](Ok (Api PUT '/settings/inventory' @{ interval_hours = 0; concurrency = 8; rescan_after_deploy = $true }))
+        Assert ((Ok (Api GET '/inventory')).settings.concurrency -eq 8) 'inventory settings not saved'
+        $inv = Invoke-Scan @('rt-a.invalid') 120
+        Assert ($inv['rt-a.invalid'].status -eq 'offline') "status $($inv['rt-a.invalid'].status)"
+        Assert (-not $inv['rt-a.invalid'].scanned_at) 'unreachable computer has a scan time'
+        $bad = Api POST '/groups' @{ name = 'RT bad inv'; kind = 'dynamic'; rules = @{ app_version = '<130' } }
+        Assert ($bad.Status -eq 400) 'version condition without software accepted'
+        $prev = Ok (Api POST '/groups/preview' @{ app = '*' })
+        Assert (@($prev.members).Count -eq 0) "unscanned computers matched a software rule: $($prev.members)"
+        Assert ((Api GET '/inventory/computer/no-such-computer').Status -eq 404) 'missing inventory is not 404'
     }
     Test-Step 'API' 'Credentials never return secrets' {
         $c = Ok (Api POST '/credentials' @{ name = 'rt-cred'; kind = 'ssh'; username = 'u'; secret = 'p@ss-rt' })
@@ -491,6 +517,21 @@ try {
             $r = Invoke-Deploy @{ command = "Write-Output ('ps=' + `$PSVersionTable.PSVersion.Major); hostname"; targets = @{ computers = @($WindowsTarget) } } 300
             Assert-Deploy $r 'success' @('ps=')
         }
+        Test-Step 'Windows' 'Inventory scan over WinRM and a software group rule' {
+            $i = (Invoke-Scan @($WindowsTarget))[$WindowsTarget]
+            Assert ($i.status -eq 'ok') "scan $($i.status): $($i.error)"
+            Assert ($i.facts.os_name -like '*Windows*') "os_name '$($i.facts.os_name)'"
+            Assert ([int]$i.facts.ram_mb -gt 0) 'no memory size'
+            Assert (@($i.disks).Count -ge 1) 'no disks'
+            Assert ($i.app_count -gt 0) 'no installed programs'
+            $full = Ok (Api GET "/inventory/computer/$WindowsTarget")
+            $app = @($full.apps)[0].name
+            $prev = Ok (Api POST '/groups/preview' @{ app = $app })
+            Assert (@($prev.members) -contains $WindowsTarget) "software rule '$app' did not match"
+            $prev = Ok (Api POST '/groups/preview' @{ app = $app; app_missing = $true })
+            Assert (@($prev.members) -notcontains $WindowsTarget) "'without $app' matched"
+            "$($i.facts.os_name), $($i.app_count) programs"
+        }
         Test-Step 'Windows' 'cmd shell' {
             $r = Invoke-Deploy @{ command = 'echo cmd-ok %COMPUTERNAME%'; shell = 'cmd'; targets = @{ computers = @($WindowsTarget) } } 300
             Assert-Deploy $r 'success' @('cmd-ok')
@@ -577,15 +618,20 @@ verify:
         }
         Test-Step 'Windows' '7-Zip install, then detect skips' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($WindowsTarget) } } 900
+            $r = Invoke-Deploy @{ package_id = '7zip'; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 900
             Assert-Deploy $r 'success' @('==> Verify')
             $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($WindowsTarget) } } 600
             Assert ($r.Targets[0].status -eq 'skipped') "second run: $($r.Targets[0].status)"
         }
-        Test-Step 'Windows' 'Node.js 22 install' {
+        Test-Step 'Windows' 'Uninstall, Node.js MSI install, same version is not reinstalled' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = '22' }; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 1200
-            Assert-Deploy $r 'success' @('v22.')
+            # Start clean (runner images ship Node.js): this also exercises uninstall-app.
+            $r = Invoke-Deploy @{ package_id = 'uninstall-app'; variables = @{ name = 'Node.js' }; targets = @{ computers = @($WindowsTarget) } } 900
+            if ($r.Targets[0].status -ne 'skipped') { Assert-Deploy $r 'success' @('Uninstalling Node.js') }
+            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = '22' }; targets = @{ computers = @($WindowsTarget) } } 1200
+            Assert-Deploy $r 'success' @('Running: msiexec.exe', '==> Verify', 'v22.')
+            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = '22' }; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 600
+            Assert-Deploy $r 'success' @('is already installed') @('Running: msiexec.exe')
         }
         Test-Step 'Windows' 'IIS install, site deploy with health check, app pool recycle' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
@@ -622,6 +668,17 @@ verify:
         Test-Step 'Linux' 'Ad-hoc command over SSH with sudo' {
             $r = Invoke-Deploy @{ command = 'echo "kernel=$(uname -s) uid=$(id -u)"'; targets = @{ computers = @($LinuxTarget) } } 300
             Assert-Deploy $r 'success' @('kernel=Linux uid=0')
+        }
+        Test-Step 'Linux' 'Inventory scan over SSH' {
+            $i = (Invoke-Scan @($LinuxTarget))[$LinuxTarget]
+            Assert ($i.status -eq 'ok') "scan $($i.status): $($i.error)"
+            Assert ($i.facts.os_name) 'no os_name'
+            Assert ($i.facts.kernel) 'no kernel'
+            Assert (@($i.disks).Count -ge 1) 'no disks'
+            Assert ($i.app_count -gt 0) 'no installed packages'
+            $prev = Ok (Api POST '/groups/preview' @{ app = 'bash' })
+            Assert (@($prev.members) -contains $LinuxTarget) 'software rule "bash" did not match'
+            "$($i.facts.os_name), $($i.app_count) packages"
         }
         Test-Step 'Linux' 'Every step type (script, when, retry, copy, install, service, include, delegate)' {
             [void](Add-Package "id: rt-child-linux`nname: RT child`nplatforms: [linux]`nsteps:`n  - name: Child step`n    script: echo child-ok`n")
@@ -686,8 +743,8 @@ verify:
         }
         Test-Step 'Linux' '7-Zip install, then detect skips' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($LinuxTarget) } } 900
-            if ($r.Targets[0].status -ne 'skipped') { Assert-Deploy $r 'success' @('==> Verify') }
+            $r = Invoke-Deploy @{ package_id = '7zip'; options = @{ use_detect = $false }; targets = @{ computers = @($LinuxTarget) } } 900
+            Assert-Deploy $r 'success' @('==> Verify')
             $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($LinuxTarget) } } 600
             Assert ($r.Targets[0].status -eq 'skipped') "second run: $($r.Targets[0].status)"
         }
@@ -714,7 +771,8 @@ frontend fe
 backend web
     server s1 127.0.0.1:9 check
 "@
-            Write-Utf8 (Join-Path $repo 'haproxy/haproxy.cfg') $cfg.Replace("`r`n", "`n")
+            # Deliberately no final newline: the package must cope with that.
+            Write-Utf8 (Join-Path $repo 'haproxy/haproxy.cfg') $cfg.Replace("`r`n", "`n").TrimEnd("`n")
             $r = Invoke-Deploy @{ package_id = 'haproxy-upgrade'; targets = @{ computers = @($LinuxTarget) } } 1800
             Assert-Deploy $r 'success' @('HAProxy version', 'Configuration file is valid')
             $r = Invoke-Deploy @{ package_id = 'haproxy-config'; targets = @{ computers = @($LinuxTarget) } } 600
@@ -758,11 +816,17 @@ backend web
 if ($Setup -and $OnWindows) {
     Test-Step 'Installer' 'Silent uninstall removes the service' {
         $un = Join-Path $env:ProgramFiles 'PSCCM\unins000.exe'
-        $p = Start-Process -FilePath $un -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+        $p = Start-Process -FilePath $un -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru
+        # The uninstaller hands off to a copy of itself in %TEMP%; wait for that too.
+        $deadline = (Get-Date).AddMinutes(5)
+        while ((-not $p.HasExited -or (Get-Process _unins* -ErrorAction SilentlyContinue)) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+        $left = Get-Process _unins* -ErrorAction SilentlyContinue
+        if ($left) { $left | Stop-Process -Force; throw 'uninstaller still running after 5 minutes (waiting on a prompt?)' }
         Assert ($p.ExitCode -eq 0) "uninstaller exit $($p.ExitCode)"
         Start-Sleep -Seconds 3
         Assert (-not (Get-Service PSCCM -ErrorAction SilentlyContinue)) 'service still exists'
         Assert (-not (Test-Path $InstalledExe)) 'psccm.exe still installed'
+        Assert (Test-Path (Join-Path $env:ProgramData 'PSCCM\psccm.db')) 'silent uninstall must keep the data folder'
     }
 }
 

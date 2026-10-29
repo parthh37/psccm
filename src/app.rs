@@ -20,6 +20,8 @@ pub struct Ctx {
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Live agent check-in wakeups and interactive terminal sessions.
     pub agents: Hub,
+    /// Progress of the current (or last) inventory scan.
+    pub scan: Mutex<crate::inventory::ScanState>,
 }
 
 /// Console-side agent settings: the shared enrollment token agents present.
@@ -88,6 +90,7 @@ impl Ctx {
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
             agents: Hub::default(),
+            scan: Mutex::new(Default::default()),
         };
         std::fs::create_dir_all(ctx.packages_dir())?;
         std::fs::create_dir_all(ctx.repo_dir())?;

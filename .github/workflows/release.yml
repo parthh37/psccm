@@ -90,6 +90,7 @@ jobs:
     needs: [publish]
     if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Download release
@@ -127,6 +128,7 @@ jobs:
     needs: [publish]
     if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Download release

@@ -188,8 +188,8 @@ begin
     SetEnvironmentVariable('PSCCM_SERVICE_PASSWORD', AccountPage.Values[1]);
   end;
   if not Exec(ExpandConstant('{app}\psccm.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
-    MsgBox('The PSCCM service could not be installed (exit code ' + IntToStr(Code) + ').' + #13#10 +
-      'Check the account name and password, or run "psccm service install" from an administrator prompt.', mbError, MB_OK);
+    SuppressibleMsgBox('The PSCCM service could not be installed (exit code ' + IntToStr(Code) + ').' + #13#10 +
+      'Check the account name and password, or run "psccm service install" from an administrator prompt.', mbError, MB_OK, IDOK);
   SetEnvironmentVariable('PSCCM_SERVICE_PASSWORD', '');
 end;
 
@@ -204,7 +204,8 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
-    if MsgBox('Delete the PSCCM data folder (computers, credentials, history, packages)?' + #13#10 +
-      ExpandConstant('{commonappdata}\PSCCM'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    { Suppressible, so a silent uninstall (/SUPPRESSMSGBOXES) keeps the data instead of waiting on a prompt. }
+    if SuppressibleMsgBox('Delete the PSCCM data folder (computers, credentials, history, packages)?' + #13#10 +
+      ExpandConstant('{commonappdata}\PSCCM'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
       DelTree(ExpandConstant('{commonappdata}\PSCCM'), True, True, True);
 end;

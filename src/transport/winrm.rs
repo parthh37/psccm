@@ -155,12 +155,29 @@ Invoke-Command @sess -ArgumentList {remote}, $b64, '{shell_name}' -ScriptBlock {
     param($path, $b64, $shell)
     New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
     [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($b64))
+    # Through cmd so stdout and stderr arrive merged and in order, decoded
+    # explicitly: the remote host has no console, so PowerShell's own decoding
+    # of native output would guess the wrong code page. PowerShell steps write
+    # UTF-8 (see the prelude); cmd writes the OEM code page.
+    $psi = New-Object Diagnostics.ProcessStartInfo 'cmd.exe'
     if ($shell -eq 'cmd') {{
-        & cmd.exe /d /c "`"$path`"" 2>&1
+        $psi.Arguments = '/d /s /c ""' + $path + '" 2>&1"'
+        $oem = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -ErrorAction SilentlyContinue).OEMCP
+        $psi.StandardOutputEncoding = try {{ [Text.Encoding]::GetEncoding([int]$oem) }} catch {{ [Text.Encoding]::Default }}
     }} else {{
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $path 2>&1
+        $psi.Arguments = '/d /s /c ""powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $path + '" 2>&1"'
+        $psi.StandardOutputEncoding = New-Object Text.UTF8Encoding $false
     }}
-    $code = $LASTEXITCODE
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    # Installers that prompt get end-of-input instead of hanging.
+    $p.StandardInput.Close()
+    while ($null -ne ($line = $p.StandardOutput.ReadLine())) {{ $line }}
+    $p.WaitForExit()
+    $code = $p.ExitCode
     Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
     "__PSCCM_EXIT__=$code"
 }} 2>&1 | ForEach-Object {{ "$_" }}
