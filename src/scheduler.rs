@@ -19,6 +19,10 @@ pub fn spawn(app: App) {
             if let Err(e) = crate::update::tick(&app).await {
                 error!("update check: {e:#}");
             }
+            // Keep roughly a day of per-agent metric points (one per minute).
+            if let Err(e) = app.db.prune_agent_metrics(1440) {
+                error!("pruning agent metrics: {e:#}");
+            }
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
         }
     });

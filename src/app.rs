@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use crate::agent::terminal::Hub;
 use crate::db::Db;
 use crate::package::{Library, load_library};
 
@@ -17,6 +18,29 @@ pub struct Ctx {
     pub data_dir: PathBuf,
     /// Cancellation flags of running deployments.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Live agent check-in wakeups and interactive terminal sessions.
+    pub agents: Hub,
+}
+
+/// Console-side agent settings: the shared enrollment token agents present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSettings {
+    /// Shared secret an agent must send to enroll. Generated on first use.
+    #[serde(default)]
+    pub enroll_token: String,
+    /// Allow new agents to enroll. Existing agents keep working when off.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        AgentSettings { enroll_token: String::new(), enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -48,6 +72,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("linux-package.yaml", include_str!("../packages/linux-package.yaml")),
     ("linux-update.yaml", include_str!("../packages/linux-update.yaml")),
     ("reboot.yaml", include_str!("../packages/reboot.yaml")),
+    ("install-agent.yaml", include_str!("../packages/install-agent.yaml")),
 ];
 
 pub fn builtin_packages() -> &'static [(&'static str, &'static str)] {
@@ -62,6 +87,7 @@ impl Ctx {
             db: Db::open(&data_dir.join("psccm.db"))?,
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
+            agents: Hub::default(),
         };
         std::fs::create_dir_all(ctx.packages_dir())?;
         std::fs::create_dir_all(ctx.repo_dir())?;
@@ -90,6 +116,20 @@ impl Ctx {
 
     pub fn winrm_settings(&self) -> WinRmSettings {
         self.db.get_setting("winrm").unwrap_or_default()
+    }
+
+    pub fn agent_settings(&self) -> AgentSettings {
+        self.db.get_setting("agent").unwrap_or_default()
+    }
+
+    /// The enrollment token, generating and persisting one the first time.
+    pub fn enroll_token(&self) -> Result<String> {
+        let mut s = self.agent_settings();
+        if s.enroll_token.is_empty() {
+            s.enroll_token = uuid::Uuid::new_v4().simple().to_string();
+            self.db.set_setting("agent", &s)?;
+        }
+        Ok(s.enroll_token)
     }
 
     /// Resolve a repository-relative path, refusing anything that escapes it.

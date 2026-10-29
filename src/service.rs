@@ -51,34 +51,58 @@ mod imp {
     static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
     pub fn install(data_dir: &std::path::Path, account: Option<String>, password: Option<String>) -> Result<()> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)
-            .context("opening the service manager (run as administrator)")?;
-        let info = ServiceInfo {
-            name: OsString::from(SERVICE_NAME),
-            display_name: OsString::from("PSCCM Deployment Console"),
-            service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: std::env::current_exe()?,
-            launch_arguments: vec![
+        install_named(
+            SERVICE_NAME,
+            "PSCCM Deployment Console",
+            "Agentless software deployment for Windows (WinRM) and Linux (SSH).",
+            vec![
                 OsString::from("--data-dir"),
                 data_dir.as_os_str().to_owned(),
                 OsString::from("service"),
                 OsString::from("run"),
             ],
+            account,
+            password,
+        )
+    }
+
+    /// Register and start an own-process service with the given launch
+    /// arguments. Shared by the console and the agent.
+    pub fn install_named(
+        name: &str,
+        display: &str,
+        description: &str,
+        launch_arguments: Vec<OsString>,
+        account: Option<String>,
+        password: Option<String>,
+    ) -> Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)
+            .context("opening the service manager (run as administrator)")?;
+        let info = ServiceInfo {
+            name: OsString::from(name),
+            display_name: OsString::from(display),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: std::env::current_exe()?,
+            launch_arguments,
             dependencies: vec![],
             account_name: account.filter(|a| !a.is_empty()).map(OsString::from),
             account_password: password.filter(|p| !p.is_empty()).map(OsString::from),
         };
         let svc = manager.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
-        svc.set_description("Agentless software deployment for Windows (WinRM) and Linux (SSH).")?;
+        svc.set_description(description)?;
         svc.start::<&str>(&[]).context("starting the service")?;
         Ok(())
     }
 
     pub fn uninstall() -> Result<()> {
+        uninstall_named(SERVICE_NAME)
+    }
+
+    pub fn uninstall_named(name: &str) -> Result<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-        let svc = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)?;
+        let svc = manager.open_service(name, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)?;
         if svc.query_status()?.current_state != ServiceState::Stopped {
             let _ = svc.stop();
             for _ in 0..30 {
@@ -137,6 +161,7 @@ mod imp {
             let app = crate::app::Ctx::open(&data_dir)?;
             let s: ServerSettings = app.db.get_setting("server")?;
             app.db.fail_interrupted()?;
+            app.db.fail_interrupted_jobs()?;
             crate::scheduler::spawn(app.clone());
             let addr: std::net::SocketAddr = format!("{}:{}", s.bind, s.port).parse()?;
             tracing::info!("PSCCM service listening on {addr}");
@@ -151,7 +176,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{install, run, uninstall};
+pub use imp::{install, install_named, run, uninstall, uninstall_named};
 
 #[cfg(not(windows))]
 pub fn install(_: &std::path::Path, _: Option<String>, _: Option<String>) -> Result<()> {
@@ -159,7 +184,24 @@ pub fn install(_: &std::path::Path, _: Option<String>, _: Option<String>) -> Res
 }
 
 #[cfg(not(windows))]
+pub fn install_named(
+    _: &str,
+    _: &str,
+    _: &str,
+    _: Vec<std::ffi::OsString>,
+    _: Option<String>,
+    _: Option<String>,
+) -> Result<()> {
+    anyhow::bail!("not a Windows system")
+}
+
+#[cfg(not(windows))]
 pub fn uninstall() -> Result<()> {
+    anyhow::bail!("not a Windows system")
+}
+
+#[cfg(not(windows))]
+pub fn uninstall_named(_: &str) -> Result<()> {
     anyhow::bail!("not a Windows system")
 }
 

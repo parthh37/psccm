@@ -130,11 +130,12 @@ const ICON = {
   gpo: '<path d="M12 2l8 3v6c0 5-3.4 9.4-8 11-4.6-1.6-8-6-8-11V5zm0 2.2L6 6.4V11c0 3.9 2.5 7.4 6 8.9 3.5-1.5 6-5 6-8.9V6.4zM11 7h2v6h-2zm0 8h2v2h-2z"/>',
   schedules: '<path d="M7 2h2v2h6V2h2v2h3v18H4V4h3zm-1 8v10h12V10zm0-4v2h12V6z"/>',
   settings: '<path d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm8.6 5.5l1.9 1.5-2 3.4-2.3-.9a7.7 7.7 0 0 1-2.1 1.2L15.8 21h-4l-.4-2.4a7.7 7.7 0 0 1-2.1-1.2l-2.3.9-2-3.4L7 13.4a7.8 7.8 0 0 1 0-2.8L5 9.1l2-3.4 2.3.9a7.7 7.7 0 0 1 2.1-1.2L11.8 3h4l.4 2.4a7.7 7.7 0 0 1 2.1 1.2l2.3-.9 2 3.4-1.9 1.5a7.8 7.8 0 0 1 0 2.9z"/>',
+  agents: '<path d="M4 4h16v10H4zm2 2v6h12V6zm-3 11h18v2H3zm9-9a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/>',
 };
 
 const NAV = [
   ['dashboard', 'Dashboard'], ['deploy', 'Deploy'], ['history', 'Deployments'], ['computers', 'Computers'],
-  ['packages', 'Packages'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
+  ['agents', 'Agents'], ['packages', 'Packages'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
 ];
 
 // ------------------------------------------------------------------ router
@@ -149,7 +150,7 @@ async function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const name = parts[0] || 'dashboard';
   const param = decodeURIComponent(parts.slice(1).join('/') || '');
-  const navKey = { deployment: 'history', package: 'packages' }[name] || name;
+  const navKey = { deployment: 'history', package: 'packages', agent: 'agents' }[name] || name;
   $('#nav').innerHTML = NAV.map(([k, label]) =>
     `<a href="#/${k}" class="${k === navKey ? 'active' : ''}"><svg viewBox="0 0 24 24" fill="currentColor">${ICON[k]}</svg>${label}</a>`).join('');
   const main = $('#main');
@@ -1119,12 +1120,42 @@ async function pageSettings(el) {
         <p class="small muted">Host keys are remembered the first time PSCCM connects. If a server is rebuilt, forget its key.</p>
         <div class="row"><div class="field"><input id="kh-host" placeholder="web01.corp.local or host:port"></div><button onclick="App.forgetHost()">Forget key</button></div></div></div>
     </div>
+    <div class="card"><div class="card-head"><h2>Agents</h2>
+      <span class="small muted">For computers with no WinRM/SSH — they connect out to this console</span></div>
+      <div class="card-body">
+        <label class="check"><input type="checkbox" id="ag-enabled" ${s.agent.enabled ? 'checked' : ''}> Allow new agents to enroll</label>
+        ${s.agent.enroll_token ? `
+          <div class="field" style="margin-top:10px"><label>Enrollment token</label>
+            <div class="row"><input id="ag-token" readonly value="${esc(s.agent.enroll_token)}" style="font-family:monospace">
+              <button onclick="App.agRotate()">Regenerate</button></div>
+            <div class="hint">Regenerating does not disconnect existing agents.</div></div>
+          <div class="field"><label>Install on a computer (run as administrator, PowerShell)</label>
+            <pre class="log" id="ag-cmd" style="min-height:0;white-space:pre-wrap">${esc(agentInstallCmd(s.agent.enroll_token))}</pre>
+            <div style="display:flex;gap:8px;margin-top:6px"><button onclick="App.agCopy()">Copy command</button>
+              <span class="small muted">Or push it with a GPO startup/login script, or deploy the <b>Install PSCCM Agent</b> package to machines that still have WinRM/SSH.</span></div></div>
+          <p class="small muted">The agent runs as LocalSystem and can run commands, read event logs and manage the firewall, tasks and local
+            users on that computer. Anyone who can use this console controls every enrolled machine — protect it like a domain admin account.</p>`
+          : `<div style="margin-top:10px"><button class="primary" onclick="App.agRotate()">Generate enrollment token</button>
+            <span class="small muted">Creates the token agents use to join.</span></div>`}
+        <div style="margin-top:10px"><button onclick="App.saveAgent()">Save</button></div>
+      </div></div>
     ${updateCard(upd)}
     <div class="card"><div class="card-head"><h2>Folders</h2></div><div class="card-body small">
       <div>Data: <code>${esc(s.data_dir)}</code></div><div>Packages: <code>${esc(s.packages_dir)}</code></div><div>Repository: <code>${esc(s.repo_dir)}</code></div></div></div>`;
   const vis = () => { $('#ad-ldap').style.display = $('#ad-mode').value === 'ldap' ? '' : 'none'; };
   $('#ad-mode').onchange = vis;
   vis();
+}
+
+/// The PowerShell one-liner that downloads and installs the agent. Built from
+/// the console's own origin so no server URL needs configuring.
+function agentInstallCmd(token) {
+  const u = location.origin;
+  return `[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; `
+    + `$u='${u}'; $t='${token}'; $d='C:\\Program Files\\PSCCM-Agent'; `
+    + `New-Item -Type Directory -Force $d | Out-Null; `
+    + `Invoke-WebRequest "$u/download/agent?token=$t" -OutFile "$d\\psccm.exe" -UseBasicParsing; `
+    + `& "$d\\psccm.exe" agent install --server $u --token $t`;
 }
 
 function adForm() {
@@ -1188,6 +1219,13 @@ Object.assign(App, {
     } catch (e) { $('#ad-result').innerHTML = `<span class="err">${esc(e.message)}</span>`; }
   }),
   saveWinrm: act(async () => { await PUT('/settings/winrm', { use_ssl: $('#w-ssl').checked, skip_ca_check: $('#w-skip').checked }); toast('Saved'); }),
+  saveAgent: act(async () => { await PUT('/settings/agent', { enabled: $('#ag-enabled').checked, rotate: false }); toast('Saved'); }),
+  agRotate: act(async () => {
+    if (!confirm('Generate a new enrollment token? New installs must use it; existing agents are unaffected.')) return;
+    await PUT('/settings/agent', { enabled: $('#ag-enabled') ? $('#ag-enabled').checked : true, rotate: true });
+    route();
+  }),
+  agCopy() { navigator.clipboard.writeText($('#ag-cmd').textContent).then(() => toast('Copied')); },
   forgetHost: act(async () => {
     const h = $('#kh-host').value.trim();
     if (!h) return;
@@ -1329,10 +1367,386 @@ function updateCard(u) {
 
 // ------------------------------------------------------------------- start
 
+// ------------------------------------------------------------------ agents
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const gb = (b) => (b ? (b / 1073741824).toFixed(b >= 10737418240 ? 0 : 1) + ' GB' : '0');
+const uptimeFmt = (s) => (s ? (s >= 86400 ? Math.floor(s / 86400) + 'd ' : '') + Math.floor((s % 86400) / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm' : '—');
+
+function meter(pct, label) {
+  pct = Math.max(0, Math.min(100, Math.round(pct || 0)));
+  const col = pct > 90 ? 'var(--bad)' : pct > 75 ? '#d97706' : 'var(--ok)';
+  return `<div class="meter" title="${esc(label || '')}"><span style="width:${pct}%;background:${col}"></span></div>`;
+}
+
+/// Enqueue a job for an agent and wait for its result.
+async function runJob(id, kind, params = {}) {
+  const { job_id } = await POST(`/agents/${id}/jobs`, { kind, params });
+  for (let i = 0; i < 90; i++) {
+    const j = await GET('/jobs/' + job_id);
+    if (j.status !== 'queued' && j.status !== 'running') return j;
+    await sleep(800);
+  }
+  throw new Error('the agent did not return a result in time (is it online?)');
+}
+
+function runAsControls(p) {
+  return `<select id="${p}-mode" onchange="App.runAsVis('${p}')">
+      <option value="system">As SYSTEM (the agent)</option>
+      <option value="loggedon">As the logged-on user</option>
+      <option value="user">As a specific account…</option></select>
+    <span id="${p}-extra" style="display:none;gap:6px">
+      <input id="${p}-user" autocomplete="off" placeholder="CORP\\user or .\\localuser" style="max-width:190px">
+      <input id="${p}-pass" type="password" autocomplete="new-password" placeholder="password" style="max-width:150px"></span>`;
+}
+function readRunAs(p) {
+  const m = $('#' + p + '-mode').value;
+  if (m === 'loggedon') return { impersonate: true };
+  if (m === 'user') return { user: $('#' + p + '-user').value.trim(), password: $('#' + p + '-pass').value };
+  return {};
+}
+
+async function pageAgents(el) {
+  const agents = await GET('/agents');
+  el.innerHTML = `
+    <div class="page-head"><h1>Agents</h1><span class="sub">${agents.length} enrolled, ${agents.filter((a) => a.online).length} online</span>
+      <div class="actions"><button onclick="location.hash='#/settings'">Enroll an agent</button></div></div>
+    ${agents.length ? `<div class="card"><div class="card-body flush"><div class="table-wrap"><table>
+      <thead><tr><th>Computer</th><th>Status</th><th>CPU</th><th>Memory</th><th>Disk</th><th>Version</th><th>Last seen</th></tr></thead><tbody>
+      ${agents.map((a) => {
+        const worst = (a.disks || []).reduce((m, d) => Math.max(m, d.total ? 100 * (d.total - d.available) / d.total : 0), 0);
+        const memPct = a.mem_total ? 100 * a.mem_used / a.mem_total : 0;
+        return `<tr class="click" onclick="location.hash='#/agent/${a.id}'">
+          <td><b>${esc(a.computer)}</b><div class="os">${osLabel(a.os)}</div></td>
+          <td>${pill(a.online ? 'online' : 'offline')}</td>
+          <td style="min-width:90px">${meter(a.cpu_pct, 'CPU')}<span class="small muted">${a.cpu_pct != null ? Math.round(a.cpu_pct) + '%' : '—'}</span></td>
+          <td style="min-width:90px">${meter(memPct, 'Memory')}<span class="small muted">${gb(a.mem_used)} / ${gb(a.mem_total)}</span></td>
+          <td style="min-width:90px">${meter(worst, 'Disk')}<span class="small muted">${Math.round(worst)}%</span></td>
+          <td class="small">${esc(a.version || '—')}</td>
+          <td class="small muted" title="${fmtTime(a.last_checkin)}">${a.last_checkin ? ago(a.last_checkin) : 'never'}</td></tr>`;
+      }).join('')}</tbody></table></div></div></div>`
+      : `<div class="card"><div class="card-body"><div class="empty"><b>No agents yet</b>
+        Agents let you manage computers that have no WinRM or SSH — they connect out to this console.
+        <div style="margin-top:10px"><a href="#/settings"><b>Settings → Agents</b></a> has the one-line installer and enrollment token.</div></div></div></div>`}`;
+  poll(() => pageAgents(el).catch(() => {}), 10000);
+}
+
+let ASEL = 'overview'; // selected agent detail tab
+
+async function pageAgent(el, id) {
+  const d = await GET('/agents/' + id);
+  const a = d.agent;
+  const tabs = [['overview', 'Overview'], ['eventlog', 'Event Log'], ['tasks', 'Scheduled Tasks'], ['firewall', 'Firewall'], ['users', 'Local Users'], ['terminal', 'Terminal']];
+  el.innerHTML = `
+    <div class="page-head"><h1>${esc(a.computer)}</h1>${pill(a.online ? 'online' : 'offline')}
+      <span class="sub">${osLabel(a.os)} · ${esc(a.os_version || '')} · agent ${esc(a.version || '?')}</span>
+      <div class="actions"><button class="danger" onclick="App.agentRemove('${a.id}')">Remove agent</button></div></div>
+    <div class="tabs">${tabs.map(([k, l]) => `<button class="tab ${k === ASEL ? 'on' : ''}" onclick="App.aTab('${k}')">${l}</button>`).join('')}</div>
+    <div id="atab"></div>`;
+  const box = $('#atab');
+  if (ASEL === 'overview') overviewTab(box, d);
+  else if (ASEL === 'eventlog') eventlogTab(box, d);
+  else if (ASEL === 'tasks') tasksTab(box, d);
+  else if (ASEL === 'firewall') firewallTab(box, d);
+  else if (ASEL === 'users') usersTab(box, d);
+  else if (ASEL === 'terminal') terminalTab(box, a);
+  if (ASEL === 'overview' && a.online) poll(() => pageAgent(el, id).catch(() => {}), 8000);
+}
+
+function syncedLine(inv, label, onclick) {
+  return `<div class="card-head"><h2>${label}</h2><div class="right">
+    ${inv && inv.synced_at ? `<span class="small muted">synced ${ago(inv.synced_at)}</span>` : ''}
+    <button class="primary" onclick="${onclick}">${inv && inv.synced_at ? 'Re-sync' : 'Sync now'}</button></div></div>`;
+}
+
+function overviewTab(box, d) {
+  const a = d.agent;
+  const memPct = a.mem_total ? 100 * a.mem_used / a.mem_total : 0;
+  box.innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="n">${a.cpu_pct != null ? Math.round(a.cpu_pct) + '%' : '—'}</div><div class="l">CPU${a.processes ? ' · ' + a.processes + ' processes' : ''}</div>${meter(a.cpu_pct, 'CPU')}</div>
+      <div class="stat"><div class="n">${Math.round(memPct)}%</div><div class="l">Memory ${gb(a.mem_used)} / ${gb(a.mem_total)}</div>${meter(memPct, 'Memory')}</div>
+      <div class="stat"><div class="n">${uptimeFmt(a.uptime_secs)}</div><div class="l">Uptime</div></div>
+    </div>
+    <div class="grid two">
+      <div class="card"><div class="card-head"><h2>Disks</h2></div><div class="card-body">
+        ${(a.disks || []).length ? (a.disks).map((dk) => {
+          const pct = dk.total ? 100 * (dk.total - dk.available) / dk.total : 0;
+          return `<div class="disk"><div class="disk-l"><b>${esc(dk.mount)}</b><span class="small muted">${gb(dk.total - dk.available)} used of ${gb(dk.total)} · ${gb(dk.available)} free</span></div>${meter(pct, dk.mount)}</div>`;
+        }).join('') : '<span class="muted">No metrics yet.</span>'}</div></div>
+      <div class="card"><div class="card-head"><h2>Run a command</h2></div><div class="card-body">
+        <div class="row"><div class="field"><label>Shell</label><select id="c-shell"><option value="powershell">PowerShell</option><option value="cmd">cmd</option><option value="bash">bash</option></select></div>
+          <div class="field"><label>Run as</label><div class="runas">${runAsControls('c')}</div></div></div>
+        <textarea id="c-script" rows="3" placeholder="Get-Service | Where Status -eq Running"></textarea>
+        <div style="margin-top:8px"><button class="primary" id="c-run" onclick="App.aRun('${a.id}')">Run</button></div>
+        <pre class="log" id="c-out" style="min-height:0;margin-top:10px;display:none"></pre></div></div>
+    </div>
+    <div class="card"><div class="card-head"><h2>Recent jobs</h2></div><div class="card-body flush">
+      ${d.jobs.length ? `<div class="table-wrap"><table><thead><tr><th>Job</th><th>Status</th><th>When</th><th>Result</th></tr></thead><tbody>
+        ${d.jobs.map((j) => `<tr><td>${esc(j.kind)}</td><td>${pill(j.status)}</td><td class="small muted">${ago(j.finished_at || j.created_at)}</td>
+          <td class="small">${esc((j.output || '').slice(0, 140))}</td></tr>`).join('')}</tbody></table></div>`
+        : '<div class="empty">No jobs run yet.</div>'}</div></div>`;
+}
+
+function eventlogTab(box, d) {
+  const inv = d.eventlog;
+  const rows = (inv && Array.isArray(inv.data)) ? inv.data : (inv && inv.data ? [inv.data] : []);
+  box.innerHTML = `
+    <div class="card"><div class="card-head"><h2>Collect Windows Event Log</h2></div><div class="card-body">
+      <div class="row">
+        <div class="field"><label>Log</label><select id="ev-log">${['System', 'Application', 'Security', 'Setup'].map((l) => `<option>${l}</option>`).join('')}</select></div>
+        <div class="field"><label>Level</label><select id="ev-level"><option value="">Any</option><option value="1">Critical</option><option value="2">Error</option><option value="3">Warning</option><option value="4">Information</option></select></div>
+        <div class="field"><label>Last (hours)</label><input id="ev-hours" type="number" min="0" value="24"></div>
+        <div class="field"><label>Max events</label><input id="ev-max" type="number" min="1" value="200"></div>
+        <div class="field"><label>Event IDs (optional)</label><input id="ev-ids" placeholder="1000, 7034"></div>
+      </div>
+      <button class="primary" id="ev-run" onclick="App.aEventlog('${d.agent.id}')">Collect</button>
+      ${inv && inv.synced_at ? `<span class="small muted" style="margin-left:10px">last collected ${ago(inv.synced_at)}</span>` : ''}</div></div>
+    <div class="card"><div class="card-body flush">${rows.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Time</th><th>Level</th><th>ID</th><th>Provider</th><th>Message</th></tr></thead><tbody>
+      ${rows.map((e) => `<tr><td class="small" style="white-space:nowrap">${esc(fmtTime(e.time))}</td>
+        <td>${pill(String(e.level || '').toLowerCase().includes('err') || String(e.level || '').toLowerCase().includes('crit') ? 'failed' : String(e.level || '').toLowerCase().includes('warn') ? 'scheduled' : 'success')}</td>
+        <td class="num">${esc(e.Id ?? e.id ?? '')}</td><td class="small">${esc(e.provider || '')}</td>
+        <td class="small">${esc((e.message || '').slice(0, 300))}</td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="empty">No events collected yet. Choose filters above and press Collect.</div>'}</div></div>`;
+}
+
+function tasksTab(box, d) {
+  const inv = d.tasks;
+  const rows = (inv && Array.isArray(inv.data)) ? inv.data : (inv && inv.data ? [inv.data] : []);
+  const id = d.agent.id;
+  box.innerHTML = `
+    <div class="card">${syncedLine(inv, 'Scheduled Tasks', `App.aSync('${id}','tasks_list')`)}
+      <div class="card-body flush">${rows.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Task</th><th>State</th><th>Last run</th><th>Next run</th><th>Last result</th><th></th></tr></thead><tbody>
+        ${rows.map((t) => `<tr><td><b>${esc(t.name)}</b><div class="os">${esc(t.path || '')}</div></td>
+          <td>${pill(String(t.state).toLowerCase() === 'disabled' ? 'offline' : 'success')}</td>
+          <td class="small muted">${esc(t.last_run || '')}</td><td class="small muted">${esc(t.next_run || '')}</td>
+          <td class="num small">${esc(String(t.last_result ?? ''))}</td>
+          <td class="rowbtns">
+            <button onclick="App.aTask('${id}','run',${jattr(t)})">Run</button>
+            ${String(t.state).toLowerCase() === 'disabled' ? `<button onclick="App.aTask('${id}','enable',${jattr(t)})">Enable</button>` : `<button onclick="App.aTask('${id}','disable',${jattr(t)})">Disable</button>`}
+            <button class="danger" onclick="App.aTask('${id}','delete',${jattr(t)})">Delete</button></td></tr>`).join('')}
+        </tbody></table></div>` : '<div class="empty">Press “Sync now” to read this computer’s scheduled tasks.</div>'}</div></div>`;
+}
+
+function firewallTab(box, d) {
+  const inv = d.firewall;
+  const rows = (inv && Array.isArray(inv.data)) ? inv.data : (inv && inv.data ? [inv.data] : []);
+  const id = d.agent.id;
+  box.innerHTML = `
+    <div class="card">${syncedLine(inv, 'Windows Firewall rules', `App.aSync('${id}','firewall_list')`)}
+      <div class="card-body"><button onclick="App.aFwAdd('${id}')">Add rule</button></div>
+      <div class="card-body flush">${rows.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Rule</th><th>Dir</th><th>Action</th><th>Profile</th><th>Enabled</th><th></th></tr></thead><tbody>
+        ${rows.map((r) => `<tr><td><b>${esc(r.DisplayName || r.Name)}</b>${r.group ? `<div class="os">${esc(r.group)}</div>` : ''}</td>
+          <td class="small">${esc(r.direction || '')}</td><td class="small">${esc(r.action || '')}</td><td class="small">${esc(r.profile || '')}</td>
+          <td>${r.enabled ? pill('success') : pill('offline')}</td>
+          <td class="rowbtns">
+            ${r.enabled ? `<button onclick="App.aFw('${id}','disable',${jattr({ name: r.Name })})">Disable</button>` : `<button onclick="App.aFw('${id}','enable',${jattr({ name: r.Name })})">Enable</button>`}
+            <button class="danger" onclick="App.aFw('${id}','delete',${jattr({ name: r.Name })})">Delete</button></td></tr>`).join('')}
+        </tbody></table></div>` : '<div class="empty">Press “Sync now” to read the firewall rules.</div>'}</div></div>`;
+}
+
+function usersTab(box, d) {
+  const inv = d.users;
+  const data = inv && inv.data && !Array.isArray(inv.data) ? inv.data : {};
+  const users = data.users || [];
+  const groups = data.groups || [];
+  const id = d.agent.id;
+  box.innerHTML = `
+    <div class="card">${syncedLine(inv, 'Local users & groups', `App.aSync('${id}','users_list')`)}
+      <div class="card-body"><button onclick="App.aUserAdd('${id}')">Add user</button></div>
+      <div class="card-body flush">${users.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>User</th><th>Full name</th><th>Enabled</th><th></th></tr></thead><tbody>
+        ${users.map((u) => `<tr><td><b>${esc(u.Name)}</b>${u.Description ? `<div class="os">${esc(u.Description)}</div>` : ''}</td>
+          <td class="small">${esc(u.full_name || '')}</td><td>${u.enabled ? pill('success') : pill('offline')}</td>
+          <td class="rowbtns">
+            <button onclick="App.aUserPw('${id}',${jattr({ user: u.Name })})">Set password</button>
+            ${u.enabled ? `<button onclick="App.aUser('${id}','disable',${jattr({ user: u.Name })})">Disable</button>` : `<button onclick="App.aUser('${id}','enable',${jattr({ user: u.Name })})">Enable</button>`}
+            <button onclick="App.aUserGroup('${id}',${jattr({ user: u.Name })})">Groups…</button>
+            <button class="danger" onclick="App.aUser('${id}','delete',${jattr({ user: u.Name })})">Delete</button></td></tr>`).join('')}
+        </tbody></table></div>` : '<div class="empty">Press “Sync now” to read local users.</div>'}
+      ${groups.length ? `<div class="card-body"><h3 class="small" style="margin:0 0 6px">Groups</h3>
+        ${groups.map((g) => `<div class="small"><b>${esc(g.name)}</b> <span class="muted">${esc((g.members || []).join(', ') || 'no members')}</span></div>`).join('')}</div>` : ''}</div></div>`;
+}
+
+let TERM = null; // active terminal WebSocket
+
+function terminalTab(box, a) {
+  box.innerHTML = `
+    <div class="card"><div class="card-body">
+      <div class="row">
+        <div class="field"><label>Shell</label><select id="t-shell"><option value="powershell">PowerShell</option><option value="cmd">cmd</option>${a.os === 'linux' ? '<option value="bash">bash</option>' : ''}</select></div>
+        <div class="field"><label>Run as</label><div class="runas">${runAsControls('t')}</div></div>
+        <div class="field" style="align-self:end"><button class="primary" id="t-connect" onclick="App.termConnect('${a.id}')">Connect</button>
+          <button id="t-close" onclick="App.termClose()" disabled>Close</button></div>
+      </div>
+      <pre class="term" id="t-out"></pre>
+      <input id="t-in" class="term-in" placeholder="Connect, then type here and press Enter" disabled></div></div>`;
+  const inp = $('#t-in');
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && TERM && TERM.ws.readyState === 1) {
+      TERM.ws.send(JSON.stringify({ type: 'input', data: inp.value + '\n' }));
+      $('#t-out').textContent += inp.value + '\n';
+      inp.value = '';
+      $('#t-out').scrollTop = $('#t-out').scrollHeight;
+    }
+  });
+}
+
+Object.assign(App, {
+  aTab(k) { ASEL = k; route(); },
+  runAsVis(p) { $('#' + p + '-extra').style.display = $('#' + p + '-mode').value === 'user' ? 'inline-flex' : 'none'; },
+  agentRemove: act(async (id) => {
+    if (!confirm('Remove this agent? The computer stays in the list; the agent will re-enroll if it is still running.')) return;
+    await DEL('/agents/' + id);
+    location.hash = '#/agents';
+  }),
+  aRun: act(async (id) => {
+    const script = $('#c-script').value;
+    if (!script.trim()) return;
+    const btn = $('#c-run'); btn.disabled = true; btn.textContent = 'Running…';
+    const out = $('#c-out'); out.style.display = 'block'; out.textContent = 'Running on the agent…';
+    try {
+      const j = await runJob(id, 'command', { shell: $('#c-shell').value, script, run_as: readRunAs('c') });
+      out.textContent = j.output || '(no output)';
+    } finally { btn.disabled = false; btn.textContent = 'Run'; }
+  }),
+  aEventlog: act(async (id) => {
+    const btn = $('#ev-run'); btn.disabled = true; btn.textContent = 'Collecting…';
+    const ids = $('#ev-ids').value.split(',').map((x) => parseInt(x.trim(), 10)).filter((n) => !isNaN(n));
+    try {
+      const j = await runJob(id, 'eventlog', {
+        log: $('#ev-log').value, level: $('#ev-level').value ? +$('#ev-level').value : null,
+        since_hours: +$('#ev-hours').value || null, max: +$('#ev-max').value || 200, event_ids: ids,
+      });
+      if (j.status !== 'success') throw new Error(j.output || 'collection failed');
+      route();
+    } catch (e) { btn.disabled = false; btn.textContent = 'Collect'; throw e; }
+  }),
+  aSync: act(async (id, kind) => {
+    const j = await runJob(id, kind, {});
+    if (j.status !== 'success') throw new Error(j.output || 'sync failed');
+    toast('Synced'); route();
+  }),
+  aTask: act(async (id, action, t) => {
+    t = App._p(t);
+    if (action === 'delete' && !confirm(`Delete scheduled task ${t.name}?`)) return;
+    const j = await runJob(id, 'task_control', { action, path: t.path, name: t.name });
+    if (j.status !== 'success') throw new Error(j.output || 'failed');
+    toast('Task ' + action); await App._reSync(id, 'tasks_list');
+  }),
+  aFw: act(async (id, action, r) => {
+    r = App._p(r);
+    if (action === 'delete' && !confirm(`Delete firewall rule?`)) return;
+    const j = await runJob(id, 'firewall_set', { action, name: r.name });
+    if (j.status !== 'success') throw new Error(j.output || 'failed');
+    toast('Firewall ' + action); await App._reSync(id, 'firewall_list');
+  }),
+  aFwAdd(id) {
+    modal('Add firewall rule', `
+      <div class="field"><label>Display name</label><input id="fw-name" placeholder="Allow app 8080"></div>
+      <div class="row">
+        <div class="field"><label>Direction</label><select id="fw-dir"><option>Inbound</option><option>Outbound</option></select></div>
+        <div class="field"><label>Action</label><select id="fw-act"><option>Allow</option><option>Block</option></select></div>
+        <div class="field"><label>Protocol</label><select id="fw-proto"><option value="">Any</option><option>TCP</option><option>UDP</option></select></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Local port(s)</label><input id="fw-port" placeholder="8080 or 80,443"></div>
+        <div class="field"><label>Remote address</label><input id="fw-raddr" placeholder="any or 10.0.0.0/8"></div>
+        <div class="field"><label>Program (optional)</label><input id="fw-prog" placeholder="C:\\app\\app.exe"></div>
+      </div>`,
+      [{ label: 'Cancel' }, { label: 'Add', cls: 'primary', onClick: async () => {
+        const j = await runJob(id, 'firewall_set', {
+          action: 'new', display_name: $('#fw-name').value.trim(), direction: $('#fw-dir').value, fw_action: $('#fw-act').value,
+          protocol: $('#fw-proto').value, local_port: $('#fw-port').value.trim(), remote_address: $('#fw-raddr').value.trim(), program: $('#fw-prog').value.trim(),
+        });
+        if (j.status !== 'success') throw new Error(j.output || 'failed');
+        toast('Rule added'); await App._reSync(id, 'firewall_list');
+      } }]);
+  },
+  aUserAdd(id) {
+    modal('Add local user', `
+      <div class="field"><label>User name</label><input id="u-name" placeholder="svc-app"></div>
+      <div class="field"><label>Full name (optional)</label><input id="u-full"></div>
+      <div class="field"><label>Password</label><input id="u-pass" type="password" autocomplete="new-password"><div class="hint">Leave empty to create a no-password account.</div></div>`,
+      [{ label: 'Cancel' }, { label: 'Create', cls: 'primary', onClick: async () => {
+        const j = await runJob(id, 'user_control', { action: 'create', user: $('#u-name').value.trim(), full_name: $('#u-full').value.trim(), password: $('#u-pass').value || null });
+        if (j.status !== 'success') throw new Error(j.output || 'failed');
+        toast('User created'); await App._reSync(id, 'users_list');
+      } }]);
+  },
+  aUserPw(id, u) {
+    u = App._p(u);
+    modal('Set password for ' + u.user, `<div class="field"><label>New password</label><input id="u-pw" type="password" autocomplete="new-password"></div>`,
+      [{ label: 'Cancel' }, { label: 'Set', cls: 'primary', onClick: async () => {
+        const j = await runJob(id, 'user_control', { action: 'setpassword', user: u.user, password: $('#u-pw').value });
+        if (j.status !== 'success') throw new Error(j.output || 'failed');
+        toast('Password set');
+      } }]);
+  },
+  aUserGroup(id, u) {
+    u = App._p(u);
+    modal('Group membership for ' + u.user, `
+      <div class="row"><div class="field"><label>Group</label><input id="g-name" placeholder="Administrators"></div>
+        <div class="field" style="align-self:end"><label class="check"><input type="radio" name="g-act" value="addgroup" checked> Add</label>
+          <label class="check"><input type="radio" name="g-act" value="removegroup"> Remove</label></div></div>`,
+      [{ label: 'Cancel' }, { label: 'Apply', cls: 'primary', onClick: async () => {
+        const action = $$('input[name=g-act]').find((r) => r.checked).value;
+        const j = await runJob(id, 'user_control', { action, user: u.user, group: $('#g-name').value.trim() });
+        if (j.status !== 'success') throw new Error(j.output || 'failed');
+        toast('Group updated'); await App._reSync(id, 'users_list');
+      } }]);
+  },
+  aUser: act(async (id, action, u) => {
+    u = App._p(u);
+    if (action === 'delete' && !confirm(`Delete local user ${u.user}?`)) return;
+    const j = await runJob(id, 'user_control', { action, user: u.user });
+    if (j.status !== 'success') throw new Error(j.output || 'failed');
+    toast('User ' + action); await App._reSync(id, 'users_list');
+  }),
+  _p(v) { return typeof v === 'string' ? JSON.parse(v) : v; },
+  async _reSync(id, kind) { try { await runJob(id, kind, {}); } catch { /* ignore */ } route(); },
+  termConnect(id) {
+    App.termClose();
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = `${proto}://${location.host}/api/agents/${id}/terminal${TOKEN ? '?token=' + encodeURIComponent(TOKEN) : ''}`;
+    const out = $('#t-out');
+    out.textContent = 'Connecting…\n';
+    const ws = new WebSocket(url);
+    TERM = { ws, id };
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ shell: $('#t-shell').value, run_as: readRunAs('t') }));
+      $('#t-in').disabled = false; $('#t-close').disabled = false; $('#t-connect').disabled = true;
+      $('#t-in').focus();
+    };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === 'output') { out.textContent += m.data; out.scrollTop = out.scrollHeight; }
+      else if (m.type === 'ready') { out.textContent += '[connected]\n'; }
+      else if (m.type === 'closed') { out.textContent += '\n[session closed]\n'; App.termClose(); }
+    };
+    ws.onclose = () => { if (TERM && TERM.ws === ws) App._termReset(); };
+    ws.onerror = () => { out.textContent += '\n[connection error]\n'; };
+  },
+  termClose() { if (TERM) { try { TERM.ws.send(JSON.stringify({ type: 'close' })); TERM.ws.close(); } catch { /* */ } } App._termReset(); },
+  _termReset() {
+    TERM = null;
+    const c = $('#t-connect'), cl = $('#t-close'), i = $('#t-in');
+    if (c) c.disabled = false; if (cl) cl.disabled = true; if (i) i.disabled = true;
+  },
+});
+
+/// JSON for an inline onclick attribute (single-quoted, HTML-escaped).
+function jattr(obj) {
+  return `'${esc(JSON.stringify(obj)).replace(/&#39;/g, '\\u0027')}'`;
+}
+
 const PAGES = {
   dashboard: pageDashboard, deploy: pageDeploy, history: pageHistory, deployment: pageDeployment,
   computers: pageComputers, packages: pagePackages, package: pagePackage, schedules: pageSchedules, settings: pageSettings,
-  gpo: pageGpo,
+  gpo: pageGpo, agents: pageAgents, agent: pageAgent,
 };
 
 route();

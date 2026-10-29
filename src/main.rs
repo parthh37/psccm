@@ -1,6 +1,7 @@
 //! PSCCM - lightweight, agentless deployment manager for Windows and Linux.
 
 mod ad;
+mod agent;
 mod app;
 mod db;
 mod engine;
@@ -127,6 +128,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Run or manage the PSCCM agent on this computer.
+    Agent {
+        #[command(subcommand)]
+        cmd: AgentCmd,
+    },
     /// Recent deployments.
     History {
         #[arg(long, default_value_t = 20)]
@@ -179,6 +185,27 @@ enum ServiceCmd {
     Uninstall,
     /// Used by the service manager.
     #[command(hide = true)]
+    Run,
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Install the agent (stores config and registers the service).
+    Install {
+        /// Console base URL the agent connects to, e.g. https://console:8080.
+        #[arg(long)]
+        server: String,
+        /// Enrollment token from the console (Settings → Agents).
+        #[arg(long, default_value = "")]
+        token: String,
+    },
+    /// Stop and remove the agent.
+    Uninstall,
+    /// Enroll once in the foreground (for testing).
+    Enroll,
+    /// Show the agent's configuration and enrollment status.
+    Status,
+    /// Run the agent (used by the service; also works in the foreground).
     Run,
 }
 
@@ -263,6 +290,22 @@ pub fn default_data_dir() -> PathBuf {
 fn main() {
     let cli = Cli::parse();
     let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+    // `agent run` manages its own runtime (and Windows service dispatch), so it
+    // is handled before the console's tokio runtime is built.
+    if matches!(cli.command, Some(Cmd::Agent { cmd: AgentCmd::Run })) {
+        let agent_dir = agent::runtime::data_dir();
+        let _ = std::fs::create_dir_all(&agent_dir);
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "psccm=info,warn".into());
+        match std::fs::OpenOptions::new().create(true).append(true).open(agent_dir.join("agent.log")) {
+            Ok(f) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(f)).init(),
+            Err(_) => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        }
+        if let Err(e) = agent::runtime::run() {
+            tracing::error!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let is_service = matches!(cli.command, Some(Cmd::Service { cmd: ServiceCmd::Run }));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "psccm=info,warn".into());
     if is_service {
@@ -299,6 +342,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
         Cmd::Serve { bind, port, token, no_browser } => {
             let addr: std::net::SocketAddr = format!("{bind}:{port}").parse().context("invalid --bind/--port")?;
             app.db.fail_interrupted()?;
+            app.db.fail_interrupted_jobs()?;
             scheduler::spawn(app.clone());
             let url = format!("http://{}:{port}/", if addr.ip().is_unspecified() { "localhost".into() } else { bind.clone() });
             println!("PSCCM console: {url}");
@@ -330,6 +374,13 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
                 Ok(())
             }
             ServiceCmd::Run => bail!("'service run' is started by the Windows service manager"),
+        },
+        Cmd::Agent { cmd } => match cmd {
+            AgentCmd::Install { server, token } => agent::runtime::install(&server, &token),
+            AgentCmd::Uninstall => agent::runtime::uninstall(),
+            AgentCmd::Enroll => agent::runtime::enroll_now().await,
+            AgentCmd::Status => agent::runtime::status(),
+            AgentCmd::Run => unreachable!("handled in main()"),
         },
         Cmd::Update { install } => {
             let r = update::check(&app).await?;
