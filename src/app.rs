@@ -22,6 +22,8 @@ pub struct Ctx {
     pub agents: Hub,
     /// Progress of the current (or last) inventory scan.
     pub scan: Mutex<crate::inventory::ScanState>,
+    /// Progress of the current (or last) Windows Update scan.
+    pub wu_scan: Mutex<crate::inventory::ScanState>,
 }
 
 /// Console-side agent settings: the shared enrollment token agents present.
@@ -73,6 +75,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("install-exe.yaml", include_str!("../packages/install-exe.yaml")),
     ("linux-package.yaml", include_str!("../packages/linux-package.yaml")),
     ("linux-update.yaml", include_str!("../packages/linux-update.yaml")),
+    ("windows-update.yaml", include_str!("../packages/windows-update.yaml")),
     ("reboot.yaml", include_str!("../packages/reboot.yaml")),
     ("install-agent.yaml", include_str!("../packages/install-agent.yaml")),
 ];
@@ -91,6 +94,7 @@ impl Ctx {
             cancels: Mutex::new(HashMap::new()),
             agents: Hub::default(),
             scan: Mutex::new(Default::default()),
+            wu_scan: Mutex::new(Default::default()),
         };
         std::fs::create_dir_all(ctx.packages_dir())?;
         std::fs::create_dir_all(ctx.repo_dir())?;

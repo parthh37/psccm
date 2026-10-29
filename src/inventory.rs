@@ -107,7 +107,7 @@ pub fn parse_output(lines: &[String], unescape: bool) -> Result<Scan> {
 }
 
 /// Turn `\u00e9` sequences back into characters.
-fn decode_escapes(s: &str) -> String {
+pub(crate) fn decode_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find("\\u") {
@@ -209,7 +209,7 @@ pub fn changes(old_facts: &BTreeMap<String, String>, old_apps: &[InstalledApp], 
     out
 }
 
-fn target_of(c: &Computer) -> Target {
+pub(crate) fn target_of(c: &Computer) -> Target {
     Target {
         name: c.name.clone(),
         host: c.connect_host().to_string(),

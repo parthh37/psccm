@@ -16,6 +16,7 @@ mod service;
 mod transport;
 mod update;
 mod web;
+mod wu;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -145,6 +146,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: InventoryCmd,
     },
+    /// Windows Update: missing updates on the Windows computers.
+    Updates {
+        #[command(subcommand)]
+        cmd: UpdatesCmd,
+    },
     /// Recent deployments.
     History {
         #[arg(long, default_value_t = 20)]
@@ -184,6 +190,20 @@ enum InventoryCmd {
     },
     /// App catalog programs that are older than the latest version, with the computers that have them.
     Outdated,
+}
+
+#[derive(Subcommand)]
+enum UpdatesCmd {
+    /// Scan Windows computers for missing updates now (all when no names are given) and wait.
+    Scan { names: Vec<String> },
+    /// Missing updates and the computers that need them.
+    List {
+        /// Only security and critical updates.
+        #[arg(long)]
+        security: bool,
+    },
+    /// Missing updates and recent installs of one computer.
+    Show { name: String },
 }
 
 #[derive(Subcommand)]
@@ -531,6 +551,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
         }
         Cmd::Cred { cmd } => cred_cmd(&app, cmd),
         Cmd::Inventory { cmd } => inventory_cmd(&app, cmd).await,
+        Cmd::Updates { cmd } => updates_cmd(&app, cmd).await,
         Cmd::History { limit } => {
             for d in app.db.list_deployments(limit)? {
                 println!(
@@ -791,6 +812,78 @@ async fn inventory_cmd(app: &App, cmd: InventoryCmd) -> Result<()> {
                 for o in outdated {
                     println!("    {:<40} {}", o["computer"].as_str().unwrap_or(""), o["version"].as_str().unwrap_or(""));
                 }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn updates_cmd(app: &App, cmd: UpdatesCmd) -> Result<()> {
+    match cmd {
+        UpdatesCmd::Scan { names } => {
+            let mut results = wu::scan_now(app, &names).await?;
+            results.sort_by_key(|r| r.computer.to_lowercase());
+            let mut bad = 0;
+            for r in &results {
+                println!("{:<40} {:<8} {}", r.computer, r.status, r.error.as_deref().unwrap_or(""));
+                bad += usize::from(r.status != "ok");
+            }
+            println!("{} scanned, {bad} not scanned", results.len() - bad);
+            if bad > 0 {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        UpdatesCmd::List { security } => {
+            let r = wu::report(app)?;
+            for u in r["updates"].as_array().into_iter().flatten() {
+                if security && u["security"] != true {
+                    continue;
+                }
+                let computers: Vec<&str> = u["computers"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
+                println!(
+                    "{:<10} {:<18} {:<9} {:>4}  {}{}",
+                    u["update"]["kb"].as_str().filter(|k| !k.is_empty()).unwrap_or("-"),
+                    u["update"]["classification"].as_str().unwrap_or(""),
+                    u["update"]["severity"].as_str().unwrap_or(""),
+                    computers.len(),
+                    u["update"]["title"].as_str().unwrap_or(""),
+                    if u["declined"] == true { "  (declined)" } else { "" }
+                );
+                println!("{:>44}{}", "", computers.join(", "));
+            }
+            Ok(())
+        }
+        UpdatesCmd::Show { name } => {
+            let (s, missing) = app
+                .db
+                .get_wu_status(&name)?
+                .ok_or_else(|| anyhow!("no update scan for '{name}' (run 'psccm updates scan {name}')"))?;
+            println!(
+                "{}  last scan: {}  ({}{})",
+                s.computer,
+                s.scanned_at.as_deref().unwrap_or("never"),
+                s.status,
+                s.error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+            );
+            for (k, v) in &s.info {
+                println!("  {k:<16} {v}");
+            }
+            println!("  {} missing updates", missing.len());
+            for u in &missing {
+                let kb = if u.kb.is_empty() { "-" } else { &u.kb };
+                println!("    {kb:<10} {:<18} {:<9} {}{}", u.classification, u.severity, u.title, if u.optional { " (optional)" } else { "" });
+            }
+            println!("  recent installs");
+            for h in &s.history {
+                let result = match h.result {
+                    2 => "ok",
+                    3 => "ok*",
+                    4 => "failed",
+                    5 => "aborted",
+                    _ => "?",
+                };
+                println!("    {:<20} {result:<7} {}", h.at, h.title);
             }
             Ok(())
         }

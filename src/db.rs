@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::{DiskUsage, EnrollReq, Job, JobResult, Metrics, STALE_SECS};
 use crate::secrets;
+use crate::wu::{MissingUpdate, WuScan, WuStatus};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS computers (
@@ -180,10 +181,37 @@ CREATE TABLE IF NOT EXISTS inventory_changes (
 );
 CREATE INDEX IF NOT EXISTS idx_inv_changes_computer ON inventory_changes(computer_id);
 CREATE INDEX IF NOT EXISTS idx_inv_changes_at ON inventory_changes(at);
+CREATE TABLE IF NOT EXISTS wu_status (
+    computer_id INTEGER PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
+    scanned_at TEXT,
+    last_attempt TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    info TEXT NOT NULL DEFAULT '{}',
+    history TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS wu_missing (
+    computer_id INTEGER NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    update_id TEXT NOT NULL,
+    kb TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    classification TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    released TEXT NOT NULL DEFAULT '',
+    reboot INTEGER NOT NULL DEFAULT 0,
+    downloaded INTEGER NOT NULL DEFAULT 0,
+    optional INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_wu_missing_computer ON wu_missing(computer_id);
 "#;
 
 /// Columns added after the first release: (table, column, definition).
-const MIGRATIONS: &[(&str, &str, &str)] = &[("computers", "ad_groups", "TEXT NOT NULL DEFAULT ''")];
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("computers", "ad_groups", "TEXT NOT NULL DEFAULT ''"),
+    ("schedules", "week", "INTEGER NOT NULL DEFAULT 2"),
+    ("schedules", "offset_days", "INTEGER NOT NULL DEFAULT 0"),
+];
 
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -657,18 +685,20 @@ impl Db {
                 s.interval_minutes,
                 s.enabled,
                 s.next_run,
+                s.week,
+                s.offset_days,
                 s.id,
             ];
             if s.id > 0 {
                 c.execute(
-                    "UPDATE schedules SET name=?1,package_id=?2,targets=?3,variables=?4,options=?5,kind=?6,time=?7,weekdays=?8,interval_minutes=?9,enabled=?10,next_run=?11 WHERE id=?12",
+                    "UPDATE schedules SET name=?1,package_id=?2,targets=?3,variables=?4,options=?5,kind=?6,time=?7,weekdays=?8,interval_minutes=?9,enabled=?10,next_run=?11,week=?12,offset_days=?13 WHERE id=?14",
                     args,
                 )?;
                 Ok(s.id)
             } else {
                 c.execute(
-                    "INSERT INTO schedules(name,package_id,targets,variables,options,kind,time,weekdays,interval_minutes,enabled,next_run) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-                    &args[..11],
+                    "INSERT INTO schedules(name,package_id,targets,variables,options,kind,time,weekdays,interval_minutes,enabled,next_run,week,offset_days) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    &args[..13],
                 )?;
                 Ok(c.last_insert_rowid())
             }
@@ -1060,6 +1090,118 @@ impl Db {
             st.query_map([name], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
         })
     }
+
+    // ---------------------------------------------------------- windows update
+
+    /// Store a successful update scan, replacing the computer's missing list.
+    pub fn save_wu_scan(&self, computer_id: i64, scan: &WuScan) -> Result<()> {
+        let info = serde_json::to_string(&scan.info)?;
+        let history = serde_json::to_string(&scan.history)?;
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO wu_status(computer_id,scanned_at,last_attempt,status,error,info,history) VALUES(?1,?2,?2,'ok',NULL,?3,?4)
+                 ON CONFLICT(computer_id) DO UPDATE SET scanned_at=?2, last_attempt=?2, status='ok', error=NULL, info=?3, history=?4",
+                params![computer_id, now(), info, history],
+            )?;
+            tx.execute("DELETE FROM wu_missing WHERE computer_id=?1", [computer_id])?;
+            {
+                let mut st = tx.prepare(
+                    "INSERT INTO wu_missing(computer_id,update_id,kb,title,classification,severity,size,released,reboot,downloaded,optional)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                )?;
+                for u in &scan.updates {
+                    st.execute(params![
+                        computer_id,
+                        u.update_id,
+                        u.kb,
+                        u.title,
+                        u.classification,
+                        u.severity,
+                        u.size as i64,
+                        u.released,
+                        u.reboot,
+                        u.downloaded,
+                        u.optional
+                    ])?;
+                }
+            }
+            tx.execute("UPDATE computers SET online=1, last_check=?2 WHERE id=?1", params![computer_id, now()])?;
+            tx.commit()
+        })?;
+        Ok(())
+    }
+
+    /// Record a failed or offline update scan; the last good result is kept.
+    pub fn wu_failed(&self, computer_id: i64, status: &str, error: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO wu_status(computer_id,last_attempt,status,error) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(computer_id) DO UPDATE SET last_attempt=?2, status=?3, error=?4",
+                params![computer_id, now(), status, error],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Update scan state of every computer scanned at least once (without history).
+    pub fn list_wu_status(&self) -> Result<Vec<WuStatus>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("{WU_SELECT} ORDER BY c.name COLLATE NOCASE"))?;
+            st.query_map([], |r| wu_status_row(r, false))?.collect()
+        })
+    }
+
+    /// One computer's scan state with its history and missing updates.
+    pub fn get_wu_status(&self, computer: &str) -> Result<Option<(WuStatus, Vec<MissingUpdate>)>> {
+        self.with(|c| {
+            let s = c.query_row(&format!("{WU_SELECT} WHERE c.name=?1"), [computer], |r| wu_status_row(r, true)).optional()?;
+            let Some(s) = s else { return Ok(None) };
+            let mut st = c.prepare(&format!("{WU_MISSING_SELECT} WHERE computer_id=?1 ORDER BY classification, title"))?;
+            let missing = st.query_map([s.computer_id], |r| missing_row(r, 0))?.collect::<rusqlite::Result<_>>()?;
+            Ok(Some((s, missing)))
+        })
+    }
+
+    /// Every missing update of every computer: (computer id, update).
+    pub fn wu_missing(&self) -> Result<Vec<(i64, MissingUpdate)>> {
+        self.with(|c| {
+            let mut st = c.prepare(&WU_MISSING_SELECT.replacen("SELECT ", "SELECT computer_id, ", 1))?;
+            st.query_map([], |r| Ok((r.get(0)?, missing_row(r, 1)?)))?.collect()
+        })
+    }
+}
+
+const WU_SELECT: &str = "SELECT w.*, c.name AS computer FROM wu_status w JOIN computers c ON c.id=w.computer_id";
+const WU_MISSING_SELECT: &str =
+    "SELECT update_id,kb,title,classification,severity,size,released,reboot,downloaded,optional FROM wu_missing";
+
+fn wu_status_row(r: &Row, with_history: bool) -> rusqlite::Result<WuStatus> {
+    Ok(WuStatus {
+        computer_id: r.get("computer_id")?,
+        computer: r.get("computer")?,
+        scanned_at: r.get("scanned_at")?,
+        last_attempt: r.get("last_attempt")?,
+        status: r.get("status")?,
+        error: r.get("error")?,
+        info: json_col(r, "info")?,
+        history: if with_history { json_col(r, "history")? } else { vec![] },
+    })
+}
+
+fn missing_row(r: &Row, first: usize) -> rusqlite::Result<MissingUpdate> {
+    Ok(MissingUpdate {
+        update_id: r.get(first)?,
+        kb: r.get(first + 1)?,
+        title: r.get(first + 2)?,
+        classification: r.get(first + 3)?,
+        severity: r.get(first + 4)?,
+        size: r.get::<_, i64>(first + 5)?.max(0) as u64,
+        released: r.get(first + 6)?,
+        reboot: r.get(first + 7)?,
+        downloaded: r.get(first + 8)?,
+        optional: r.get(first + 9)?,
+    })
 }
 
 fn json_col<T: DeserializeOwned + Default>(row: &Row, col: &str) -> rusqlite::Result<T> {
@@ -1343,22 +1485,33 @@ pub struct Schedule {
     pub variables: BTreeMap<String, String>,
     #[serde(default)]
     pub options: DeployOptions,
-    /// "once", "daily", "weekly" or "interval"
+    /// "once", "daily", "weekly", "monthly" or "interval"
     pub kind: String,
-    /// "HH:MM" local time (daily/weekly), or RFC 3339 / "YYYY-MM-DD HH:MM" (once)
+    /// "HH:MM" local time (daily/weekly/monthly), or RFC 3339 / "YYYY-MM-DD HH:MM" (once)
     #[serde(default)]
     pub time: String,
-    /// 0 = Monday … 6 = Sunday (weekly)
+    /// 0 = Monday … 6 = Sunday (weekly; the first one for monthly)
     #[serde(default)]
     pub weekdays: Vec<u32>,
     #[serde(default)]
     pub interval_minutes: i64,
+    /// Monthly: which of the month's `weekdays[0]`: 1-4, or 5 = the last one.
+    /// The default (2nd Tuesday) is Microsoft's Patch Tuesday.
+    #[serde(default = "second_week")]
+    pub week: u32,
+    /// Monthly: days after (or before, negative) that weekday, e.g. Patch Tuesday + 2.
+    #[serde(default)]
+    pub offset_days: i64,
     #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default)]
     pub last_run: Option<String>,
     #[serde(default)]
     pub next_run: Option<String>,
+}
+
+fn second_week() -> u32 {
+    2
 }
 
 impl Schedule {
@@ -1374,6 +1527,8 @@ impl Schedule {
             time: r.get("time")?,
             weekdays: json_col(r, "weekdays")?,
             interval_minutes: r.get("interval_minutes")?,
+            week: r.get("week")?,
+            offset_days: r.get("offset_days")?,
             enabled: r.get("enabled")?,
             last_run: r.get("last_run")?,
             next_run: r.get("next_run")?,
@@ -1564,6 +1719,10 @@ pub struct GroupRules {
     /// A fixed disk has less than this many GB free (0 = off)
     #[serde(default)]
     pub low_disk_gb: f64,
+    /// The last update scan found missing updates: "any", or "security"
+    /// (security or critical updates). Declined and optional updates don't count.
+    #[serde(default)]
+    pub missing_updates: String,
 }
 
 /// Result of one inventory scan, as parsed from the scan script's output.
@@ -1633,9 +1792,29 @@ pub struct Inventory {
     pub app_count: i64,
     /// Filled only when asked for.
     pub apps: Vec<InstalledApp>,
+    /// Windows Update scan summary, loaded for group rules that need it.
+    #[serde(skip)]
+    pub updates: Option<crate::wu::UpdateSummary>,
 }
 
 impl Inventory {
+    /// A computer that has no inventory scan (only an update scan).
+    pub fn empty(computer_id: i64) -> Inventory {
+        Inventory {
+            computer_id,
+            computer: String::new(),
+            scanned_at: None,
+            last_attempt: String::new(),
+            status: String::new(),
+            error: None,
+            facts: BTreeMap::new(),
+            disks: vec![],
+            app_count: 0,
+            apps: vec![],
+            updates: None,
+        }
+    }
+
     fn from_row(r: &Row) -> rusqlite::Result<Inventory> {
         Ok(Inventory {
             computer_id: r.get("computer_id")?,
@@ -1648,6 +1827,7 @@ impl Inventory {
             disks: json_col(r, "disks")?,
             app_count: r.get("app_count")?,
             apps: vec![],
+            updates: None,
         })
     }
 }

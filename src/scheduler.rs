@@ -1,8 +1,9 @@
 //! Background loop: starts scheduled deployments, recurring schedules,
-//! AD auto-sync, periodic inventory scans and the daily app catalog check.
+//! AD auto-sync, periodic inventory and update scans and the daily app
+//! catalog check.
 
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use tracing::{error, info};
 
 use crate::ad::{self, AdSettings};
@@ -25,6 +26,9 @@ pub fn spawn(app: App) {
             }
             if let Err(e) = crate::inventory::tick(&app) {
                 error!("inventory: {e:#}");
+            }
+            if let Err(e) = crate::wu::tick(&app) {
+                error!("update scan: {e:#}");
             }
             crate::catalog::tick(&app);
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
@@ -155,8 +159,48 @@ pub fn next_run(s: &Schedule, after: DateTime<Local>) -> Result<Option<String>> 
             }
             found
         }
+        "monthly" => {
+            let at = parse_hhmm(&s.time)?;
+            let weekday = *s.weekdays.first().ok_or_else(|| anyhow!("pick the weekday"))?;
+            if weekday > 6 || !(1..=5).contains(&s.week) {
+                bail!("monthly needs a weekday and a week 1-4 (or 5 = last)");
+            }
+            if s.offset_days.abs() > 27 {
+                bail!("the day offset must be between -27 and 27");
+            }
+            // Start a month back: an offset can move last month's date into this one.
+            let (mut y, mut m) = (after.year(), after.month());
+            (y, m) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
+            let mut found = None;
+            for _ in 0..15 {
+                let day = nth_weekday(y, m, weekday, s.week) + Duration::days(s.offset_days);
+                if let Some(t) = Local.from_local_datetime(&day.and_time(at)).earliest()
+                    && t > after
+                {
+                    found = Some(to_utc_string(t));
+                    break;
+                }
+                (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+            }
+            found
+        }
         k => bail!("unknown schedule kind '{k}'"),
     })
+}
+
+/// The `week`-th (1-4, or 5 = last) `weekday` (0 = Monday) of a month.
+fn nth_weekday(year: i32, month: u32, weekday: u32, week: u32) -> NaiveDate {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid month");
+    let shift = (weekday + 7 - first.weekday().num_days_from_monday()) % 7;
+    let mut day = first + Duration::days(shift as i64);
+    if week >= 5 {
+        while (day + Duration::days(7)).month() == month {
+            day += Duration::days(7);
+        }
+    } else {
+        day += Duration::days(7 * (week as i64 - 1));
+    }
+    day
 }
 
 #[cfg(test)]
@@ -175,6 +219,8 @@ mod tests {
             time: time.into(),
             weekdays,
             interval_minutes: 30,
+            week: 2,
+            offset_days: 0,
             enabled: true,
             last_run: None,
             next_run: None,
@@ -200,5 +246,29 @@ mod tests {
         assert!(next_run(&sched("weekly", "03:00", vec![]), after).is_err());
         let i = next(&sched("interval", "", vec![]));
         assert_eq!(i, after + Duration::minutes(30));
+    }
+
+    #[test]
+    fn monthly_patch_tuesday() {
+        // Wednesday 2026-10-28 10:00 local; Patch Tuesdays: Oct 13, Nov 10, Dec 8.
+        let after = Local.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
+        let next = |time: &str, week: u32, offset: i64| {
+            let s = Schedule { week, offset_days: offset, ..sched("monthly", time, vec![1]) };
+            let t = DateTime::parse_from_rfc3339(&next_run(&s, after).unwrap().unwrap()).unwrap().with_timezone(&Local);
+            (t.month(), t.day(), t.format("%H:%M").to_string())
+        };
+        assert_eq!(next("02:00", 2, 0), (11, 10, "02:00".into()));
+        assert_eq!(next("02:00", 2, 2), (11, 12, "02:00".into()));
+        // Oct 13 + 15 = today, but 02:00 has passed; at 11:00 it is still ahead.
+        assert_eq!(next("02:00", 2, 15), (11, 25, "02:00".into()));
+        assert_eq!(next("11:00", 2, 15), (10, 28, "11:00".into()));
+        // Patch Tuesday + 20 lands in the next month: Sep 8 + 20 = Sep 28, Oct 13 + 20 = Nov 2.
+        assert_eq!(next("02:00", 2, 20), (11, 2, "02:00".into()));
+        // Last Saturday of the month (Oct 31).
+        let s = Schedule { week: 5, ..sched("monthly", "03:00", vec![5]) };
+        let t = DateTime::parse_from_rfc3339(&next_run(&s, after).unwrap().unwrap()).unwrap().with_timezone(&Local);
+        assert_eq!((t.month(), t.day()), (10, 31));
+        assert!(next_run(&Schedule { week: 0, ..sched("monthly", "03:00", vec![1]) }, after).is_err());
+        assert!(next_run(&sched("monthly", "03:00", vec![]), after).is_err());
     }
 }
