@@ -14,15 +14,15 @@ variables:
     description: Silent switches for non-MSI uninstallers
 detect:
   windows: |
-    if (Test-AppInstalled -Name '{{name}}') { exit 1 }
+    if (Test-AppInstalled -Name {{name|ps}}) { exit 1 }
     Write-Output 'not installed'
     exit 0
 steps:
   - name: Uninstall {{name}}
     script: |
-      Get-InstalledApp -Name '{{name}}' | Format-Table DisplayName, DisplayVersion -AutoSize | Out-String
-      Uninstall-App -Name '{{name}}' -ExeArgs '{{exe_args}}'
+      Get-InstalledApp -Name {{name|ps}} | Format-Table DisplayName, DisplayVersion -AutoSize | Out-String
+      Uninstall-App -Name {{name|ps}} -ExeArgs {{exe_args|ps}}
 verify:
   windows: |
-    if (Test-AppInstalled -Name '{{name}}') { Write-Output 'still installed'; exit 1 }
+    if (Test-AppInstalled -Name {{name|ps}}) { Write-Output 'still installed'; exit 1 }
     exit 0

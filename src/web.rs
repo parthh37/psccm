@@ -67,6 +67,10 @@ pub async fn serve(
     if !addr.ip().is_loopback() && token.is_none() {
         bail!("listening on {addr} needs --token (or PSCCM_TOKEN) so others on the network cannot deploy");
     }
+    if token.as_deref().is_some_and(|t| t.len() < MIN_TOKEN_LEN) {
+        tracing::warn!("the access token is shorter than {MIN_TOKEN_LEN} characters; use a long random one");
+    }
+    app.secure_data_dir();
     let st = St { app, token };
     let api = Router::new()
         .route("/summary", get(summary))
@@ -146,11 +150,15 @@ pub async fn serve(
         .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css"), (header::CACHE_CONTROL, "no-cache")], STYLE) }))
         .route("/download/agent", get(download_agent))
         .nest("/api", api.merge(agent_api))
+        .layer(middleware::from_fn_with_state(st.clone(), guard))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
+
+/// Shortest console token `serve` / `service install` accept.
+pub const MIN_TOKEN_LEN: usize = 16;
 
 async fn auth(State(st): State<St>, headers: HeaderMap, req: Request, next: Next) -> Response {
     if let Some(token) = &st.token {
@@ -158,11 +166,67 @@ async fn auth(State(st): State<St>, headers: HeaderMap, req: Request, next: Next
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
-        if given != Some(token.as_str()) {
+        if !given.is_some_and(|g| crate::secrets::token_eq(g, token)) {
+            // Slow down guessing.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
         }
     }
     next.run(req).await
+}
+
+/// Browser-facing protections for every request:
+/// * without a token (loopback only) the Host header must name this machine,
+///   so a web page cannot reach the console through DNS rebinding;
+/// * a request a browser sent from another site (its `Origin` differs from the
+///   host) is refused, which blocks cross-site requests and WebSocket
+///   hijacking of the terminal;
+/// * responses carry headers that stop framing, sniffing and leaking.
+async fn guard(State(st): State<St>, headers: HeaderMap, req: Request, next: Next) -> Response {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if st.token.is_none() && !is_local_host(host) {
+        return (StatusCode::FORBIDDEN, "open the console as http://localhost or http://127.0.0.1").into_response();
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let forwarded = headers.get("x-forwarded-host").and_then(|v| v.to_str().ok());
+        let same = origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .is_some_and(|(_, authority)| {
+                authority.eq_ignore_ascii_case(host) || forwarded.is_some_and(|f| authority.eq_ignore_ascii_case(f))
+            });
+        if !same {
+            return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+        }
+    }
+    let api = req.uri().path().starts_with("/api/");
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+             form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    if api {
+        h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    }
+    resp
+}
+
+/// `localhost`, `127.0.0.1` or `[::1]`, with or without a port.
+fn is_local_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(n, _)| n),
+    };
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
 }
 
 // ------------------------------------------------------------------ summary
@@ -183,7 +247,7 @@ async fn summary(State(st): State<St>) -> ApiResult {
         "packages": lib.packages.len(),
         "package_errors": lib.errors,
         "running": running,
-        "recent": deployments,
+        "recent": deployments.iter().map(masked_deployment).collect::<Vec<_>>(),
         "credentials": app.db.list_credentials()?.len(),
         "agents": agents.len(),
         "agents_online": agents.iter().filter(|a| a.online).count(),
@@ -719,7 +783,31 @@ struct LimitQ {
 }
 
 async fn list_deployments(State(st): State<St>, Query(q): Query<LimitQ>) -> ApiResult {
-    Ok(Json(json!(st.app.db.list_deployments(q.limit.unwrap_or(100).min(1000))?)))
+    let list = st.app.db.list_deployments(q.limit.unwrap_or(100).min(1000))?;
+    Ok(Json(json!(list.iter().map(masked_deployment).collect::<Vec<_>>())))
+}
+
+const MASK: &str = "********";
+
+/// Replace the values of `secret` variables in a JSON `variables` object.
+fn mask_vars(vars: &mut Value, secret: impl IntoIterator<Item = String>) {
+    if let Some(vars) = vars.as_object_mut() {
+        for k in secret {
+            if vars.contains_key(&k) {
+                vars.insert(k, json!(MASK));
+            }
+        }
+    }
+}
+
+/// A deployment as JSON with its secret variables masked.
+fn masked_deployment(dep: &crate::db::Deployment) -> Value {
+    let secret: Vec<String> = serde_yaml::from_str::<Package>(&dep.package_yaml)
+        .map(|p| p.variables.into_iter().filter(|(_, v)| v.secret).map(|(k, _)| k).collect())
+        .unwrap_or_default();
+    let mut v = json!(dep);
+    mask_vars(&mut v["variables"], secret);
+    v
 }
 
 #[derive(Deserialize)]
@@ -763,19 +851,7 @@ async fn create_deployment(State(st): State<St>, Json(req): Json<CreateDeploymen
 async fn get_deployment(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
     let dep = st.app.db.get_deployment(&id)?.ok_or_else(|| anyhow!("deployment not found"))?;
     let targets = st.app.db.list_targets(&id, false)?;
-    let pkg: Option<Package> = serde_yaml::from_str(&dep.package_yaml).ok();
-    let secret: Vec<String> = pkg
-        .map(|p| p.variables.into_iter().filter(|(_, v)| v.secret).map(|(k, _)| k).collect())
-        .unwrap_or_default();
-    let mut dep_json = json!(dep);
-    if let Some(vars) = dep_json["variables"].as_object_mut() {
-        for k in secret {
-            if vars.contains_key(&k) {
-                vars.insert(k, json!("********"));
-            }
-        }
-    }
-    Ok(Json(json!({ "deployment": dep_json, "targets": targets, "package_yaml": dep.package_yaml })))
+    Ok(Json(json!({ "deployment": masked_deployment(&dep), "targets": targets, "package_yaml": dep.package_yaml })))
 }
 
 async fn target_log(State(st): State<St>, Path(id): Path<i64>) -> Result<String, ApiError> {
@@ -817,8 +893,28 @@ async fn delete_deployment(State(st): State<St>, Path(id): Path<String>) -> ApiR
 
 // ---------------------------------------------------------------- schedules
 
+/// Names of a package's secret variables.
+fn secret_vars(lib: &crate::package::Library, package_id: &str) -> Vec<String> {
+    lib.packages
+        .get(package_id)
+        .map(|p| p.variables.iter().filter(|(_, v)| v.secret).map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default()
+}
+
 async fn list_schedules(State(st): State<St>) -> ApiResult {
-    Ok(Json(json!(st.app.db.list_schedules()?)))
+    let lib = st.app.library()?;
+    let list: Vec<Value> = st
+        .app
+        .db
+        .list_schedules()?
+        .iter()
+        .map(|s| {
+            let mut v = json!(s);
+            mask_vars(&mut v["variables"], secret_vars(&lib, &s.package_id));
+            v
+        })
+        .collect();
+    Ok(Json(json!(list)))
 }
 
 async fn save_schedule(State(st): State<St>, Json(mut s): Json<Schedule>) -> ApiResult {
@@ -826,6 +922,16 @@ async fn save_schedule(State(st): State<St>, Json(mut s): Json<Schedule>) -> Api
         return Err(anyhow!("schedule name is required").into());
     }
     let lib = st.app.library()?;
+    // The editor gets secrets masked; a value left as the mask keeps the old one.
+    if let Some(old) = st.app.db.list_schedules()?.into_iter().find(|o| o.id == s.id && s.id != 0) {
+        for k in secret_vars(&lib, &s.package_id) {
+            if s.variables.get(&k).is_some_and(|v| v == MASK)
+                && let Some(prev) = old.variables.get(&k)
+            {
+                s.variables.insert(k, prev.clone());
+            }
+        }
+    }
     let pkg = lib.packages.get(&s.package_id).ok_or_else(|| anyhow!("package '{}' not found", s.package_id))?;
     pkg.resolve_vars(&s.variables)?;
     if s.targets.computers.is_empty() && s.targets.tags.is_empty() && s.targets.groups.is_empty() {
@@ -945,7 +1051,7 @@ async fn save_agent_settings(State(st): State<St>, Json(req): Json<AgentSettings
     let mut s: AgentSettings = st.app.agent_settings();
     s.enabled = req.enabled;
     if req.rotate || s.enroll_token.is_empty() {
-        s.enroll_token = uuid::Uuid::new_v4().simple().to_string();
+        s.enroll_token = crate::secrets::random_token();
     }
     st.app.db.set_setting("agent", &s)?;
     Ok(Json(json!({ "enabled": s.enabled, "enroll_token": s.enroll_token })))
@@ -959,7 +1065,7 @@ async fn install_command(State(st): State<St>) -> ApiResult {
 /// enrollment token gates the download (the bootstrap has no console token).
 async fn download_agent(State(st): State<St>, Query(q): Query<TokenQ>) -> Result<Response, ApiError> {
     let expected = st.app.enroll_token()?;
-    if q.token.as_deref() != Some(expected.as_str()) {
+    if !q.token.as_deref().is_some_and(|t| crate::secrets::token_eq(t, &expected)) {
         return Err(anyhow!("invalid or missing enrollment token").into());
     }
     let exe = std::env::current_exe().map_err(|e| anyhow!("locating the executable: {e}"))?;
@@ -990,7 +1096,7 @@ async fn terminal_ws(
     ws: WebSocketUpgrade,
 ) -> Response {
     if let Some(tok) = &st.token
-        && q.token.as_deref() != Some(tok.as_str())
+        && !q.token.as_deref().is_some_and(|t| crate::secrets::token_eq(t, tok))
     {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }

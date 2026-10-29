@@ -1,6 +1,6 @@
 //! SQLite storage: computers, credentials, settings, deployment history, schedules.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -189,6 +189,15 @@ pub fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// A host name, FQDN or IP address. Computer names end up in scripts
+/// (`{{host}}`) and the UI, so anything else (quotes, spaces, `$`, ...) is
+/// refused, whether typed in, imported from AD or reported by an agent.
+pub fn valid_computer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);
 
@@ -259,6 +268,9 @@ impl Db {
 
     /// Insert or update by name. Fields that are `None` keep their old value.
     pub fn upsert_computer(&self, n: &NewComputer) -> Result<()> {
+        if !valid_computer_name(n.name.trim()) {
+            bail!("'{}' is not a valid computer name (letters, digits, '.', '-', '_' or an IP address)", n.name.trim());
+        }
         let tags = n.tags.as_ref().map(|t| join_tags(t));
         let ad_groups = n.ad_groups.as_ref().map(|g| g.join("\n"));
         self.with(|c| {
@@ -705,24 +717,12 @@ impl Db {
         Ok(())
     }
 
-    /// If an agent already exists for this computer name, return its id so the
-    /// agent re-enrolls into the same record instead of piling up duplicates.
+    /// The id of the agent enrolled for this computer name, if any.
     pub fn agent_id_for_computer(&self, computer: &str) -> Result<Option<String>> {
         self.with(|c| {
             c.query_row("SELECT id FROM agents WHERE computer=?1 COLLATE NOCASE", [computer], |r| r.get(0))
                 .optional()
         })
-    }
-
-    /// Re-enroll: refresh the key and facts of an existing agent record.
-    pub fn reenroll_agent(&self, id: &str, key: &str, req: &EnrollReq, address: Option<&str>) -> Result<()> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE agents SET agent_key=?2, hostname=?3, os=?4, os_version=?5, version=?6, address=?7, last_checkin=?8 WHERE id=?1",
-                params![id, key, req.hostname, req.os, req.os_version, req.agent_version, address, now()],
-            )
-        })?;
-        Ok(())
     }
 
     /// The stored key for an agent, for authenticating its requests.

@@ -92,6 +92,7 @@ fn wanted_asset(name: &str) -> bool {
 
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        .https_only(true)
         .user_agent(format!("psccm/{CURRENT}"))
         .timeout(std::time::Duration::from_secs(300))
         .build()?)
@@ -136,6 +137,10 @@ struct GhAsset {
 /// Ask GitHub for the latest release and remember the answer.
 pub async fn check(app: &App) -> Result<Release> {
     let mut s: UpdateSettings = app.db.get_setting("update")?;
+    let valid = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !s.repo.split_once('/').is_some_and(|(o, r)| valid(o) && valid(r) && r != "..") {
+        bail!("update repository must look like owner/name, not {:?}", s.repo);
+    }
     let http = client()?;
     let url = format!("https://api.github.com/repos/{}/releases/latest", s.repo);
     let resp = http.get(&url).header("Accept", "application/vnd.github+json").send().await?;
@@ -191,7 +196,13 @@ pub async fn install(app: &App) -> Result<String> {
     if got != expected {
         bail!("checksum mismatch for {name} (expected {expected}, got {got})");
     }
+    if name.contains(['/', '\\']) || name.contains("..") {
+        bail!("unexpected release asset name {name:?}");
+    }
+    // A fresh folder each time, so nothing placed there earlier (by anyone)
+    // can be run in place of the verified installer.
     let dir = app.data_dir.join("updates");
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let file = dir.join(&name);
     std::fs::write(&file, &bytes)?;

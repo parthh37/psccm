@@ -28,6 +28,36 @@ pub fn unprotect(stored: &str) -> Result<String> {
     Ok(String::from_utf8(plain)?)
 }
 
+/// Compare a presented token with the expected one in constant time, so the
+/// response time does not reveal how many leading characters were right.
+pub fn token_eq(given: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    // Hashing first makes the comparison length-independent too.
+    let (a, b) = (Sha256::digest(given.as_bytes()), Sha256::digest(expected.as_bytes()));
+    let diff = a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    diff == 0 && !expected.is_empty()
+}
+
+/// What is stored for a key the console only has to recognise (agent keys):
+/// its SHA-256, so a copy of the database does not hand out working keys.
+pub fn hash_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+/// Check a presented key against [`hash_token`] output (or a key stored in
+/// clear by an older version).
+pub fn token_matches_stored(given: &str, stored: &str) -> bool {
+    if stored.starts_with("sha256:") { token_eq(&hash_token(given), stored) } else { token_eq(given, stored) }
+}
+
+/// A fresh random token (244 bits from the OS RNG, hex) for agent keys and enrollment.
+pub fn random_token() -> String {
+    format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+}
+
 #[cfg(windows)]
 mod platform {
     use anyhow::{Result, bail};
@@ -115,5 +145,20 @@ mod tests {
         let enc = super::protect("p@ss wörd").unwrap();
         assert_ne!(enc, "p@ss wörd");
         assert_eq!(super::unprotect(&enc).unwrap(), "p@ss wörd");
+    }
+
+    #[test]
+    fn token_compare() {
+        assert!(super::token_eq("abc123", "abc123"));
+        assert!(!super::token_eq("abc124", "abc123"));
+        assert!(!super::token_eq("abc", "abc123"));
+        assert!(!super::token_eq("", ""));
+        assert_ne!(super::random_token(), super::random_token());
+        assert_eq!(super::random_token().len(), 64);
+        let stored = super::hash_token("k3y");
+        assert!(super::token_matches_stored("k3y", &stored));
+        assert!(!super::token_matches_stored("k3z", &stored));
+        assert!(!super::token_matches_stored(&stored, &stored));
+        assert!(super::token_matches_stored("legacy", "legacy"));
     }
 }

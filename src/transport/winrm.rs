@@ -19,7 +19,10 @@ use crate::package::Shell;
 
 const EXIT_MARK: &str = "__PSCCM_EXIT__=";
 const CONNECT_MARK: &str = "__PSCCM_CONNECT_ERROR__";
-const REMOTE_TMP: &str = r"C:\Windows\Temp\psccm";
+/// Scripts go straight into the Windows temp folder under a random name, not
+/// into a fixed subfolder: an ordinary user could create that subfolder first,
+/// own it, and edit every script placed in it before it runs.
+const REMOTE_TMP: &str = r"C:\Windows\Temp";
 
 const HEADER: &str = r#"
 $ErrorActionPreference = 'Stop'
@@ -146,7 +149,7 @@ impl Transport for WinRm {
             Shell::Cmd => ("cmd", script.as_bytes().to_vec()),
             other => bail!("{other:?} scripts cannot run on Windows"),
         };
-        let remote = format!(r"{REMOTE_TMP}\{}.{ext}", uuid::Uuid::new_v4());
+        let remote = format!(r"{REMOTE_TMP}\psccm-{}.{ext}", uuid::Uuid::new_v4().simple());
         let shell_name = if shell == Shell::Cmd { "cmd" } else { "powershell" };
         let body = format!(
             r#"

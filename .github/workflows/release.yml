@@ -1,30 +1,89 @@
 name: Release
 
-# Push a tag like v0.2.0 to build, publish and then test the release.
+# Two ways to release:
+#  * push a tag like v0.2.3, or
+#  * run this workflow by hand (Actions → Release → Run workflow) on main with
+#    the tag to create, e.g. v0.2.3. The tag is created at that commit.
+# Either way Cargo.toml must already carry the matching version. Running it by
+# hand with the tag of a release that already exists only re-runs the tests.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to re-test (skips building)
+        description: Release tag (vX.Y.Z). New → build and publish it; existing → re-test it
         required: true
 
-permissions:
-  contents: write
+# Every job asks for what it needs; nothing gets write access by default.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
-  build-windows:
-    if: github.event_name == 'push'
-    runs-on: windows-latest
+  # Decide whether to build (new release) or only re-test (release exists).
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check version matches tag
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag; use the form v1.2.3"
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG exists: re-running the release tests only."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Cargo.toml on ${GITHUB_REF_NAME} is version $version, so it can only be released as v$version. Bump the version in Cargo.toml (and Cargo.lock) first, or run the workflow with tag v$version."
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            if [ "$GITHUB_REF" != refs/heads/main ]; then
+              echo "::error::Run the release from the main branch (it ran on $GITHUB_REF)."
+              exit 1
+            fi
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
+              echo "::error::Tag $TAG already exists without a release; push the tag again or delete it first."
+              exit 1
+            fi
+          fi
+          echo "Building and publishing $TAG from $GITHUB_SHA."
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  # Release builds deliberately do not restore a shared cargo cache, so a
+  # poisoned cache entry can never end up inside a published binary.
+  build-windows:
+    needs: [prepare]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Read version
         shell: pwsh
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
@@ -44,59 +103,95 @@ jobs:
           & $iscc /Qp "/DAppVersion=$env:VERSION" installer\psccm.iss
           if ($LASTEXITCODE) { throw "ISCC failed" }
           Copy-Item target\release\psccm.exe dist\psccm-x86_64-windows.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows
           path: dist/*
+          if-no-files-found: error
 
   build-linux:
-    if: github.event_name == 'push'
+    needs: [prepare]
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - run: cargo test --locked --release
       - run: cargo build --locked --release
         env:
           PSCCM_UPDATE_REPO: ${{ github.repository }}
       - run: mkdir dist && cp target/release/psccm dist/psccm-x86_64-linux
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux
           path: dist/*
+          if-no-files-found: error
 
   publish:
-    needs: [build-windows, build-linux]
+    needs: [prepare, build-windows, build-linux]
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the release
+      id-token: write # sign the build provenance
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      # Anyone can check a download came from this workflow with
+      #   gh attestation verify <file> --repo <owner>/<repo>
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$TAG" dist/* --title "PSCCM $TAG" --generate-notes --verify-tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "PSCCM $TAG" --generate-notes --verify-tag
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "PSCCM $TAG" --generate-notes --target "$GITHUB_SHA"
+          fi
 
   # ---------------------------------------------------------------------------
   # Post-release tests: download what was published, install it like a user
   # would and run tests/release-test.ps1 against real WinRM / SSH targets on
   # the (throwaway) CI machines. Reports are attached to the release.
   test-windows:
-    needs: [publish]
-    if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
+    needs: [prepare, publish]
+    if: always() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || needs.prepare.outputs.build == 'false')
     runs-on: windows-latest
     timeout-minutes: 60
+    permissions:
+      contents: write # attach the report to the release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Download release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "$env:TAG" --dir rel --pattern "psccm-setup-*.exe" --pattern SHA256SUMS
+        run: gh release download "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --dir rel --pattern "psccm-setup-*.exe" --pattern SHA256SUMS
+      - name: Verify checksum
+        shell: pwsh
+        run: |
+          foreach ($line in Get-Content rel\SHA256SUMS) {
+            $hash, $name = $line -split '\s+\*?', 2
+            if (-not (Test-Path "rel\$name")) { continue }
+            $actual = (Get-FileHash "rel\$name" -Algorithm SHA256).Hash
+            if ($actual -ne $hash) { throw "checksum mismatch for $name" }
+            "OK  $name"
+          }
       - name: Prepare this runner as a target (WinRM)
         shell: pwsh
         run: |
@@ -116,25 +211,30 @@ jobs:
         run: |
           if (Test-Path report\report.html) {
             Copy-Item report\report.html report\test-report-windows.html
-            gh release upload "$env:TAG" report\test-report-windows.html --clobber
+            gh release upload "$env:TAG" report\test-report-windows.html --repo "$env:GITHUB_REPOSITORY" --clobber
           }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: test-report-windows
           path: report/
+          if-no-files-found: ignore
 
   test-linux:
-    needs: [publish]
-    if: always() && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch')
+    needs: [prepare, publish]
+    if: always() && needs.prepare.result == 'success' && (needs.publish.result == 'success' || needs.prepare.outputs.build == 'false')
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    permissions:
+      contents: write # attach the report to the release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Download release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "$TAG" --dir rel --pattern psccm-x86_64-linux --pattern SHA256SUMS
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel --pattern psccm-x86_64-linux --pattern SHA256SUMS
       - name: Verify checksum
         run: cd rel && sha256sum --check --ignore-missing SHA256SUMS
       - name: Prepare this runner as a target (SSH + sudo)
@@ -162,10 +262,11 @@ jobs:
         run: |
           if [ -f report/report.html ]; then
             cp report/report.html report/test-report-linux.html
-            gh release upload "$TAG" report/test-report-linux.html --clobber
+            gh release upload "$TAG" report/test-report-linux.html --repo "$GITHUB_REPOSITORY" --clobber
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: test-report-linux
           path: report/
+          if-no-files-found: ignore

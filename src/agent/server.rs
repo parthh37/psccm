@@ -39,7 +39,7 @@ pub async fn agent_auth(State(app): State<App>, headers: HeaderMap, mut req: Req
         return unauth();
     };
     match app.db.agent_key(id) {
-        Ok(Some(stored)) if stored == key => {
+        Ok(Some(stored)) if crate::secrets::token_matches_stored(key, &stored) => {
             req.extensions_mut().insert(AgentId(id.to_string()));
             next.run(req).await
         }
@@ -55,36 +55,43 @@ pub async fn enroll(State(app): State<App>, Json(req): Json<EnrollReq>) -> ApiRe
         return Err(anyhow::anyhow!("agent enrollment is disabled on this console").into());
     }
     let expected = app.enroll_token()?;
-    if req.token.is_empty() || req.token != expected {
+    if !crate::secrets::token_eq(&req.token, &expected) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
         return Err(anyhow::anyhow!("invalid enrollment token").into());
     }
-    if req.hostname.trim().is_empty() {
-        return Err(anyhow::anyhow!("hostname is required").into());
+    let valid_name = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_';
+    if req.hostname.trim().is_empty() || req.hostname.len() > 253 || !req.hostname.chars().all(valid_name) {
+        return Err(anyhow::anyhow!("a valid hostname is required").into());
+    }
+    // The enrollment token is shared by every machine, so it must not let one
+    // machine take over another's agent: a computer that already has an agent
+    // can only enroll again after that agent is removed in the console.
+    if app.db.agent_id_for_computer(&req.hostname)?.is_some() {
+        tracing::warn!("refused enrollment for {}: an agent is already enrolled for it", req.hostname);
+        return Err(anyhow::anyhow!(
+            "an agent is already enrolled for {}; remove it under Agents in the console to enroll this machine again",
+            req.hostname
+        )
+        .into());
     }
     let os = if req.os.eq_ignore_ascii_case("linux") { "linux" } else { "windows" };
 
-    // Keep (or refresh) the computer record; agents never delete computers.
+    // Keep (or refresh) the computer record; agents never delete computers,
+    // and never rewrite how the console reaches one it already manages.
+    let existing = app.db.get_computer(&req.hostname)?;
+    let agent_owned = existing.as_ref().is_none_or(|c| c.source == "agent");
     app.db.upsert_computer(&NewComputer {
         name: req.hostname.clone(),
-        os: Some(os.to_string()),
-        os_detail: (!req.os_version.is_empty()).then(|| req.os_version.clone()),
-        source: Some("agent".to_string()),
-        address: req.address.clone(),
+        os: agent_owned.then(|| os.to_string()),
+        os_detail: (agent_owned && !req.os_version.is_empty()).then(|| req.os_version.clone()),
+        source: agent_owned.then(|| "agent".to_string()),
+        address: req.address.clone().filter(|_| agent_owned),
         ..Default::default()
     })?;
 
-    let key = uuid::Uuid::new_v4().simple().to_string();
-    let agent_id = match app.db.agent_id_for_computer(&req.hostname)? {
-        Some(id) => {
-            app.db.reenroll_agent(&id, &key, &req, req.address.as_deref())?;
-            id
-        }
-        None => {
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            app.db.create_agent(&id, &key, &req, req.address.as_deref())?;
-            id
-        }
-    };
+    let key = crate::secrets::random_token();
+    let agent_id = uuid::Uuid::new_v4().simple().to_string();
+    app.db.create_agent(&agent_id, &crate::secrets::hash_token(&key), &req, req.address.as_deref())?;
     tracing::info!("agent enrolled: {} ({os}) -> {agent_id}", req.hostname);
     Ok(Json(json!(EnrollResp { agent_id, agent_key: key })))
 }
@@ -98,7 +105,7 @@ pub async fn checkin(
 ) -> Result<Json<CheckinResp>, ApiError> {
     app.db.agent_checkin(&id, &req.agent_version, req.metrics.as_ref())?;
     for chunk in &req.terminal {
-        app.agents.push_output(chunk);
+        app.agents.push_output(&id, chunk);
     }
 
     let notifier = app.agents.notifier(&id);

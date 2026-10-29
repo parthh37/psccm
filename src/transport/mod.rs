@@ -80,9 +80,20 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Quote a string as a PowerShell single-quoted literal.
+/// Quote a string as a PowerShell single-quoted literal. PowerShell also ends
+/// such a literal at the typographic quotes U+2018..U+201B, so those are
+/// doubled as well.
 pub fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// Read `reader` line by line (lossy UTF-8) and hand each line to `f`.
@@ -131,6 +142,7 @@ mod tests {
     fn quoting() {
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
         assert_eq!(ps_quote("it's"), "'it''s'");
+        assert_eq!(ps_quote("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
     }
 
     #[test]

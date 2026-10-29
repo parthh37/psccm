@@ -365,6 +365,16 @@ impl StepCx<'_> {
     }
 }
 
+/// A fresh, unguessable folder on the target for uploaded files. Users on the
+/// target must not be able to create it ahead of time (and so own it).
+fn remote_workdir(os: Os) -> String {
+    let id = uuid::Uuid::new_v4().simple();
+    match os {
+        Os::Windows => format!(r"C:\Windows\Temp\psccm-{id}"),
+        Os::Linux => format!("/tmp/psccm-{id}"),
+    }
+}
+
 pub fn build_transport(
     app: &App,
     t: &Target,
@@ -438,11 +448,7 @@ async fn run_target_inner(run: &Run, row: i64, t: &Target, log: &LogFn) -> Resul
     }
     let transport = build_transport(app, t, os, port, &run.winrm)?;
 
-    let short = &run.dep_id[..8];
-    let workdir = match os {
-        Os::Windows => format!(r"C:\Windows\Temp\psccm\{short}"),
-        Os::Linux => format!("/tmp/psccm-{short}"),
-    };
+    let workdir = remote_workdir(os);
     let mut vars = run.vars.clone();
     vars.insert("host".into(), t.name.clone());
     let short = if t.name.parse::<std::net::IpAddr>().is_ok() { &t.name } else { t.name.split('.').next().unwrap_or(&t.name) };
@@ -572,14 +578,10 @@ async fn open_delegate(run: &Run, name: &str) -> Result<Delegate> {
     if !port_open(&t.host, port, Duration::from_secs(5)).await {
         bail!("delegate host {}:{port} is not reachable", t.host);
     }
-    let short = &run.dep_id[..8];
     Ok(Delegate {
         transport: build_transport(&run.app, &t, os, port, &run.winrm)?,
         os,
-        workdir: match os {
-            Os::Windows => format!(r"C:\Windows\Temp\psccm\{short}"),
-            Os::Linux => format!("/tmp/psccm-{short}"),
-        },
+        workdir: remote_workdir(os),
         host: t.host,
         port,
     })
@@ -711,7 +713,7 @@ async fn run_step(cx: &StepCx<'_>, step: &Step) -> Result<()> {
                     ServiceAction::Restart => "restart",
                 };
                 let n = sh_quote(&name);
-                format!("systemctl {verb} {n}\necho \"{name}: $(systemctl is-active {n} || true)\"")
+                format!("systemctl {verb} {n}\nprintf '%s: %s\\n' {n} \"$(systemctl is-active {n} || true)\"")
             }
         };
         return check(cx.script(cx.default_shell(), &body, timeout).await?);
@@ -768,7 +770,7 @@ async fn install_script(cx: &StepCx<'_>, inst: &Install, timeout: Duration) -> R
                 s += &format!("download {} \"$f\"\n", sh_quote(u));
             }
             if let Some(h) = &sha {
-                s += &format!("echo \"{}  $f\" | sha256sum -c -\n", h.to_lowercase());
+                s += &format!("printf '%s  %s\\n' {} \"$f\" | sha256sum -c -\n", sh_quote(&h.to_lowercase()));
             }
             s += &LINUX_INSTALL.replace("@ARGS@", &args);
             s

@@ -99,9 +99,21 @@ impl Ctx {
             // A deleted built-in is renamed to *.yaml.disabled; don't bring it back.
             if !path.exists() && !path.with_extension("yaml.disabled").exists() {
                 std::fs::write(&path, text)?;
+            } else if std::fs::read_to_string(&path).is_ok_and(|old| old != *text && old == unquoted_builtin(text)) {
+                // An unedited copy from before the {{x|ps}} / {{x|sh}} quoting filters.
+                std::fs::write(&path, text)?;
             }
         }
         Ok(Arc::new(ctx))
+    }
+
+    /// Keep other local users out of the data folder: it holds the database
+    /// (enrollment token, secret variables, credentials), the packages that
+    /// run as admin everywhere and the staged update installer.
+    pub fn secure_data_dir(&self) {
+        if let Err(e) = restrict_to_owner(&self.data_dir) {
+            tracing::warn!("could not restrict access to {}: {e:#}", self.data_dir.display());
+        }
     }
 
     pub fn packages_dir(&self) -> PathBuf {
@@ -129,7 +141,7 @@ impl Ctx {
     pub fn enroll_token(&self) -> Result<String> {
         let mut s = self.agent_settings();
         if s.enroll_token.is_empty() {
-            s.enroll_token = uuid::Uuid::new_v4().simple().to_string();
+            s.enroll_token = crate::secrets::random_token();
             self.db.set_setting("agent", &s)?;
         }
         Ok(s.enroll_token)
@@ -138,15 +150,60 @@ impl Ctx {
     /// Resolve a repository-relative path, refusing anything that escapes it.
     pub fn repo_file(&self, rel: &str) -> Result<PathBuf> {
         let rel = rel.replace('\\', "/");
-        if rel.split('/').any(|p| p == "..") || Path::new(&rel).is_absolute() {
+        // Only plain names: no "..", roots or drive prefixes such as "C:..".
+        let plain = Path::new(&rel).components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
+        if !plain || rel.contains(':') {
             anyhow::bail!("repository path '{rel}' must be relative and stay inside the repository");
         }
         let path = self.repo_dir().join(&rel);
         if !path.is_file() {
             anyhow::bail!("file '{rel}' not found in repository folder {}", self.repo_dir().display());
         }
+        // A link inside the repository must not lead out of it either.
+        let (real, root) = (path.canonicalize()?, self.repo_dir().canonicalize()?);
+        if !real.starts_with(&root) {
+            anyhow::bail!("repository path '{rel}' leads outside the repository");
+        }
         Ok(path)
     }
+}
+
+/// A built-in package as older versions shipped it: `'{{x}}'` where it now
+/// has `{{x|ps}}` / `{{x|sh}}`.
+fn unquoted_builtin(text: &str) -> String {
+    let re = regex::Regex::new(r"\{\{(\w+)\|(?:ps|sh)\}\}").unwrap();
+    re.replace_all(text, "'{{$1}}'").into_owned()
+}
+
+/// Unix: mode 700. Windows: stop inheriting the parent's ACL (ProgramData
+/// lets every user read), drop the Users / Authenticated Users / Everyone
+/// entries and make sure the account running PSCCM keeps full access. Other
+/// explicit grants (e.g. a service account added at install) stay.
+fn restrict_to_owner(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("whoami.exe").args(["/user", "/fo", "csv", "/nh"]).output()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let sid = text.trim().rsplit(',').next().unwrap_or("").trim_matches('"').to_string();
+        if !sid.starts_with("S-1-") {
+            anyhow::bail!("cannot tell the current account's SID");
+        }
+        let icacls = |args: &[&str]| -> Result<()> {
+            let st = std::process::Command::new("icacls.exe").arg(dir).args(args).arg("/Q").status()?;
+            anyhow::ensure!(st.success(), "icacls {} failed", args.join(" "));
+            Ok(())
+        };
+        icacls(&["/grant", &format!("*{sid}:(OI)(CI)F")])?;
+        icacls(&["/grant", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])?;
+        icacls(&["/inheritance:d"])?;
+        icacls(&["/remove:g", "*S-1-5-32-545", "*S-1-5-11", "*S-1-1-0"])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
