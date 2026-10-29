@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info};
@@ -143,6 +143,69 @@ fn decode_escapes(s: &str) -> String {
         }
     }
     out.push_str(rest);
+    out
+}
+
+/// Facts whose changes go to the change history. Others (logged-on user,
+/// last boot, IP addresses, pending reboot) change all the time.
+const TRACKED_FACTS: &[&str] = &[
+    "os_name", "os_version", "os_build", "kernel", "arch", "manufacturer", "model", "serial", "cpu", "cpu_count",
+    "ram_mb", "domain",
+];
+
+/// One difference between two scans of a computer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    /// "installed", "removed", "updated" or "changed" (a fact)
+    pub kind: &'static str,
+    pub name: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// What changed from the previous scan (`old_facts`, `old_apps`) to `new`.
+pub fn changes(old_facts: &BTreeMap<String, String>, old_apps: &[InstalledApp], new: &Scan) -> Vec<Change> {
+    let mut out = Vec::new();
+    for key in TRACKED_FACTS {
+        // A value that is missing in one scan is usually a query that failed, not a change.
+        if let (Some(o), Some(n)) = (old_facts.get(*key), new.facts.get(*key))
+            && !o.is_empty()
+            && !n.is_empty()
+            && o != n
+        {
+            out.push(Change { kind: "changed", name: key.to_string(), old: o.clone(), new: n.clone() });
+        }
+    }
+    // A scan that suddenly lists no software at all failed to read it.
+    if new.apps.is_empty() && !old_apps.is_empty() {
+        return out;
+    }
+    // Program name (case-insensitive) -> (shown name, versions).
+    let index = |apps: &[InstalledApp]| {
+        let mut m: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
+        for a in apps {
+            m.entry(a.name.to_lowercase()).or_insert_with(|| (a.name.clone(), BTreeSet::new())).1.insert(a.version.clone());
+        }
+        m
+    };
+    let (old, new) = (index(old_apps), index(&new.apps));
+    let none = (String::new(), BTreeSet::new());
+    for key in old.keys().chain(new.keys().filter(|k| !old.contains_key(*k))) {
+        let (o, n) = (old.get(key).unwrap_or(&none), new.get(key).unwrap_or(&none));
+        let name = if n.0.is_empty() { &o.0 } else { &n.0 };
+        let gone: Vec<&String> = o.1.difference(&n.1).collect();
+        let added: Vec<&String> = n.1.difference(&o.1).collect();
+        if gone.len() == 1 && added.len() == 1 {
+            out.push(Change { kind: "updated", name: name.clone(), old: gone[0].clone(), new: added[0].clone() });
+            continue;
+        }
+        for v in gone {
+            out.push(Change { kind: "removed", name: name.clone(), old: v.clone(), new: String::new() });
+        }
+        for v in added {
+            out.push(Change { kind: "installed", name: name.clone(), old: String::new(), new: v.clone() });
+        }
+    }
     out
 }
 
@@ -365,6 +428,53 @@ mod tests {
         assert_eq!(s.apps[0].publisher, "Google LLC");
         assert_eq!(s.apps[1].name, "Café Tool \\ x");
         assert!(parse_output(&lines("@@inv\tfact\tos_name\tx"), false).is_err(), "no done marker");
+    }
+
+    fn app(name: &str, version: &str) -> InstalledApp {
+        InstalledApp { name: name.into(), version: version.into(), publisher: String::new() }
+    }
+
+    #[test]
+    fn finds_changes_between_scans() {
+        let old_facts: BTreeMap<String, String> =
+            [("os_build", "22631.4317"), ("ram_mb", "16384"), ("user", "CORP\\bob"), ("serial", "ABC")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let old_apps = vec![
+            app("Google Chrome", "129.0.1"),
+            app("7-Zip 24.08 (x64)", "24.08"),
+            app("Microsoft Visual C++ 2015-2022 Redistributable", "14.38"),
+            app("Microsoft Visual C++ 2015-2022 Redistributable", "14.36"),
+        ];
+        let mut new = Scan::default();
+        for (k, v) in [("os_build", "22631.4460"), ("ram_mb", "16384"), ("user", "CORP\\alice")] {
+            new.facts.insert(k.into(), v.into());
+        }
+        new.apps = vec![
+            app("google chrome", "130.0.2"),
+            app("Microsoft Visual C++ 2015-2022 Redistributable", "14.40"),
+            app("Notepad++ (64-bit x64)", "8.7"),
+        ];
+        let got: Vec<(&str, String, String, String)> =
+            changes(&old_facts, &old_apps, &new).into_iter().map(|c| (c.kind, c.name, c.old, c.new)).collect();
+        let want = |k: &'static str, n: &str, o: &str, v: &str| (k, n.to_string(), o.to_string(), v.to_string());
+        assert_eq!(
+            got,
+            vec![
+                // The user changed too, but is not tracked; the serial is missing, not changed.
+                want("changed", "os_build", "22631.4317", "22631.4460"),
+                want("removed", "7-Zip 24.08 (x64)", "24.08", ""),
+                want("updated", "google chrome", "129.0.1", "130.0.2"),
+                want("removed", "Microsoft Visual C++ 2015-2022 Redistributable", "14.36", ""),
+                want("removed", "Microsoft Visual C++ 2015-2022 Redistributable", "14.38", ""),
+                want("installed", "Microsoft Visual C++ 2015-2022 Redistributable", "", "14.40"),
+                want("installed", "Notepad++ (64-bit x64)", "", "8.7"),
+            ]
+        );
+        // A scan without any software is a failed read, not "everything removed".
+        new.apps.clear();
+        assert_eq!(changes(&old_facts, &old_apps, &new).len(), 1);
     }
 
     #[test]

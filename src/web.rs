@@ -82,6 +82,9 @@ pub async fn serve(
         .route("/inventory/scan", post(scan_inventory))
         .route("/inventory/software", get(list_software))
         .route("/inventory/software/computers", get(software_computers))
+        .route("/inventory/software/all", get(all_software))
+        .route("/inventory/changes", get(inventory_changes))
+        .route("/inventory/outdated", get(outdated_software))
         .route("/inventory/computer/{name}", get(get_inventory))
         .route("/settings/inventory", put(save_inventory_settings))
         .route("/gpos", get(list_gpos))
@@ -357,6 +360,43 @@ async fn software_computers(State(st): State<St>, Query(q): Query<NameQ>) -> Api
         .map(|(computer, version)| json!({ "computer": computer, "version": version }))
         .collect();
     Ok(Json(json!({ "computers": list })))
+}
+
+/// Every program on every computer (for the CSV export).
+async fn all_software(State(st): State<St>) -> ApiResult {
+    let list: Vec<Value> = st
+        .app
+        .db
+        .all_software()?
+        .into_iter()
+        .map(|(computer, a)| json!({ "computer": computer, "name": a.name, "version": a.version, "publisher": a.publisher }))
+        .collect();
+    Ok(Json(json!({ "software": list })))
+}
+
+#[derive(Deserialize)]
+struct ChangesQ {
+    #[serde(default)]
+    computer: Option<String>,
+    /// Only the last N days (default 30).
+    #[serde(default)]
+    days: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn inventory_changes(State(st): State<St>, Query(q): Query<ChangesQ>) -> ApiResult {
+    let days = q.days.unwrap_or(30).clamp(1, crate::db::CHANGE_HISTORY_DAYS);
+    let since = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let computer = q.computer.as_deref().filter(|c| !c.is_empty());
+    let limit = q.limit.unwrap_or(5000).clamp(1, 20000);
+    let changes = st.app.db.list_inventory_changes(computer, Some(&since), limit + 1)?;
+    let truncated = changes.len() > limit;
+    Ok(Json(json!({ "changes": &changes[..changes.len().min(limit)], "truncated": truncated, "days": days })))
+}
+
+async fn outdated_software(State(st): State<St>) -> ApiResult {
+    Ok(Json(catalog::outdated(&st.app)?))
 }
 
 async fn save_inventory_settings(State(st): State<St>, Json(mut s): Json<inventory::InventorySettings>) -> ApiResult {

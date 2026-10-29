@@ -22,8 +22,9 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::app::App;
-use crate::db::{DeployOptions, TargetSpec, now};
+use crate::db::{DeployOptions, InstalledApp, TargetSpec, now};
 use crate::engine;
+use crate::groups::{cmp_versions, glob, parse_version, version_matches};
 use crate::package::{Package, render};
 use crate::update::{CURRENT, is_newer};
 
@@ -889,9 +890,97 @@ pub fn overview(app: &App) -> Result<Value> {
     }))
 }
 
+/// One catalog app as found in the inventory.
+#[derive(Debug, Clone, Serialize)]
+pub struct Installed {
+    pub computer: String,
+    /// Highest installed version that matches the app's detect name.
+    pub version: String,
+}
+
+/// Split scanned Windows computers that have app `a` into up to date and
+/// outdated, using the same rule as the package's detect check: a computer is
+/// up to date when any matching program has `target` or newer.
+pub fn compare_installed(a: &CatalogApp, target: &str, inventory: &[(String, Vec<InstalledApp>)]) -> (Vec<Installed>, Vec<Installed>) {
+    let (mut current, mut outdated) = (Vec::new(), Vec::new());
+    for (computer, apps) in inventory {
+        let matching: Vec<&InstalledApp> = apps.iter().filter(|x| glob(&a.detect, &x.name)).collect();
+        let Some(best) = matching.iter().max_by(|x, y| cmp_versions(&parse_version(&x.version), &parse_version(&y.version)))
+        else {
+            continue;
+        };
+        let entry = Installed { computer: computer.clone(), version: best.version.clone() };
+        if matching.iter().any(|x| version_matches(&format!(">={target}"), &x.version)) {
+            current.push(entry);
+        } else {
+            outdated.push(entry);
+        }
+    }
+    (current, outdated)
+}
+
+/// Catalog apps installed on scanned Windows computers and which of those
+/// computers have an older version than the latest one.
+pub fn outdated(app: &App) -> Result<Value> {
+    let (list, _) = load(app);
+    let s = settings(app)?;
+    let windows: BTreeSet<i64> = app.db.list_computers()?.into_iter().filter(|c| c.os == "windows").map(|c| c.id).collect();
+    let inventory: Vec<(String, Vec<InstalledApp>)> = app
+        .db
+        .list_inventory(true)?
+        .into_iter()
+        .filter(|i| i.scanned_at.is_some() && windows.contains(&i.computer_id))
+        .map(|i| (i.computer, i.apps))
+        .collect();
+    let mut apps: Vec<Value> = Vec::new();
+    for a in &list {
+        let st = s.apps.get(&a.id).cloned().unwrap_or_default();
+        let package_version = st.current.as_ref().map(|c| c.version.clone());
+        // Without a looked-up latest version, compare with the downloaded one.
+        let target = st.latest.clone().or_else(|| package_version.clone());
+        let (current, outdated) = match &target {
+            Some(t) => compare_installed(a, t, &inventory),
+            // With no known version nothing can be called outdated.
+            None => {
+                let (c, o) = compare_installed(a, "0", &inventory);
+                ([c, o].concat(), vec![])
+            }
+        };
+        if current.is_empty() && outdated.is_empty() {
+            continue;
+        }
+        // The package would install an older version than the latest one.
+        let package_behind = matches!((&st.latest, &package_version), (Some(l), Some(p)) if is_newer(l, p));
+        apps.push(json!({
+            "id": a.id, "name": a.name, "detect": a.detect, "package_id": a.package_id(), "added": st.added,
+            "latest": st.latest, "checked_at": st.checked_at, "package_version": package_version, "package_behind": package_behind,
+            "installed": current.len() + outdated.len(), "current": current, "outdated": outdated,
+        }));
+    }
+    apps.sort_by_key(|v| (std::cmp::Reverse(v["outdated"].as_array().map_or(0, Vec::len)), v["name"].as_str().unwrap_or("").to_lowercase()));
+    Ok(json!({ "last_check": s.last_check, "scanned": inventory.len(), "apps": apps }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compares_installed_versions() {
+        let a: CatalogApp = parse("- id: x\n  name: X\n  detect: Python 3.* (64-bit)\n  version: { github: o/r }\n  installer: { asset: x }\n")
+            .unwrap()
+            .remove(0);
+        let app = |n: &str, v: &str| InstalledApp { name: n.into(), version: v.into(), publisher: String::new() };
+        let inv = vec![
+            ("old".to_string(), vec![app("Python 3.11.4 (64-bit)", "3.11.4150.0")]),
+            // Two side by side: the newer one makes it up to date.
+            ("both".to_string(), vec![app("Python 3.11.4 (64-bit)", "3.11.4150.0"), app("Python 3.13.1 (64-bit)", "3.13.1150.0")]),
+            ("none".to_string(), vec![app("Python Launcher", "3.13.1150.0")]),
+        ];
+        let (current, outdated) = compare_installed(&a, "3.13.1", &inv);
+        assert_eq!(current.iter().map(|i| (i.computer.as_str(), i.version.as_str())).collect::<Vec<_>>(), [("both", "3.13.1150.0")]);
+        assert_eq!(outdated.iter().map(|i| (i.computer.as_str(), i.version.as_str())).collect::<Vec<_>>(), [("old", "3.11.4150.0")]);
+    }
 
     fn fake_download(a: &CatalogApp) -> Download {
         Download {

@@ -175,6 +175,15 @@ enum InventoryCmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Software installed, removed or updated and OS/hardware changes (of one computer or all).
+    Changes {
+        computer: Option<String>,
+        /// Only the last N days.
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+    },
+    /// App catalog programs that are older than the latest version, with the computers that have them.
+    Outdated,
 }
 
 #[derive(Subcommand)]
@@ -751,6 +760,36 @@ async fn inventory_cmd(app: &App, cmd: InventoryCmd) -> Result<()> {
             for (n, version, _publisher, count) in app.db.software_summary()? {
                 if name.as_deref().is_none_or(|p| groups::glob(p, &n)) {
                     println!("{n:<60} {version:<24} {count:>5}");
+                }
+            }
+            Ok(())
+        }
+        InventoryCmd::Changes { computer, days } => {
+            let since = (chrono::Utc::now() - chrono::Duration::days(days.max(1)))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            for c in app.db.list_inventory_changes(computer.as_deref(), Some(&since), 1_000_000)? {
+                let what = match c.kind.as_str() {
+                    "installed" => c.new,
+                    "removed" => c.old,
+                    _ => format!("{} -> {}", c.old, c.new),
+                };
+                println!("{}  {:<24} {:<9} {:<50} {what}", c.at, c.computer, c.kind, c.name);
+            }
+            Ok(())
+        }
+        InventoryCmd::Outdated => {
+            let r = catalog::outdated(app)?;
+            for a in r["apps"].as_array().into_iter().flatten() {
+                let outdated = a["outdated"].as_array().cloned().unwrap_or_default();
+                println!(
+                    "{:<32} latest {:<16} {} of {} computers outdated",
+                    a["name"].as_str().unwrap_or(""),
+                    a["latest"].as_str().unwrap_or("unknown"),
+                    outdated.len(),
+                    a["installed"]
+                );
+                for o in outdated {
+                    println!("    {:<40} {}", o["computer"].as_str().unwrap_or(""), o["version"].as_str().unwrap_or(""));
                 }
             }
             Ok(())
