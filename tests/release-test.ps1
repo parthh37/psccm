@@ -587,14 +587,15 @@ verify:
             $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($WindowsTarget) } } 600
             Assert ($r.Targets[0].status -eq 'skipped') "second run: $($r.Targets[0].status)"
         }
-        Test-Step 'Windows' 'Node.js install / upgrade' {
+        Test-Step 'Windows' 'Uninstall, Node.js MSI install, same version is not reinstalled' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            # The MSI cannot downgrade, so upgrade within whatever major is installed (22 when none is).
-            $chk = Invoke-Deploy @{ command = "`$n = Join-Path `$env:ProgramFiles 'nodejs\node.exe'; if (Test-Path `$n) { 'major=' + ((& `$n -v) -replace '^v(\d+)\..*$', '`$1') } else { 'major=none' }"; targets = @{ computers = @($WindowsTarget) } } 300
-            $major = if ($chk.AllLogs -match 'major=(\d+)') { $Matches[1] } else { '22' }
-            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = $major }; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 1200
-            Assert-Deploy $r 'success' @("v$major.")
-            "Node.js major $major"
+            # Start clean (runner images ship Node.js): this also exercises uninstall-app.
+            $r = Invoke-Deploy @{ package_id = 'uninstall-app'; variables = @{ name = 'Node.js' }; targets = @{ computers = @($WindowsTarget) } } 900
+            if ($r.Targets[0].status -ne 'skipped') { Assert-Deploy $r 'success' @('Uninstalling Node.js') }
+            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = '22' }; targets = @{ computers = @($WindowsTarget) } } 1200
+            Assert-Deploy $r 'success' @('Running: msiexec.exe', '==> Verify', 'v22.')
+            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = '22' }; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 600
+            Assert-Deploy $r 'success' @('is already installed') @('Running: msiexec.exe')
         }
         Test-Step 'Windows' 'IIS install, site deploy with health check, app pool recycle' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }

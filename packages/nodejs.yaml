@@ -57,6 +57,8 @@ steps:
       if (Test-Path $node) {
           $cur = (& $node -v)
           Write-Output "Installed: $cur"
+          # Re-running the same MSI is a "repair" that fails (1603) on some installs.
+          if ($cur -eq $v) { Write-Output "Node.js $v is already installed"; exit 0 }
           if ((ConvertTo-PsccmVersion $cur) -gt (ConvertTo-PsccmVersion $v)) {
               throw "Node.js $cur is newer than $v and the MSI cannot downgrade. Uninstall it first (package 'uninstall-app', name 'Node.js') or deploy a newer version."
           }
@@ -64,7 +66,7 @@ steps:
       $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
       $f = Join-Path '{{workdir}}' "node-$v-$arch.msi"
       Get-PsccmFile -Url "https://nodejs.org/dist/$v/node-$v-$arch.msi" -OutFile $f
-      exit (Install-PsccmMsi -Path $f)
+      exit (Invoke-PsccmMsi -Path $f)
     success_codes: [0, 3010]
   - name: Install Node.js (Linux tarball)
     os: linux

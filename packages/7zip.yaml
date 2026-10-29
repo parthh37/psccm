@@ -21,7 +21,7 @@ steps:
       $v = '{{version}}'.Replace('.', '')
       $f = Join-Path '{{workdir}}' "7z$v-x64.msi"
       Get-PsccmFile -Url "https://www.7-zip.org/a/7z$v-x64.msi" -OutFile $f
-      exit (Install-PsccmMsi -Path $f)
+      exit (Invoke-PsccmMsi -Path $f)
     success_codes: [0, 3010]
   - name: Install 7-Zip package
     os: linux

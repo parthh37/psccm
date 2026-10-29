@@ -56,16 +56,17 @@ function Invoke-PsccmProcess {
     return $p.ExitCode
 }
 
-# Install (/i) or patch (/p) an MSI quietly with a verbose log; returns the exit
-# code and, on failure, prints the log lines that say why.
-function Install-PsccmMsi {
-    param([Parameter(Mandatory)][string]$Path, [string]$Arguments, [string]$Verb = '/i')
-    $log = "$Path.log"
-    $code = Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "$Verb `"$Path`" /qn /norestart /l*v `"$log`" $Arguments"
-    if ($code -notin 0, 3010, 1641 -and (Test-Path $log)) {
-        Write-Host "--- MSI log: $log ---"
-        $lines = @(Get-Content -LiteralPath $log)
-        $hits = @($lines | Select-String -Pattern 'Product: |Error \d{4}|error code \d|later version|newer version' | Select-Object -First 15)
+# Install (/i), patch (/p) or remove (/x, -Path = product code) an MSI quietly
+# with a verbose log; returns the exit code and, on failure, prints the log
+# lines that say why.
+function Invoke-PsccmMsi {
+    param([Parameter(Mandatory)][string]$Path, [string]$Arguments, [string]$Verb = '/i', [string]$Log)
+    if (-not $Log) { $Log = if ($Verb -eq '/x') { Join-Path $env:TEMP "psccm-msi-$($Path.Trim('{}')).log" } else { "$Path.log" } }
+    $code = Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "$Verb `"$Path`" /qn /norestart /l*v `"$Log`" $Arguments"
+    if ($code -notin 0, 3010, 1641 -and (Test-Path $Log)) {
+        Write-Host "--- MSI log: $Log ---"
+        $lines = @(Get-Content -LiteralPath $Log)
+        $hits = @($lines | Select-String -Pattern 'Product: .* -- |Error \d{4}|error code \d|later version|newer version' | Select-Object -First 15)
         if ($hits.Count) { $hits | ForEach-Object { Write-Host $_.Line } } else { $lines | Select-Object -Last 25 | ForEach-Object { Write-Host $_ } }
     }
     return $code
@@ -77,7 +78,7 @@ function Uninstall-App {
     foreach ($a in @(Get-InstalledApp -Name $Name)) {
         Write-Host "Uninstalling $($a.DisplayName) $($a.DisplayVersion)"
         if ($a.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
-            $code = Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "/x $($a.PSChildName) /qn /norestart"
+            $code = Invoke-PsccmMsi -Verb '/x' -Path $a.PSChildName
         } else {
             $exe = ($a.UninstallString -replace '^"([^"]+)".*$', '$1')
             $code = Invoke-PsccmProcess -FilePath $exe -Arguments $ExeArgs

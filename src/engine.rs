@@ -777,8 +777,8 @@ async fn install_script(cx: &StepCx<'_>, inst: &Install, timeout: Duration) -> R
 }
 
 const WIN_INSTALL: &str = r#"switch ([IO.Path]::GetExtension($f).ToLower()) {
-    '.msi' { $code = Install-PsccmMsi -Path $f -Arguments $a }
-    '.msp' { $code = Install-PsccmMsi -Path $f -Arguments $a -Verb '/p' }
+    '.msi' { $code = Invoke-PsccmMsi -Path $f -Arguments $a }
+    '.msp' { $code = Invoke-PsccmMsi -Path $f -Arguments $a -Verb '/p' }
     '.msu' { $code = Invoke-PsccmProcess -FilePath 'wusa.exe' -Arguments "`"$f`" /quiet /norestart $a" }
     default { $code = Invoke-PsccmProcess -FilePath $f -Arguments $a }
 }
