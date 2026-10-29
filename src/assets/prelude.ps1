@@ -1,6 +1,8 @@
 # ---- PSCCM helpers (available in every PowerShell step) ----
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# The console decodes step output as UTF-8.
+try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # Installed programs from the registry (64- and 32-bit), filtered by display name wildcard.
@@ -52,6 +54,21 @@ function Invoke-PsccmProcess {
         $p = Start-Process -FilePath $FilePath -Wait -PassThru -NoNewWindow
     }
     return $p.ExitCode
+}
+
+# Install (/i) or patch (/p) an MSI quietly with a verbose log; returns the exit
+# code and, on failure, prints the log lines that say why.
+function Install-PsccmMsi {
+    param([Parameter(Mandatory)][string]$Path, [string]$Arguments, [string]$Verb = '/i')
+    $log = "$Path.log"
+    $code = Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "$Verb `"$Path`" /qn /norestart /l*v `"$log`" $Arguments"
+    if ($code -notin 0, 3010, 1641 -and (Test-Path $log)) {
+        Write-Host "--- MSI log: $log ---"
+        $lines = @(Get-Content -LiteralPath $log)
+        $hits = @($lines | Select-String -Pattern 'Product: |Error \d{4}|error code \d|later version|newer version' | Select-Object -First 15)
+        if ($hits.Count) { $hits | ForEach-Object { Write-Host $_.Line } } else { $lines | Select-Object -Last 25 | ForEach-Object { Write-Host $_ } }
+    }
+    return $code
 }
 
 # Uninstall every app matching -Name using its MSI product code or uninstall string.

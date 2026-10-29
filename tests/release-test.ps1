@@ -582,15 +582,19 @@ verify:
         }
         Test-Step 'Windows' '7-Zip install, then detect skips' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($WindowsTarget) } } 900
+            $r = Invoke-Deploy @{ package_id = '7zip'; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 900
             Assert-Deploy $r 'success' @('==> Verify')
             $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($WindowsTarget) } } 600
             Assert ($r.Targets[0].status -eq 'skipped') "second run: $($r.Targets[0].status)"
         }
-        Test-Step 'Windows' 'Node.js 22 install' {
+        Test-Step 'Windows' 'Node.js install / upgrade' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = '22' }; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 1200
-            Assert-Deploy $r 'success' @('v22.')
+            # The MSI cannot downgrade, so upgrade within whatever major is installed (22 when none is).
+            $chk = Invoke-Deploy @{ command = "`$n = Join-Path `$env:ProgramFiles 'nodejs\node.exe'; if (Test-Path `$n) { 'major=' + ((& `$n -v) -replace '^v(\d+)\..*$', '`$1') } else { 'major=none' }"; targets = @{ computers = @($WindowsTarget) } } 300
+            $major = if ($chk.AllLogs -match 'major=(\d+)') { $Matches[1] } else { '22' }
+            $r = Invoke-Deploy @{ package_id = 'nodejs'; variables = @{ version = $major }; options = @{ use_detect = $false }; targets = @{ computers = @($WindowsTarget) } } 1200
+            Assert-Deploy $r 'success' @("v$major.")
+            "Node.js major $major"
         }
         Test-Step 'Windows' 'IIS install, site deploy with health check, app pool recycle' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
@@ -702,8 +706,8 @@ verify:
         }
         Test-Step 'Linux' '7-Zip install, then detect skips' {
             if (-not $RealInstalls) { Skip 'run with -RealInstalls' }
-            $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($LinuxTarget) } } 900
-            if ($r.Targets[0].status -ne 'skipped') { Assert-Deploy $r 'success' @('==> Verify') }
+            $r = Invoke-Deploy @{ package_id = '7zip'; options = @{ use_detect = $false }; targets = @{ computers = @($LinuxTarget) } } 900
+            Assert-Deploy $r 'success' @('==> Verify')
             $r = Invoke-Deploy @{ package_id = '7zip'; targets = @{ computers = @($LinuxTarget) } } 600
             Assert ($r.Targets[0].status -eq 'skipped') "second run: $($r.Targets[0].status)"
         }
@@ -730,7 +734,8 @@ frontend fe
 backend web
     server s1 127.0.0.1:9 check
 "@
-            Write-Utf8 (Join-Path $repo 'haproxy/haproxy.cfg') $cfg.Replace("`r`n", "`n")
+            # Deliberately no final newline: the package must cope with that.
+            Write-Utf8 (Join-Path $repo 'haproxy/haproxy.cfg') $cfg.Replace("`r`n", "`n").TrimEnd("`n")
             $r = Invoke-Deploy @{ package_id = 'haproxy-upgrade'; targets = @{ computers = @($LinuxTarget) } } 1800
             Assert-Deploy $r 'success' @('HAProxy version', 'Configuration file is valid')
             $r = Invoke-Deploy @{ package_id = 'haproxy-config'; targets = @{ computers = @($LinuxTarget) } } 600
@@ -774,11 +779,17 @@ backend web
 if ($Setup -and $OnWindows) {
     Test-Step 'Installer' 'Silent uninstall removes the service' {
         $un = Join-Path $env:ProgramFiles 'PSCCM\unins000.exe'
-        $p = Start-Process -FilePath $un -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+        $p = Start-Process -FilePath $un -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru
+        # The uninstaller hands off to a copy of itself in %TEMP%; wait for that too.
+        $deadline = (Get-Date).AddMinutes(5)
+        while ((-not $p.HasExited -or (Get-Process _unins* -ErrorAction SilentlyContinue)) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+        $left = Get-Process _unins* -ErrorAction SilentlyContinue
+        if ($left) { $left | Stop-Process -Force; throw 'uninstaller still running after 5 minutes (waiting on a prompt?)' }
         Assert ($p.ExitCode -eq 0) "uninstaller exit $($p.ExitCode)"
         Start-Sleep -Seconds 3
         Assert (-not (Get-Service PSCCM -ErrorAction SilentlyContinue)) 'service still exists'
         Assert (-not (Test-Path $InstalledExe)) 'psccm.exe still installed'
+        Assert (Test-Path (Join-Path $env:ProgramData 'PSCCM\psccm.db')) 'silent uninstall must keep the data folder'
     }
 }
 

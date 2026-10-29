@@ -53,10 +53,18 @@ steps:
       else { $rel = $index | Where-Object { $_.version -eq "v$($want.TrimStart('v'))" } | Select-Object -First 1 }
       if (-not $rel) { throw "Node.js version '$want' not found on nodejs.org" }
       $v = $rel.version
+      $node = Join-Path $env:ProgramFiles 'nodejs\node.exe'
+      if (Test-Path $node) {
+          $cur = (& $node -v)
+          Write-Output "Installed: $cur"
+          if ((ConvertTo-PsccmVersion $cur) -gt (ConvertTo-PsccmVersion $v)) {
+              throw "Node.js $cur is newer than $v and the MSI cannot downgrade. Uninstall it first (package 'uninstall-app', name 'Node.js') or deploy a newer version."
+          }
+      }
       $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
       $f = Join-Path '{{workdir}}' "node-$v-$arch.msi"
       Get-PsccmFile -Url "https://nodejs.org/dist/$v/node-$v-$arch.msi" -OutFile $f
-      exit (Invoke-PsccmProcess -FilePath 'msiexec.exe' -Arguments "/i `"$f`" /qn /norestart")
+      exit (Install-PsccmMsi -Path $f)
     success_codes: [0, 3010]
   - name: Install Node.js (Linux tarball)
     os: linux

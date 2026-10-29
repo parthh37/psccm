@@ -19,7 +19,12 @@ steps:
       src: "{{source}}"
       dest: "{{config}}.psccm-new"
   - name: Validate new configuration
-    script: haproxy -c -f '{{config}}.psccm-new'
+    script: |
+      f='{{config}}.psccm-new'
+      # Files edited on Windows: drop CRs and add the final newline haproxy insists on.
+      sed -i 's/\r$//' "$f"
+      [ -z "$(tail -c1 "$f")" ] || echo >> "$f"
+      haproxy -c -f "$f"
   - name: Show changes
     continue_on_error: true
     script: |
