@@ -12,7 +12,8 @@ computers without installing an agent, similar to PDQ Deploy.
 - **Computer groups**: static lists or dynamic rules (OS, name pattern, OU, AD security group, tag,
   installed software and version, pending reboot, low disk space).
 - **Inventory**: agentless scans of OS, hardware, disks, logged-on user, pending reboot and installed
-  software, with a software report across all computers.
+  software, with a software report across all computers, outdated App catalog software with one-click
+  update, a change history (installed / removed / updated), uninstall from the report and CSV export.
 - **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
   apply their computer settings directly on chosen computers, with no GPO link or AD change.
 - **Web console** for everyday use, plus a **CLI** for scripts and CI pipelines.
@@ -159,12 +160,27 @@ collects:
 - The **Software** tab lists every program with its versions and how many computers have each. From a
   program you can create a dynamic group of the computers **with** or **without** it, then add a version
   condition (`<130`, `>=22.11`, `!=24.09`, or `22` for any 22.x).
+- **Uninstall from the Software tab**: tick computers in a program's list and choose *Uninstall from
+  selected*. This opens *New deployment* with the *Uninstall a Windows program* package (or, for Linux,
+  *Linux package* with `remove`) and the computers filled in, so you review it before anything runs.
+- The **Outdated** tab compares the programs that each [App catalog](#app-catalog) entry detects on scanned
+  Windows computers with the latest version. *Update N* opens a deployment of the catalog package to the
+  outdated computers; *Add to catalog* downloads the installer first. A computer counts as up to date when
+  any matching program has the latest version or newer, the same rule the package uses to skip computers.
+- The **Changes** tab is a history of what changed between scans: software **installed**, **removed** or
+  **updated** (old → new version) and changes to the OS version and build, kernel, memory, CPU, model,
+  serial number or domain. Each computer's details show its changes for the last year too. History starts
+  at a computer's second scan and is kept for 365 days.
+- **Export CSV** on every tab downloads what the tab shows (with the search and filters applied).
+  *Export every install* on the Software tab gives one row per program per computer. The files open
+  directly in Excel.
 - After a deployment succeeds, the computers it ran on are re-scanned (only computers that were scanned
   before), so software groups see the change. You can turn this off.
 - A failed or offline scan keeps the last good inventory and shows the error.
 
 CLI: `psccm inventory scan [names…]`, `psccm inventory show web01`,
-`psccm inventory software --name "Google Chrome*"`.
+`psccm inventory software --name "Google Chrome*"`, `psccm inventory changes [web01] --days 7`,
+`psccm inventory outdated`.
 
 ## Group Policy (GPO) import and injection
 

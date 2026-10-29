@@ -119,6 +119,17 @@ CREATE TABLE IF NOT EXISTS inventory_apps (
     publisher TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_inv_apps_computer ON inventory_apps(computer_id);
+CREATE TABLE IF NOT EXISTS inventory_changes (
+    id INTEGER PRIMARY KEY,
+    computer_id INTEGER NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    old_value TEXT NOT NULL DEFAULT '',
+    new_value TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_inv_changes_computer ON inventory_changes(computer_id);
+CREATE INDEX IF NOT EXISTS idx_inv_changes_at ON inventory_changes(at);
 "#;
 
 /// Columns added after the first release: (table, column, definition).
@@ -632,13 +643,38 @@ impl Db {
     // --------------------------------------------------------------- inventory
 
     /// Store a successful scan, replacing the computer's previous inventory.
-    /// The OS description is filled in when AD did not provide one.
+    /// The OS description is filled in when AD did not provide one. What
+    /// changed since the previous successful scan goes to the change history.
     pub fn save_inventory(&self, computer_id: i64, scan: &Scan) -> Result<()> {
         let facts = serde_json::to_string(&scan.facts)?;
         let disks = serde_json::to_string(&scan.disks)?;
         let os_detail = scan.facts.get("os_name").cloned();
+        let at = now();
+        let cutoff = (Utc::now() - chrono::Duration::days(CHANGE_HISTORY_DAYS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.with(|c| {
             let tx = c.unchecked_transaction()?;
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT facts FROM inventory WHERE computer_id=?1 AND scanned_at IS NOT NULL",
+                    [computer_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            // The first successful scan is the baseline, not a change.
+            if let Some(old_facts) = previous {
+                let old_facts: BTreeMap<String, String> = serde_json::from_str(&old_facts).unwrap_or_default();
+                let mut st = tx.prepare("SELECT name,version,publisher FROM inventory_apps WHERE computer_id=?1")?;
+                let old_apps: Vec<InstalledApp> =
+                    st.query_map([computer_id], |r| InstalledApp::from_row(r, 0))?.collect::<rusqlite::Result<_>>()?;
+                let mut ins = tx.prepare(
+                    "INSERT INTO inventory_changes(computer_id,at,kind,name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",
+                )?;
+                for ch in crate::inventory::changes(&old_facts, &old_apps, scan) {
+                    ins.execute(params![computer_id, at, ch.kind, ch.name, ch.old, ch.new])?;
+                }
+            }
+            tx.execute("DELETE FROM inventory_changes WHERE computer_id=?1 AND at<?2", params![computer_id, cutoff])?;
             tx.execute(
                 "INSERT INTO inventory(computer_id,scanned_at,last_attempt,status,error,facts,disks) VALUES(?1,?2,?2,'ok',NULL,?3,?4)
                  ON CONFLICT(computer_id) DO UPDATE SET scanned_at=?2, last_attempt=?2, status='ok', error=NULL, facts=?3, disks=?4",
@@ -714,6 +750,40 @@ impl Db {
                  GROUP BY name COLLATE NOCASE, version ORDER BY name COLLATE NOCASE",
             )?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect()
+        })
+    }
+
+    /// Change history, newest first: of one computer or all, since an RFC 3339 time.
+    pub fn list_inventory_changes(&self, computer: Option<&str>, since: Option<&str>, limit: usize) -> Result<Vec<InventoryChange>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT c.name, h.at, h.kind, h.name, h.old_value, h.new_value
+                 FROM inventory_changes h JOIN computers c ON c.id=h.computer_id
+                 WHERE (?1 IS NULL OR c.name=?1) AND (?2 IS NULL OR h.at>=?2)
+                 ORDER BY h.at DESC, h.id LIMIT ?3",
+            )?;
+            st.query_map(params![computer, since, limit as i64], |r| {
+                Ok(InventoryChange {
+                    computer: r.get(0)?,
+                    at: r.get(1)?,
+                    kind: r.get(2)?,
+                    name: r.get(3)?,
+                    old: r.get(4)?,
+                    new: r.get(5)?,
+                })
+            })?
+            .collect()
+        })
+    }
+
+    /// Every installed program on every computer: (computer, app).
+    pub fn all_software(&self) -> Result<Vec<(String, InstalledApp)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT c.name, a.name, a.version, a.publisher FROM inventory_apps a JOIN computers c ON c.id=a.computer_id
+                 ORDER BY c.name COLLATE NOCASE, a.name COLLATE NOCASE",
+            )?;
+            st.query_map([], |r| Ok((r.get(0)?, InstalledApp::from_row(r, 1)?)))?.collect()
         })
     }
 
@@ -1157,6 +1227,22 @@ impl InstalledApp {
     }
 }
 
+/// Inventory changes older than this are deleted.
+pub const CHANGE_HISTORY_DAYS: i64 = 365;
+
+/// One entry of the inventory change history.
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryChange {
+    pub computer: String,
+    pub at: String,
+    /// "installed", "removed", "updated" (software) or "changed" (an OS or hardware fact)
+    pub kind: String,
+    /// Program name, or fact key ("os_build", "ram_mb", ...)
+    pub name: String,
+    pub old: String,
+    pub new: String,
+}
+
 const INVENTORY_SELECT: &str = "SELECT i.*, c.name AS computer,
     (SELECT COUNT(*) FROM inventory_apps a WHERE a.computer_id=i.computer_id) AS app_count
     FROM inventory i JOIN computers c ON c.id=i.computer_id";
@@ -1193,5 +1279,42 @@ impl Inventory {
             app_count: r.get("app_count")?,
             apps: vec![],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_inventory_changes() {
+        let dir = std::env::temp_dir().join(format!("psccm-db-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        db.upsert_computer(&NewComputer { name: "web01".into(), os: Some("windows".into()), ..Default::default() }).unwrap();
+        let id = db.get_computer("web01").unwrap().unwrap().id;
+        let scan = |ram: &str, apps: &[(&str, &str)]| Scan {
+            facts: [("ram_mb".to_string(), ram.to_string())].into(),
+            disks: vec![],
+            apps: apps.iter().map(|(n, v)| InstalledApp { name: n.to_string(), version: v.to_string(), publisher: String::new() }).collect(),
+        };
+        // A failed attempt before the first good scan does not make that scan a change.
+        db.inventory_failed(id, "offline", "unreachable").unwrap();
+        db.save_inventory(id, &scan("8192", &[("Google Chrome", "129.0")])).unwrap();
+        assert!(db.list_inventory_changes(None, None, 100).unwrap().is_empty(), "the first scan is the baseline");
+        db.save_inventory(id, &scan("16384", &[("Google Chrome", "130.0"), ("7-Zip", "24.08")])).unwrap();
+        let got: Vec<(String, String)> =
+            db.list_inventory_changes(Some("WEB01"), None, 100).unwrap().into_iter().map(|c| (c.kind, c.name)).collect();
+        assert_eq!(got.len(), 3);
+        for want in [("changed", "ram_mb"), ("updated", "Google Chrome"), ("installed", "7-Zip")] {
+            assert!(got.contains(&(want.0.to_string(), want.1.to_string())), "{want:?} in {got:?}");
+        }
+        let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(db.list_inventory_changes(None, Some(&future), 100).unwrap().is_empty());
+        assert_eq!(db.all_software().unwrap().len(), 2);
+        db.delete_computers(&[id]).unwrap();
+        assert!(db.list_inventory_changes(None, None, 100).unwrap().is_empty(), "deleted with the computer");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

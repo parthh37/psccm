@@ -1221,7 +1221,67 @@ Object.assign(App, {
 
 // --------------------------------------------------------------- inventory
 
-const IV = { tab: 'computers', q: '', sq: '', filter: '', sw: null };
+const IV = { tab: 'computers', qs: { computers: '', software: '', outdated: '', changes: '' }, filter: '', sw: null, out: null, ch: null, chDays: 30, chKind: '' };
+const INV_TABS = [['computers', 'Computers'], ['software', 'Software'], ['outdated', 'Outdated'], ['changes', 'Changes']];
+const INV_SEARCH = {
+  computers: 'Search name, OS, model, user, IP…', software: 'Search program or publisher…',
+  outdated: 'Search program or computer…', changes: 'Search computer, program, version…',
+};
+const CHANGE_PILL = { installed: 's-success', removed: 's-failed', updated: 's-running', changed: 's-scheduled' };
+
+function csvCell(v) {
+  let s = String(v ?? '');
+  // Excel and LibreOffice run a cell that starts with one of these as a formula.
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** Save rows as a CSV file (UTF-8 with BOM so Excel shows accents). */
+function downloadCsv(name, header, rows) {
+  const text = '﻿' + [header, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  a.download = `psccm-${name}-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/** A computer table with checkboxes (all ticked); read the choice with `pickedComputers`. */
+function pickTable(rows, extraHead = '', extraCell = () => '') {
+  return `<div class="table-wrap" style="max-height:45vh;overflow:auto"><table><thead><tr>
+      <th style="width:30px"><input type="checkbox" checked onclick="$$('input[data-c]', this.closest('table')).forEach((i) => { i.checked = this.checked; })"></th>
+      <th>Computer</th><th>Version</th>${extraHead}</tr></thead><tbody>
+    ${rows.map((r) => `<tr><td><input type="checkbox" checked data-c="${esc(r.computer)}"></td><td><b>${esc(r.computer)}</b></td>
+      <td class="small">${esc(r.version)}</td>${extraCell(r)}</tr>`).join('')}</tbody></table></div>`;
+}
+const pickedComputers = (root) => $$('input[data-c]:checked', root).map((i) => i.dataset.c);
+
+/** Open New deployment with a package, variables and computers filled in, to review and start. */
+async function deployPrefilled(pkgId, computers, vars = {}) {
+  const { packages } = await loadPackages(true);
+  if (!packages.some((p) => p.id === pkgId)) throw new Error(`The package '${pkgId}' is missing (deleted or disabled)`);
+  if (!computers.length) throw new Error('Select at least one computer');
+  Object.assign(W, { mode: 'package', pkg: pkgId, q: '', vars: { ...vars }, computers: new Set(computers), extra: '', when: '' });
+  W.tags.clear();
+  W.groups.clear();
+  location.hash = '#/deploy';
+}
+
+const factLabel = (k) => (FACTS.find(([f]) => f === k) || [k, k])[1];
+
+/** A change's old or new value as shown (memory in GB like elsewhere). */
+const changeValue = (c, v) => (v && c.kind === 'changed' && c.name === 'ram_mb' ? `${(v / 1024).toFixed(1)} GB` : v);
+
+function changeRow(c, withComputer) {
+  const what = c.kind === 'changed' ? esc(factLabel(c.name)) : `<b>${esc(c.name)}</b>`;
+  const [o, n] = [changeValue(c, c.old), changeValue(c, c.new)];
+  return `<tr><td class="small" title="${esc(fmtTime(c.at))}">${ago(c.at)}</td>
+    ${withComputer ? `<td><a href="javascript:void(0)" onclick="App.invShow('${esc(c.computer)}')">${esc(c.computer)}</a></td>` : ''}
+    <td><span class="pill ${CHANGE_PILL[c.kind] || ''}">${esc(c.kind)}</span></td><td>${what}</td>
+    <td class="small">${o ? esc(o) : ''}${o && n ? ' → ' : ''}${n ? esc(n) : ''}</td></tr>`;
+}
 const gbFmt = (b) => (b / 1073741824).toFixed(b < 10737418240 ? 1 : 0) + ' GB';
 const lowDisk = (d) => d.size > 0 && d.free / d.size < 0.1;
 
@@ -1253,6 +1313,7 @@ function pollInventory(el) {
         pollInventory(el);
       } else {
         IV.sw = null;
+        IV.ch = null;
         toast(`Inventory scan finished${r.scan.failed ? ` (${r.scan.failed} not scanned)` : ''}`);
         pageInventory(el);
       }
@@ -1261,13 +1322,15 @@ function pollInventory(el) {
 }
 
 async function pageInventory(el) {
-  const [r, computers] = await Promise.all([GET('/inventory'), GET('/computers')]);
+  const [r, computers, out] = await Promise.all([GET('/inventory'), GET('/computers'), GET('/inventory/outdated').catch(() => null)]);
   const inv = Object.fromEntries(r.inventory.map((i) => [i.computer.toLowerCase(), i]));
   const scanned = r.inventory.filter((i) => i.scanned_at);
+  IV.out = out;
   const n = {
     reboot: scanned.filter((i) => i.facts.pending_reboot === 'true').length,
     disk: scanned.filter((i) => (i.disks || []).some(lowDisk)).length,
     failed: computers.filter((c) => { const i = inv[c.name.toLowerCase()]; return !i || i.status !== 'ok'; }).length,
+    outdated: out ? new Set(out.apps.flatMap((a) => a.outdated.map((o) => o.computer.toLowerCase()))).size : 0,
   };
   const s = r.settings;
   const stat = (key, num, label, color) => `<div class="stat click ${IV.filter === key ? 'on' : ''}" onclick="App.invFilter('${key}')">
@@ -1281,12 +1344,14 @@ async function pageInventory(el) {
       ${stat('reboot', n.reboot, 'Reboot pending', 'var(--warn)')}
       ${stat('disk', n.disk, 'A disk under 10% free', 'var(--bad)')}
       ${stat('failed', n.failed, 'Not scanned or last scan failed', 'var(--bad)')}
+      <div class="stat click ${IV.tab === 'outdated' ? 'on' : ''}" onclick="App.invTab('outdated')">
+        <div class="n" style="color:${n.outdated ? 'var(--warn)' : 'inherit'}">${n.outdated}</div><div class="l">Outdated App catalog software</div></div>
     </div>
     <div class="card"><div class="card-head">
-      <div class="tabs"><button class="${IV.tab === 'computers' ? 'on' : ''}" onclick="App.invTab('computers')">Computers</button>
-        <button class="${IV.tab === 'software' ? 'on' : ''}" onclick="App.invTab('software')">Software</button></div>
-      <input class="search" id="inv-q" placeholder="${IV.tab === 'computers' ? 'Search name, OS, model, user, IP…' : 'Search program or publisher…'}"
-        value="${esc(IV.tab === 'computers' ? IV.q : IV.sq)}" oninput="App.invSearch(this.value)">
+      <div class="tabs">${INV_TABS.map(([k, l]) => `<button class="${IV.tab === k ? 'on' : ''}" onclick="App.invTab('${k}')">${l}</button>`).join('')}</div>
+      <input class="search" id="inv-q" placeholder="${INV_SEARCH[IV.tab]}" value="${esc(IV.qs[IV.tab])}" oninput="App.invSearch(this.value)">
+      <div class="right"><button onclick="App.invExport()" title="Download what this tab shows as a CSV file (opens in Excel)">Export CSV</button>
+        ${IV.tab === 'software' ? '<button onclick="App.invExportAll()" title="One row per program per computer">Export every install</button>' : ''}</div>
     </div><div class="card-body flush" id="inv-body"></div></div>
     <div class="card"><div class="card-head"><h2>Scan settings</h2>
       ${s.last_scan ? `<span class="small muted">Last full scan started ${ago(s.last_scan)}</span>` : ''}</div><div class="card-body">
@@ -1304,17 +1369,42 @@ async function pageInventory(el) {
   await renderInventoryBody();
 }
 
-function renderInventoryBody() {
-  if (IV.tab === 'software') return renderSoftware();
+/** Computers tab rows after the stat filter and search. */
+function inventoryRows() {
   const { computers, inv } = IV.data;
-  const q = IV.q.toLowerCase();
-  const rows = computers.map((c) => ({ c, i: inv[c.name.toLowerCase()] })).filter(({ c, i }) => {
+  const q = IV.qs.computers.toLowerCase();
+  return computers.map((c) => ({ c, i: inv[c.name.toLowerCase()] })).filter(({ c, i }) => {
     const f = (i && i.facts) || {};
     if (IV.filter === 'reboot' && f.pending_reboot !== 'true') return false;
     if (IV.filter === 'disk' && !(i && i.scanned_at && (i.disks || []).some(lowDisk))) return false;
     if (IV.filter === 'failed' && i && i.status === 'ok') return false;
     return !q || [c.name, f.os_name, f.model, f.manufacturer, f.user, f.ip_addresses, f.cpu].some((v) => (v || '').toLowerCase().includes(q));
   });
+}
+
+const softwareRows = () => {
+  const q = IV.qs.software.toLowerCase();
+  return IV.sw.filter((s) => !q || s.name.toLowerCase().includes(q) || (s.publisher || '').toLowerCase().includes(q));
+};
+
+const outdatedRows = () => {
+  const q = IV.qs.outdated.toLowerCase();
+  return IV.out.apps.filter((a) => !q || a.name.toLowerCase().includes(q)
+    || a.outdated.concat(a.current).some((o) => o.computer.toLowerCase().includes(q)));
+};
+
+const changeRows = () => {
+  const q = IV.qs.changes.toLowerCase();
+  return IV.ch.changes.filter((c) => (!IV.chKind || c.kind === IV.chKind)
+    && (!q || [c.computer, c.name, factLabel(c.name), c.old, c.new].some((v) => (v || '').toLowerCase().includes(q))));
+};
+
+function renderInventoryBody() {
+  if (IV.tab === 'software') return renderSoftware();
+  if (IV.tab === 'outdated') return renderOutdated();
+  if (IV.tab === 'changes') return renderChanges();
+  const { computers } = IV.data;
+  const rows = inventoryRows();
   $('#inv-body').innerHTML = !computers.length
     ? '<div class="empty"><b>No computers yet</b>Add computers first, then scan them.</div>'
     : `<div class="table-wrap"><table><thead><tr><th>Computer</th><th>Operating system</th><th>Hardware</th><th>Lowest disk</th>
@@ -1343,8 +1433,7 @@ async function renderSoftware() {
     $('#inv-body').innerHTML = '<div class="empty">Loading…</div>';
     IV.sw = (await GET('/inventory/software')).software;
   }
-  const q = IV.sq.toLowerCase();
-  const list = IV.sw.filter((s) => !q || s.name.toLowerCase().includes(q) || (s.publisher || '').toLowerCase().includes(q));
+  const list = softwareRows();
   const shown = list.slice(0, 500);
   $('#inv-body').innerHTML = !IV.sw.length
     ? '<div class="empty"><b>No software inventory yet</b>Scan computers to see what is installed.</div>'
@@ -1355,6 +1444,76 @@ async function renderSoftware() {
         <td class="num">${s.computers}</td></tr>`).join('')}</tbody></table></div>
       ${list.length > shown.length ? `<div class="empty">Showing ${shown.length} of ${list.length}; refine the search.</div>` : ''}
       ${list.length ? '' : '<div class="empty">No programs match.</div>'}`;
+}
+
+function renderOutdated() {
+  const r = IV.out;
+  if (!r) {
+    $('#inv-body').innerHTML = '<div class="empty">Could not compare with the App catalog.</div>';
+    return;
+  }
+  const list = outdatedRows();
+  const note = r.last_check ? '' : `<div class="card-body small">The latest versions have not been looked up yet.
+    <button onclick="App.invCatalogCheck()">Check for updates</button></div>`;
+  const action = (a, idx) => {
+    if (!a.outdated.length) return '';
+    if (!a.added) return `<button onclick="event.stopPropagation(); App.invCatalogAdd('${esc(a.id)}')" title="Download the installer and create its package">Add to catalog</button>`;
+    if (!a.package_version) return '<span class="small muted">downloading…</span>';
+    return `<button class="primary" onclick="event.stopPropagation(); App.invUpdate(${idx})">Update ${a.outdated.length}</button>`;
+  };
+  $('#inv-body').innerHTML = note + (!r.apps.length
+    ? `<div class="empty"><b>No App catalog programs found</b>None of the ${r.scanned} scanned Windows computers has a program from the App catalog.</div>`
+    : `<div class="table-wrap"><table><thead><tr><th>Program</th><th>Latest</th><th>Package installs</th><th>Up to date</th><th>Outdated</th><th></th></tr></thead><tbody>
+      ${list.map((a) => {
+        const idx = r.apps.indexOf(a);
+        const versions = [...new Set(a.outdated.map((o) => o.version || '?'))];
+        return `<tr class="click" onclick="App.invOutdated(${idx})">
+          <td><b>${esc(a.name)}</b>${versions.length ? `<div class="small muted">has ${versions.slice(0, 4).map(esc).join(', ')}${versions.length > 4 ? ` +${versions.length - 4} more` : ''}</div>` : ''}</td>
+          <td>${a.latest ? esc(a.latest) : '<span class="muted">unknown</span>'}</td>
+          <td class="small">${!a.added ? '<span class="muted">not added</span>' : a.package_version
+            ? `${esc(a.package_version)}${a.package_behind ? ' <span class="pill s-partial" title="Update the app on the App catalog page to install the latest version">older than latest</span>' : ''}` : '<span class="muted">downloading…</span>'}</td>
+          <td class="num">${a.current.length}</td>
+          <td class="num">${a.outdated.length ? `<b class="err">${a.outdated.length}</b>` : '0'}</td>
+          <td style="text-align:right">${action(a, idx)}</td></tr>`;
+      }).join('')}</tbody></table></div>
+      ${list.length ? '' : '<div class="empty">Nothing matches.</div>'}
+      <div class="card-body small muted">Compares the programs found by each App catalog entry's name pattern on scanned Windows computers with the latest version.
+        A computer counts as up to date when any matching program has that version or newer, the same rule the package uses to skip computers.</div>`);
+}
+
+async function renderChanges() {
+  if (!IV.ch) {
+    $('#inv-body').innerHTML = '<div class="empty">Loading…</div>';
+    IV.ch = await GET(`/inventory/changes?days=${IV.chDays}`);
+  }
+  const list = changeRows();
+  const shown = list.slice(0, 1000);
+  const kinds = [['', 'All'], ['installed', 'Installed'], ['removed', 'Removed'], ['updated', 'Updated'], ['changed', 'OS / hardware']];
+  $('#inv-body').innerHTML = `<div class="card-body" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <select style="width:auto" onchange="App.invChDays(+this.value)">
+        ${[7, 30, 90, 365].map((d) => `<option value="${d}" ${IV.chDays === d ? 'selected' : ''}>Last ${d} days</option>`).join('')}</select>
+      <div class="chips">${kinds.map(([k, l]) => `<span class="chip ${IV.chKind === k ? 'on' : ''}" onclick="App.invChKind('${k}')">${l}</span>`).join('')}</div>
+      <span class="small muted">${list.length} change${list.length === 1 ? '' : 's'}${IV.ch.truncated ? ' (only the newest are loaded)' : ''}</span></div>
+    ${!IV.ch.changes.length
+      ? `<div class="empty"><b>No changes in the last ${IV.chDays} days</b>Changes are recorded from a computer's second scan on: software installed, removed or updated, and OS, memory or hardware changes.</div>`
+      : `<div class="table-wrap"><table><thead><tr><th>When</th><th>Computer</th><th>Change</th><th>Program or item</th><th>Version / value</th></tr></thead><tbody>
+        ${shown.map((c) => changeRow(c, true)).join('')}</tbody></table></div>
+        ${list.length > shown.length ? `<div class="empty">Showing ${shown.length} of ${list.length}; refine the search or export the rest.</div>` : ''}
+        ${list.length ? '' : '<div class="empty">No changes match.</div>'}`}`;
+}
+
+/** Which uninstall package fits the computers, and its variables. */
+function uninstallPlan(name, computers) {
+  const os = new Set(computers.map((n) => (IV.data.computers.find((c) => c.name.toLowerCase() === n.toLowerCase()) || {}).os));
+  os.delete('unknown');
+  os.delete(undefined);
+  if (os.size > 1) throw new Error('Select only Windows or only Linux computers: they are uninstalled with different packages');
+  if (os.has('linux')) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9.+_:-]*$/.test(name)) throw new Error(`'${name}' is not a package name the package manager can remove`);
+    return { pkg: 'linux-package', vars: { packages: name, action: 'remove' } };
+  }
+  // ' ends the PowerShell string; [ ] and ` are -like wildcards: match any character there instead.
+  return { pkg: 'uninstall-app', vars: { name: name.replace(/['[\]`]/g, '?') } };
 }
 
 const FACTS = [
@@ -1375,7 +1534,75 @@ function factValue(k, v) {
 Object.assign(App, {
   invTab(t) { IV.tab = t; route(); },
   invFilter(f) { IV.filter = IV.filter === f ? '' : f; IV.tab = 'computers'; route(); },
-  invSearch(v) { if (IV.tab === 'computers') IV.q = v; else IV.sq = v; renderInventoryBody(); },
+  invSearch(v) { IV.qs[IV.tab] = v; renderInventoryBody(); },
+  invChDays(d) { IV.chDays = d; IV.ch = null; renderInventoryBody(); },
+  invChKind(k) { IV.chKind = k; renderInventoryBody(); },
+  invExport: act(async () => {
+    if (IV.tab === 'computers') {
+      const keys = ['os_name', 'os_version', 'os_build', 'kernel', 'arch', 'manufacturer', 'model', 'serial', 'cpu', 'cpu_count', 'ram_mb',
+        'domain', 'user', 'ip_addresses', 'last_boot', 'pending_reboot', 'last_patch', 'last_patch_id'];
+      downloadCsv('computers', ['Computer', 'OS', ...keys.map(factLabel), 'Disks', 'Programs', 'Scanned', 'Last attempt', 'Status', 'Error'],
+        inventoryRows().map(({ c, i }) => {
+          const f = (i && i.facts) || {};
+          const disks = ((i && i.disks) || []).map((d) => `${d.mount} ${gbFmt(d.free)} free of ${gbFmt(d.size)}`).join('; ');
+          return [c.name, osLabel(c.os), ...keys.map((k) => f[k]), disks, i && i.scanned_at ? i.app_count : '',
+            i ? fmtTime(i.scanned_at) : '', i ? fmtTime(i.last_attempt) : '', i ? i.status : 'never scanned', (i && i.error) || ''];
+        }));
+    } else if (IV.tab === 'software') {
+      if (!IV.sw) IV.sw = (await GET('/inventory/software')).software;
+      downloadCsv('software', ['Program', 'Publisher', 'Version', 'Computers'],
+        softwareRows().flatMap((s) => s.versions.map((v) => [s.name, s.publisher, v.version, v.computers])));
+    } else if (IV.tab === 'outdated') {
+      if (!IV.out) throw new Error('Nothing to export');
+      downloadCsv('outdated', ['Program', 'Computer', 'Installed version', 'Latest version', 'Up to date'],
+        outdatedRows().flatMap((a) => [...a.outdated.map((o) => [a.name, o.computer, o.version, a.latest, 'no']),
+          ...a.current.map((o) => [a.name, o.computer, o.version, a.latest, a.latest ? 'yes' : ''])]));
+    } else {
+      if (!IV.ch) IV.ch = await GET(`/inventory/changes?days=${IV.chDays}`);
+      downloadCsv('changes', ['Time', 'Computer', 'Change', 'Program or item', 'Old', 'New'],
+        changeRows().map((c) => [fmtTime(c.at), c.computer, c.kind, c.kind === 'changed' ? factLabel(c.name) : c.name,
+          changeValue(c, c.old), changeValue(c, c.new)]));
+    }
+  }),
+  invExportAll: act(async () => {
+    const r = await GET('/inventory/software/all');
+    downloadCsv('installed-software', ['Computer', 'Program', 'Version', 'Publisher'], r.software.map((a) => [a.computer, a.name, a.version, a.publisher]));
+  }),
+  invOutdated(idx) {
+    const a = IV.out.apps[idx];
+    const canDeploy = a.added && a.package_version;
+    modal(a.name, `
+      <div class="small muted" style="margin-bottom:10px">Latest version ${a.latest ? `<b>${esc(a.latest)}</b>` : 'unknown'}${a.checked_at ? ` (looked up ${ago(a.checked_at)})` : ''}.
+        ${!a.added ? 'This app is not added to the App catalog yet, so there is no package to deploy.'
+          : a.package_version ? `The package <code>${esc(a.package_id)}</code> installs ${esc(a.package_version)}${a.package_behind ? ': update the app on the App catalog page first to install the latest version' : ''}.`
+            : 'The installer is still downloading.'}</div>
+      ${a.outdated.length ? `<div class="cat">Outdated (${a.outdated.length})</div>${pickTable(a.outdated)}` : ''}
+      ${a.current.length ? `<div class="cat">${a.latest ? 'Up to date' : 'Installed'} (${a.current.length})</div>
+        <div class="table-wrap" style="max-height:25vh;overflow:auto"><table><tbody>
+        ${a.current.map((o) => `<tr><td><b>${esc(o.computer)}</b></td><td class="small">${esc(o.version)}</td></tr>`).join('')}</tbody></table></div>` : ''}`,
+    [
+      { label: 'Close' },
+      ...(a.outdated.length && !a.added ? [{ label: 'Add to catalog', onClick: () => App.invCatalogAdd(a.id) }] : []),
+      ...(a.outdated.length && canDeploy ? [{
+        label: 'Update selected…', cls: 'primary',
+        onClick: async (root) => { await deployPrefilled(a.package_id, pickedComputers(root)); },
+      }] : []),
+    ], { wide: true });
+  },
+  invUpdate: act(async (idx) => {
+    const a = IV.out.apps[idx];
+    await deployPrefilled(a.package_id, a.outdated.map((o) => o.computer));
+  }),
+  invCatalogAdd: act(async (id) => {
+    await POST(`/catalog/${encodeURIComponent(id)}/add`);
+    toast('Downloading the installer. Update the computers from Inventory → Outdated once it is ready.');
+    location.hash = '#/catalog';
+  }),
+  invCatalogCheck: act(async () => {
+    await POST('/catalog/check');
+    toast('Looking up the latest versions…');
+    location.hash = '#/catalog';
+  }),
   invScan: act(async (names) => {
     const r = await POST('/inventory/scan', { names: names || null });
     toast(`Scanning ${r.started} computer(s)…`);
@@ -1388,8 +1615,10 @@ Object.assign(App, {
     toast('Saved');
   }),
   invShow: act(async (name) => {
-    let i;
-    try { i = await GET('/inventory/computer/' + encodeURIComponent(name)); } catch { i = null; }
+    const [i, ch] = await Promise.all([
+      GET('/inventory/computer/' + encodeURIComponent(name)).catch(() => null),
+      GET(`/inventory/changes?days=365&limit=300&computer=${encodeURIComponent(name)}`).catch(() => ({ changes: [] })),
+    ]);
     const scanBtn = { label: 'Scan now', cls: 'primary', onClick: async () => { await App.invScan([name]); } };
     if (!i) {
       modal(name, '<p class="muted">This computer has not been scanned yet.</p>', [{ label: 'Close' }, scanBtn]);
@@ -1409,7 +1638,11 @@ Object.assign(App, {
       <input class="search" id="inv-apps-q" placeholder="Filter…" style="margin-bottom:8px">
       <div class="table-wrap" style="max-height:40vh;overflow:auto"><table><thead><tr><th>Program</th><th>Version</th><th>Publisher</th></tr></thead><tbody>
         ${i.apps.map((a) => `<tr data-q="${esc((a.name + ' ' + a.publisher).toLowerCase())}"><td>${esc(a.name)}</td><td class="small">${esc(a.version)}</td>
-          <td class="small muted">${esc(a.publisher)}</td></tr>`).join('')}</tbody></table></div>`,
+          <td class="small muted">${esc(a.publisher)}</td></tr>`).join('')}</tbody></table></div>
+      <div class="cat">Changes in the last year (${ch.changes.length}${ch.truncated ? '+' : ''})</div>
+      ${ch.changes.length ? `<div class="table-wrap" style="max-height:30vh;overflow:auto"><table><tbody>
+        ${ch.changes.map((c) => changeRow(c, false)).join('')}</tbody></table></div>`
+        : '<div class="small muted">No changes recorded. Changes are recorded from the second scan on.</div>'}`,
     [{ label: 'Close' }, scanBtn], { wide: true });
     $('#inv-apps-q', m.root).oninput = (e) => {
       const q = e.target.value.toLowerCase();
@@ -1428,12 +1661,25 @@ Object.assign(App, {
         }), 0);
       },
     });
+    const uninstall = {
+      label: 'Uninstall from selected…', cls: 'danger',
+      onClick: async (root) => {
+        const picked = pickedComputers(root);
+        if (!picked.length) throw new Error('Select at least one computer');
+        const plan = uninstallPlan(s.name, picked);
+        await deployPrefilled(plan.pkg, picked, plan.vars);
+      },
+    };
+    const exportCsv = {
+      label: 'Export CSV',
+      onClick: () => { downloadCsv('software-computers', ['Program', 'Computer', 'Version'], r.computers.map((c) => [s.name, c.computer, c.version])); return false; },
+    };
     modal(s.name, `
       <div class="small muted" style="margin-bottom:10px">${esc(s.publisher || '')} · installed on ${r.computers.length} computer(s).
-        Groups made here are dynamic: add a version condition (e.g. <code>&lt;130</code>) to find outdated copies.</div>
-      <div class="table-wrap" style="max-height:50vh;overflow:auto"><table><thead><tr><th>Computer</th><th>Version</th></tr></thead><tbody>
-        ${r.computers.map((c) => `<tr><td><b>${esc(c.computer)}</b></td><td class="small">${esc(c.version)}</td></tr>`).join('')}</tbody></table></div>`,
-    [group(true), group(false), { label: 'Close' }], { wide: true });
+        Groups made here are dynamic: add a version condition (e.g. <code>&lt;130</code>) to find outdated copies.
+        <i>Uninstall</i> opens a deployment to review before anything runs.</div>
+      ${pickTable(r.computers)}`,
+    [group(true), group(false), exportCsv, uninstall, { label: 'Close' }], { wide: true });
   }),
 });
 

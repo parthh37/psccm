@@ -144,7 +144,7 @@ pub fn parse_version(s: &str) -> Vec<u64> {
     run.split('.').map_while(|p| p.parse().ok()).collect()
 }
 
-fn cmp_versions(a: &[u64], b: &[u64]) -> Ordering {
+pub fn cmp_versions(a: &[u64], b: &[u64]) -> Ordering {
     let n = a.len().max(b.len());
     (0..n)
         .map(|i| a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)))
