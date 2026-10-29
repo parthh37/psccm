@@ -26,14 +26,17 @@ computers without installing an agent, similar to PDQ Deploy.
   batches and steps delegated to another host (e.g. drain HAProxy while patching IIS).
 - **App catalog**: 7-Zip, Chrome, Firefox, Node.js, Python, Java, VS Code, Git and more at
   their latest version, downloaded once, checksum-verified and kept up to date automatically.
+- **Microsoft 365 Apps, new Teams and Store / MSIX apps**: Office through the Office Deployment
+  Tool, Teams through Microsoft's bootstrapper, and any `.msix`/`.appx` provisioned for all users.
+  Store apps show up in inventory and can be uninstalled from it.
 - **Windows installer** (Inno Setup) that runs PSCCM as a service, plus **auto-update** from
   GitHub releases (SHA-256 verified).
 
-Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, IIS
-install, IIS site deploy, IIS app-pool recycle, IIS zero-downtime deploy behind HAProxy,
-HAProxy install/upgrade, HAProxy config deploy, HAProxy drain/ready, generic MSI/EXE
-install, Windows uninstall, Windows Update, Linux package install/remove/upgrade, Linux full update,
-and reboot.
+Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, Microsoft 365
+Apps (Office), Microsoft Teams (new), IIS install, IIS site deploy, IIS app-pool recycle, IIS
+zero-downtime deploy behind HAProxy, HAProxy install/upgrade, HAProxy config deploy, HAProxy
+drain/ready, generic MSI/EXE/MSIX install, Windows uninstall, Windows Update, Linux package
+install/remove/upgrade, Linux full update, and reboot.
 
 ## Why not Ansible?
 
@@ -159,7 +162,7 @@ collects:
 | Hardware | manufacturer, model, serial number, CPU, logical CPUs, memory | the same, from `/sys/class/dmi` and `/proc` |
 | State | last boot, logged-on user, IPv4 addresses, domain, reboot pending (CBS, Windows Update, rename) | last boot, logged-on users, IPv4 addresses, reboot pending (`/var/run/reboot-required`, `needs-restarting`) |
 | Disks | fixed drives: size, free space, file system | mounted file systems (no tmpfs/overlay) |
-| Software | *Programs and Features* (64- and 32-bit, no system components or updates) | `dpkg` or `rpm` packages |
+| Software | *Programs and Features* (64- and 32-bit, no system components or updates) and Store / MSIX apps for any user or provisioned | `dpkg` or `rpm` packages |
 
 - **Scan all computers** or *Scan now* on one computer. Set *Scan all computers every N hours* for a
   periodic scan (off by default).
@@ -361,6 +364,36 @@ and `installer: { url: https://.../{{version}}/setup.msi }` (also `{{version_nod
 CLI: `psccm catalog list`, `psccm catalog add 7zip google-chrome`, `psccm catalog update`,
 `psccm catalog check`. (The CLI downloads but does not auto-deploy; the console's daily check does.)
 
+## Microsoft 365 Apps, Teams and Store apps
+
+- **Microsoft 365 Apps (Office)** — package `microsoft-365-apps`. Downloads the Office Deployment
+  Tool (checked to be Microsoft-signed), writes a `configuration.xml` from the package settings
+  (product, channel, 32/64-bit, languages, apps to leave out, shared computer activation, remove MSI
+  Office) and runs `setup.exe /configure`. Use your own file from
+  [config.office.com](https://config.office.com) by putting it in the repository and naming it in
+  *Configuration file*. Office comes from the Microsoft CDN, or from a share made with
+  `setup.exe /download` (*Source path*) to save bandwidth. Computers that already have the product
+  are skipped.
+- **Microsoft Teams (new)** — package `microsoft-teams`. Runs Microsoft's `teamsbootstrapper.exe -p`,
+  which provisions Teams for every user (they get it at their next sign-in). Put `MSTeams-x64.msix`
+  in the repository and name it in *MSIX file* to install without each computer downloading 280 MB.
+- **Any Store / MSIX app** — package `install-msix`, or an `install:` step with an `.msix`,
+  `.msixbundle`, `.appx` or `.appxbundle`. The package is provisioned for all users with
+  `Add-AppxProvisionedPackage` (a plain `Add-AppxPackage` over WinRM would only install it for the
+  deployment account). Get the files for a Store app with
+  `winget download --id <id> --source msstore`. Dependencies (VCLibs, UI.Xaml) go in a `.zip`, and
+  the ones for other processor types are left out.
+- **Inventory and uninstall.** Scans list Store / MSIX apps installed for any user or provisioned,
+  except frameworks and Windows system apps, so they work in software groups and the Software tab.
+  *Uninstall from selected* (package `uninstall-app`) removes them for all users and from the
+  provisioned apps. It removes Microsoft 365 Apps silently too. The first scan that reads Store
+  apps does not count them as newly installed, and a scan that cannot read them keeps the previous
+  ones.
+
+Installing straight from the Microsoft Store (`winget install --source msstore`) is not used.
+winget is a per-user app that is often missing from WinRM sessions, and the msstore source needs
+a signed-in user to accept its terms.
+
 ---
 
 ## Deploy options
@@ -485,8 +518,9 @@ rollback:                  # runs (best effort) when a step or verify fails
 `continue_on_error` and `delegate_to`.
 
 **Install** on Windows: `.msi` runs `msiexec /i … /qn /norestart /l*v` (the MSI log tail is shown on
-failure), `.msp` runs `msiexec /p`, `.msu` runs `wusa /quiet /norestart`, and anything else is executed
-with `args`. On Linux: `.deb` uses `apt-get install`, `.rpm` uses `dnf/yum install`, and `.sh/.run`
+failure), `.msp` runs `msiexec /p`, `.msu` runs `wusa /quiet /norestart`, `.msix`/`.msixbundle`/`.appx`/
+`.appxbundle` are provisioned for all users (`args`: dependency packages, folders or `.zip`s and an
+optional license `.xml`, separated by `;`), and anything else is executed with `args`. On Linux: `.deb` uses `apt-get install`, `.rpm` uses `dnf/yum install`, and `.sh/.run`
 runs with bash.
 
 **Built-in variables:** `{{host}}`, `{{host_short}}` (first DNS label), `{{os}}`, `{{workdir}}` (a temp
@@ -497,11 +531,13 @@ folder on the target, removed afterwards) and `{{deployment_id}}`. Variable defa
 
 PowerShell:
 
-- `Get-InstalledApp -Name 'Chrome*'`
+- `Get-InstalledApp -Name 'Chrome*'` (registry programs and Store / MSIX apps; `-NoStore` for the registry only)
+- `Get-InstalledAppx -Name 'MSTeams'` (Store / MSIX apps by display or package name)
 - `Test-AppInstalled -Name 'X*' -MinVersion 1.2`
 - `ConvertTo-PsccmVersion`
 - `Get-PsccmFile -Url -OutFile`
 - `Invoke-PsccmProcess -FilePath -Arguments` (returns the exit code)
+- `Install-PsccmAppx -Path x.msix -Arguments 'deps.zip'` (provision for all users; returns 0 or 1)
 - `Uninstall-App -Name 'X*'`
 
 Scripts run with `$ErrorActionPreference = 'Stop'`, and the last native exit code is the step result.
@@ -518,7 +554,9 @@ bash (runs with `set -eo pipefail`):
 | Job | Package | Tip |
 |---|---|---|
 | Common apps, always current | *App catalog* → Add, then Auto-deploy to a group | New versions are downloaded daily and rolled out; PCs that have it are skipped. |
-| New utility on all PCs | `7zip`, `google-chrome`, `notepad-plus-plus`, `install-msi`, `install-exe` | Target an AD tag; detect skips machines that already have it. |
+| New utility on all PCs | `7zip`, `google-chrome`, `notepad-plus-plus`, `install-msi`, `install-exe`, `install-msix` | Target an AD tag; detect skips machines that already have it. |
+| Office on new PCs | `microsoft-365-apps` | *Source path* on a local share saves each PC downloading ~3 GB. |
+| Move to the new Teams | `microsoft-teams`, then `uninstall-app` with `Teams Machine-Wide Installer` | Users get the new Teams at their next sign-in. |
 | Node.js upgrade | `nodejs` (`version` = `lts`, `22`, or `22.11.0`) | Set `restart_services` to restart your Node services. |
 | IIS server build | `iis-install` | `reboot_if_needed: yes` to finish in one go. |
 | Website release | `iis-site-deploy` | Zip in `repository\web\`; backups kept next to the site folder. |

@@ -1,0 +1,68 @@
+id: install-msix
+name: Install any MSIX / Appx (from repository)
+category: Generic
+description: >-
+  Push an .msix, .msixbundle, .appx or .appxbundle from the repository and provision it for every
+  user: current users get the app at their next sign-in, new users at their first. Use it for Store
+  apps you have the package for (e.g. from "winget download --id <id> --source msstore"): Company
+  Portal, Windows Terminal, App Installer... Put dependency packages (VCLibs, UI.Xaml) in a .zip.
+platforms: [windows]
+variables:
+  file:
+    required: true
+    description: Package path inside the repository, e.g. apps/CompanyPortal.msixbundle
+  dependencies:
+    default: ""
+    description: >-
+      Optional dependency package, or a .zip of them, in the repository (packages for other
+      processor types are left out)
+  license:
+    default: ""
+    description: Optional license .xml in the repository; without one the license check is skipped
+  detect_name:
+    default: ""
+    description: >-
+      Optional app or package name (wildcards ok, e.g. Microsoft.CompanyPortal) used to skip
+      computers that have it
+  detect_version:
+    default: ""
+    description: Optional minimum version for the detect check
+detect:
+  windows: |
+    $name = '{{detect_name}}'
+    if (-not $name) { exit 1 }
+    if (Test-AppInstalled -Name $name -MinVersion '{{detect_version}}') { exit 0 }
+    exit 1
+steps:
+  - name: Copy {{file}}
+    copy:
+      src: "{{file}}"
+      dest: '{{workdir}}\package\{{file}}'
+  - name: Copy dependencies
+    when: |
+      if ('{{dependencies}}') { exit 0 }
+      exit 1
+    copy:
+      src: "{{dependencies}}"
+      dest: '{{workdir}}\dependencies\{{dependencies}}'
+  - name: Copy license
+    when: |
+      if ('{{license}}') { exit 0 }
+      exit 1
+    copy:
+      src: "{{license}}"
+      dest: '{{workdir}}\license\{{license}}'
+  - name: Provision the package for all users
+    script: |
+      $extra = @()
+      if ('{{dependencies}}') { $extra += Join-Path '{{workdir}}' 'dependencies\{{dependencies}}' }
+      if ('{{license}}') { $extra += Join-Path '{{workdir}}' 'license\{{license}}' }
+      $code = Install-PsccmAppx -Path (Join-Path '{{workdir}}' 'package\{{file}}') -Arguments ($extra -join ';')
+      exit $code
+verify:
+  windows: |
+    $name = '{{detect_name}}'
+    if (-not $name) { exit 0 }
+    if (Test-AppInstalled -Name $name -MinVersion '{{detect_version}}') { exit 0 }
+    Write-Output "$name is not installed"
+    exit 1

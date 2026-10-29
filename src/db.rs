@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -211,6 +211,8 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("computers", "ad_groups", "TEXT NOT NULL DEFAULT ''"),
     ("schedules", "week", "INTEGER NOT NULL DEFAULT 2"),
     ("schedules", "offset_days", "INTEGER NOT NULL DEFAULT 0"),
+    // 1 = a Store / MSIX app (Scan::store_apps).
+    ("inventory_apps", "store", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 pub fn now() -> String {
@@ -939,7 +941,6 @@ impl Db {
     /// The OS description is filled in when AD did not provide one. What
     /// changed since the previous successful scan goes to the change history.
     pub fn save_inventory(&self, computer_id: i64, scan: &Scan) -> Result<()> {
-        let facts = serde_json::to_string(&scan.facts)?;
         let disks = serde_json::to_string(&scan.disks)?;
         let os_detail = scan.facts.get("os_name").cloned();
         let at = now();
@@ -954,19 +955,34 @@ impl Db {
                     |r| r.get(0),
                 )
                 .optional()?;
+            let mut scan = std::borrow::Cow::Borrowed(scan);
             // The first successful scan is the baseline, not a change.
             if let Some(old_facts) = previous {
                 let old_facts: BTreeMap<String, String> = serde_json::from_str(&old_facts).unwrap_or_default();
-                let mut st = tx.prepare("SELECT name,version,publisher FROM inventory_apps WHERE computer_id=?1")?;
-                let old_apps: Vec<InstalledApp> =
-                    st.query_map([computer_id], |r| InstalledApp::from_row(r, 0))?.collect::<rusqlite::Result<_>>()?;
+                let mut st = tx.prepare("SELECT name,version,publisher,store FROM inventory_apps WHERE computer_id=?1")?;
+                let old_apps: Vec<(InstalledApp, bool)> = st
+                    .query_map([computer_id], |r| Ok((InstalledApp::from_row(r, 0)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                // Reading the Store apps failed this time: keep the ones from before.
+                if !scan.facts.contains_key(STORE_APPS_FACT)
+                    && let Some(n) = old_facts.get(STORE_APPS_FACT)
+                {
+                    let s = scan.to_mut();
+                    s.facts.insert(STORE_APPS_FACT.into(), n.clone());
+                    for (a, _) in old_apps.iter().filter(|(_, store)| *store) {
+                        s.store_apps.insert(a.name.to_lowercase());
+                        s.apps.push(a.clone());
+                    }
+                }
+                let old_apps: Vec<InstalledApp> = old_apps.into_iter().map(|(a, _)| a).collect();
                 let mut ins = tx.prepare(
                     "INSERT INTO inventory_changes(computer_id,at,kind,name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",
                 )?;
-                for ch in crate::inventory::changes(&old_facts, &old_apps, scan) {
+                for ch in crate::inventory::changes(&old_facts, &old_apps, &scan) {
                     ins.execute(params![computer_id, at, ch.kind, ch.name, ch.old, ch.new])?;
                 }
             }
+            let facts = serde_json::to_string(&scan.facts).unwrap_or_default();
             tx.execute("DELETE FROM inventory_changes WHERE computer_id=?1 AND at<?2", params![computer_id, cutoff])?;
             tx.execute(
                 "INSERT INTO inventory(computer_id,scanned_at,last_attempt,status,error,facts,disks) VALUES(?1,?2,?2,'ok',NULL,?3,?4)
@@ -975,9 +991,12 @@ impl Db {
             )?;
             tx.execute("DELETE FROM inventory_apps WHERE computer_id=?1", [computer_id])?;
             {
-                let mut st = tx.prepare("INSERT INTO inventory_apps(computer_id,name,version,publisher) VALUES(?1,?2,?3,?4)")?;
+                let mut st = tx.prepare(
+                    "INSERT INTO inventory_apps(computer_id,name,version,publisher,store) VALUES(?1,?2,?3,?4,?5)",
+                )?;
                 for a in &scan.apps {
-                    st.execute(params![computer_id, a.name, a.version, a.publisher])?;
+                    let store = scan.store_apps.contains(&a.name.to_lowercase());
+                    st.execute(params![computer_id, a.name, a.version, a.publisher, store])?;
                 }
             }
             tx.execute(
@@ -1731,7 +1750,14 @@ pub struct Scan {
     pub facts: BTreeMap<String, String>,
     pub disks: Vec<Disk>,
     pub apps: Vec<InstalledApp>,
+    /// Lower-case names of the `apps` that are Store / MSIX apps.
+    #[serde(default)]
+    pub store_apps: BTreeSet<String>,
 }
+
+/// Fact set when a scan read the Store / MSIX apps (their count). Without it the
+/// scan could not read them, which is not the same as none being installed.
+pub const STORE_APPS_FACT: &str = "store_apps";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Disk {
@@ -1847,6 +1873,7 @@ mod tests {
             facts: [("ram_mb".to_string(), ram.to_string())].into(),
             disks: vec![],
             apps: apps.iter().map(|(n, v)| InstalledApp { name: n.to_string(), version: v.to_string(), publisher: String::new() }).collect(),
+            ..Default::default()
         };
         // A failed attempt before the first good scan does not make that scan a change.
         db.inventory_failed(id, "offline", "unreachable").unwrap();
@@ -1859,6 +1886,23 @@ mod tests {
         for want in [("changed", "ram_mb"), ("updated", "Google Chrome"), ("installed", "7-Zip")] {
             assert!(got.contains(&(want.0.to_string(), want.1.to_string())), "{want:?} in {got:?}");
         }
+        assert_eq!(db.all_software().unwrap().len(), 2);
+        // The first scan that reads Store apps is their baseline...
+        let mut with_store = scan("16384", &[("Google Chrome", "130.0"), ("7-Zip", "24.08"), ("Microsoft Teams", "25.1")]);
+        with_store.store_apps.insert("microsoft teams".into());
+        with_store.facts.insert(STORE_APPS_FACT.into(), "1".into());
+        db.save_inventory(id, &with_store).unwrap();
+        assert_eq!(db.list_inventory_changes(None, None, 100).unwrap().len(), 3);
+        // ...and a scan that could not read them keeps them instead of reporting them removed.
+        db.save_inventory(id, &scan("16384", &[("Google Chrome", "130.0"), ("7-Zip", "24.08")])).unwrap();
+        assert_eq!(db.list_inventory_changes(None, None, 100).unwrap().len(), 3);
+        assert_eq!(db.all_software().unwrap().len(), 3);
+        // Once read again, a Store app that is gone is a removal.
+        let mut store_read = scan("16384", &[("Google Chrome", "130.0"), ("7-Zip", "24.08")]);
+        store_read.facts.insert(STORE_APPS_FACT.into(), "0".into());
+        db.save_inventory(id, &store_read).unwrap();
+        let got = db.list_inventory_changes(None, None, 100).unwrap();
+        assert!(got.iter().any(|c| c.kind == "removed" && c.name == "Microsoft Teams"), "{got:?}");
         let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         assert!(db.list_inventory_changes(None, Some(&future), 100).unwrap().is_empty());
         assert_eq!(db.all_software().unwrap().len(), 2);

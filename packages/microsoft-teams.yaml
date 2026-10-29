@@ -1,0 +1,63 @@
+id: microsoft-teams
+name: Microsoft Teams (new)
+category: Microsoft
+description: >-
+  Provision the new Microsoft Teams (MSIX) for every user with Microsoft's teamsbootstrapper.exe:
+  users get it at their next sign-in and Teams updates itself. Leave "MSIX file" empty to download
+  the latest Teams from Microsoft, or put MSTeams-x64.msix in the repository to install offline.
+  Classic Teams is not removed; deploy "Uninstall a Windows program" with "Teams Machine-Wide
+  Installer" for that.
+platforms: [windows]
+variables:
+  msix_file:
+    default: ""
+    description: >-
+      Optional MSTeams-x64.msix (or -x86 / -arm64) in the repository, e.g. apps/MSTeams-x64.msix;
+      empty = download from Microsoft
+  bootstrapper_url:
+    default: https://go.microsoft.com/fwlink/?linkid=2243204&clcid=0x409
+    description: teamsbootstrapper.exe (Microsoft-signed; checked before it runs)
+detect:
+  windows: |
+    if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams') {
+        Write-Output 'Teams is already provisioned'
+        exit 0
+    }
+    exit 1
+steps:
+  - name: Copy the Teams MSIX
+    when: |
+      if ('{{msix_file}}') { exit 0 }
+      exit 1
+    copy:
+      src: "{{msix_file}}"
+      dest: '{{workdir}}\MSTeams.msix'
+  - name: Provision Microsoft Teams
+    timeout: 3600
+    script: |
+      $dir = '{{workdir}}'
+      New-Item -ItemType Directory -Force -Path $dir | Out-Null
+      $exe = Join-Path $dir 'teamsbootstrapper.exe'
+      Get-PsccmFile -Url '{{bootstrapper_url}}' -OutFile $exe
+      $sig = Get-AuthenticodeSignature -LiteralPath $exe
+      if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+          throw "teamsbootstrapper.exe is not signed by Microsoft ($($sig.Status))"
+      }
+      $argv = @('-p')
+      if ('{{msix_file}}') { $argv += '-o', (Join-Path $dir 'MSTeams.msix') }
+      Write-Output "Running teamsbootstrapper.exe $argv"
+      # Prints JSON such as {"success":true} or {"success":false,"errorCode":"0x80004004",...}
+      $ErrorActionPreference = 'Continue'
+      $out = (& $exe @argv 2>&1 | ForEach-Object { "$_" } | Out-String).Trim()
+      $code = $LASTEXITCODE
+      $ErrorActionPreference = 'Stop'
+      Write-Output $out
+      if ($out -match '"success"\s*:\s*true') { exit 0 }
+      if ($code) { exit $code }
+      exit 1
+verify:
+  windows: |
+    $p = Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams'
+    if ($p) { Write-Output "Teams $($p.Version) is provisioned"; exit 0 }
+    Write-Output 'Teams is not provisioned'
+    exit 1

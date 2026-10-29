@@ -1,0 +1,121 @@
+id: microsoft-365-apps
+name: Microsoft 365 Apps (Office)
+category: Microsoft
+description: >-
+  Install Microsoft 365 Apps (Word, Excel, PowerPoint, Outlook...) or Office LTSC with the
+  Office Deployment Tool. The configuration is built from the settings below, or put your own
+  configuration.xml (from config.office.com) in the repository. Office downloads from the
+  Microsoft CDN unless "Source path" names a share made with "setup.exe /download". Computers
+  that already have the product are skipped; open Office apps are closed. To remove Office,
+  deploy "Uninstall a Windows program" with "Microsoft 365*".
+platforms: [windows]
+variables:
+  product:
+    default: O365ProPlusRetail
+    description: >-
+      Product ID: O365ProPlusRetail (Microsoft 365 Apps for enterprise), O365BusinessRetail
+      (for business), ProPlus2024Volume (Office LTSC 2024)
+  channel:
+    default: MonthlyEnterprise
+    options: [MonthlyEnterprise, Current, SemiAnnual, SemiAnnualPreview, PerpetualVL2024, PerpetualVL2021]
+    description: Update channel (PerpetualVL2024 / 2021 for Office LTSC)
+  edition:
+    default: "64"
+    options: ["64", "32"]
+    description: 64- or 32-bit Office
+  language:
+    default: MatchOS
+    description: Language IDs, comma separated, e.g. MatchOS or en-us,de-de
+  exclude_apps:
+    default: Groove,Lync
+    description: >-
+      Apps not to install, comma separated: Access, Excel, Groove (old OneDrive for Business),
+      Lync (Skype for Business), OneDrive, OneNote, Outlook, PowerPoint, Publisher, Teams, Word
+  shared_activation:
+    default: "no"
+    options: ["no", "yes"]
+    description: Shared computer activation, for Remote Desktop servers and shared PCs
+  remove_msi:
+    default: "no"
+    options: ["no", "yes"]
+    description: Remove older MSI versions of Office (2010-2016) first
+  source_path:
+    default: ""
+    description: Optional share with the Office files, e.g. \\fs01\office (falls back to the CDN); empty = Microsoft CDN
+  config:
+    default: ""
+    description: >-
+      Optional configuration.xml in the repository (e.g. office/configuration.xml), used instead
+      of the settings above; set Product to the product it installs
+  odt_url:
+    default: https://officecdn.microsoft.com/pr/wsus/setup.exe
+    description: Office Deployment Tool setup.exe (Microsoft-signed; checked before it runs)
+detect:
+  windows: |
+    $c = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    if ($c -and ("$($c.ProductReleaseIds)" -split ',') -contains '{{product}}') {
+        Write-Output "{{product}} $($c.VersionToReport) is installed"
+        exit 0
+    }
+    exit 1
+steps:
+  - name: Copy configuration.xml
+    when: |
+      if ('{{config}}') { exit 0 }
+      exit 1
+    copy:
+      src: "{{config}}"
+      dest: '{{workdir}}\configuration.xml'
+  - name: Install {{product}}
+    timeout: 5400
+    script: |
+      $dir = '{{workdir}}'
+      New-Item -ItemType Directory -Force -Path $dir | Out-Null
+      $setup = Join-Path $dir 'odt-setup.exe'
+      Get-PsccmFile -Url '{{odt_url}}' -OutFile $setup
+      $sig = Get-AuthenticodeSignature -LiteralPath $setup
+      if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+          throw "setup.exe is not signed by Microsoft ($($sig.Status))"
+      }
+      $xml = Join-Path $dir 'configuration.xml'
+      if (-not '{{config}}') {
+          $esc = { param($s) [Security.SecurityElement]::Escape("$s") }
+          $list = { param($s) "$s" -split '[,; ]+' | Where-Object { $_ } }
+          $langs = foreach ($l in (& $list '{{language}}')) {
+              if ($l -eq 'MatchOS') { '      <Language ID="MatchOS" Fallback="en-us" />' } else { "      <Language ID=`"$(& $esc $l)`" />" }
+          }
+          $excluded = foreach ($e in (& $list '{{exclude_apps}}')) { "      <ExcludeApp ID=`"$(& $esc $e)`" />" }
+          $source = if ('{{source_path}}') { " SourcePath=`"$(& $esc '{{source_path}}')`" AllowCdnFallback=`"TRUE`"" } else { '' }
+          $shared = if ('{{shared_activation}}' -eq 'yes') { '1' } else { '0' }
+          $lines = @(
+              '<Configuration>'
+              "  <Add OfficeClientEdition=`"$(& $esc '{{edition}}')`" Channel=`"$(& $esc '{{channel}}')`"$source>"
+              "    <Product ID=`"$(& $esc '{{product}}')`">"
+              $langs
+              $excluded
+              '    </Product>'
+              '  </Add>'
+              "  <Property Name=`"SharedComputerLicensing`" Value=`"$shared`" />"
+              '  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />'
+              '  <Updates Enabled="TRUE" />'
+              $(if ('{{remove_msi}}' -eq 'yes') { '  <RemoveMSI />' })
+              '  <Display Level="None" AcceptEULA="TRUE" />'
+              '</Configuration>'
+          )
+          Set-Content -LiteralPath $xml -Value $lines -Encoding UTF8
+      }
+      Write-Output '--- configuration.xml ---'
+      Get-Content -LiteralPath $xml
+      Write-Output '-------------------------'
+      $code = Invoke-PsccmProcess -FilePath $setup -Arguments "/configure `"$xml`""
+      Write-Output "Office Deployment Tool exit code: $code"
+      exit $code
+verify:
+  windows: |
+    $c = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    if ($c -and ("$($c.ProductReleaseIds)" -split ',') -contains '{{product}}') {
+        Write-Output "{{product}} $($c.VersionToReport) installed"
+        exit 0
+    }
+    Write-Output '{{product}} is not installed'
+    exit 1

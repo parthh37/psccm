@@ -795,6 +795,7 @@ const WIN_INSTALL: &str = r#"switch ([IO.Path]::GetExtension($f).ToLower()) {
     '.msi' { $code = Invoke-PsccmMsi -Path $f -Arguments $a }
     '.msp' { $code = Invoke-PsccmMsi -Path $f -Arguments $a -Verb '/p' }
     '.msu' { $code = Invoke-PsccmProcess -FilePath 'wusa.exe' -Arguments "`"$f`" /quiet /norestart $a" }
+    { $_ -in '.msix', '.msixbundle', '.appx', '.appxbundle' } { $code = Install-PsccmAppx -Path $f -Arguments $a }
     default { $code = Invoke-PsccmProcess -FilePath $f -Arguments $a }
 }
 Write-Output "Installer exit code: $code"
