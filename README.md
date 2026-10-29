@@ -14,6 +14,8 @@ computers without installing an agent, similar to PDQ Deploy.
 - **Inventory**: agentless scans of OS, hardware, disks, logged-on user, pending reboot and installed
   software, with a software report across all computers, outdated App catalog software with one-click
   update, a change history (installed / removed / updated), uninstall from the report and CSV export.
+- **Windows Update**: scan for missing updates (from WSUS or Windows Update), decline problem KBs, and
+  install with automatic restarts on a monthly Patch Tuesday schedule, with no agent needed.
 - **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
   apply their computer settings directly on chosen computers, with no GPO link or AD change.
 - **Optional agent** for computers with no WinRM/SSH: it connects out to the console and adds live
@@ -30,7 +32,7 @@ computers without installing an agent, similar to PDQ Deploy.
 Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, IIS
 install, IIS site deploy, IIS app-pool recycle, IIS zero-downtime deploy behind HAProxy,
 HAProxy install/upgrade, HAProxy config deploy, HAProxy drain/ready, generic MSI/EXE
-install, Windows uninstall, Linux package install/remove/upgrade, Linux full update,
+install, Windows uninstall, Windows Update, Linux package install/remove/upgrade, Linux full update,
 and reboot.
 
 ## Why not Ansible?
@@ -139,7 +141,8 @@ memberships are imported too, so they can drive dynamic groups.
 
 Dynamic groups can also use the [inventory](#inventory): installed software with an optional version
 condition (`Google Chrome*` with `<130`, or *without* `Notepad++*`), *reboot pending*, and *a disk
-has less than N GB free*. These rules only match computers that have been scanned.
+has less than N GB free*. These rules only match computers that have been scanned. The rule
+*Windows updates missing* uses the last [update scan](#windows-update).
 
 You can deploy and schedule to groups (and combine them with tags and single computers). CLI:
 `psccm deploy 7zip --group "Web farm"`, `psccm groups list`.
@@ -184,6 +187,54 @@ collects:
 CLI: `psccm inventory scan [names…]`, `psccm inventory show web01`,
 `psccm inventory software --name "Google Chrome*"`, `psccm inventory changes [web01] --days 7`,
 `psccm inventory outdated`.
+
+## Windows Update
+
+*Updates* page. PSCCM asks each Windows computer's own **Windows Update Agent** which updates are
+missing and installs them. The updates come from the computer's usual source: its **WSUS** server when
+one is set by policy, otherwise Windows Update. Nothing needs to be set up on the targets beyond WinRM.
+
+Windows does not let a remote (WinRM) session download or install updates. PSCCM therefore runs the
+update script as **SYSTEM** through a one-off scheduled task (`\PSCCM\Windows Update scan` / `… install`).
+The task's output is streamed back into the console while it runs, and the task is removed afterwards.
+
+- **Scan all computers**, or *Scan now* on one computer. Set *Scan all Windows computers every N hours*
+  for a periodic scan (off by default). A scan only searches: nothing is downloaded or installed.
+- The **Computers** tab shows each computer's missing updates (security/critical counted separately),
+  pending restart, OS build, last successful install and update source. Click a computer to see its
+  missing updates and recent install history (with failures).
+- The **Missing updates** tab lists every missing update across the fleet with its KB, classification,
+  MSRC severity, release date and the computers that need it. Filter by classification. Export to CSV.
+- **Install**: tick updates and choose *Install selected…*, or use *Install on N computer(s)…* on the
+  Computers tab. Both open *New deployment* with the **Windows Update - install updates** package and the
+  computers filled in, so you review it before anything runs.
+- **Decline** updates you never want (e.g. a problem KB): PSCCM never installs them, even through a
+  schedule by classification, and they no longer count as missing. *Show declined* → *Undecline* undoes it.
+  An update named explicitly in a deployment's `kbs` is still installed.
+- **Patch Tuesday schedules**: *New patch schedule* creates a **monthly** schedule, by default
+  2nd Tuesday + 2 days at 02:00. Pick groups and a batch size so web farms restart one server at a time.
+- **Dynamic groups**: the rule *Windows updates missing: any / security or critical* uses the last scan,
+  e.g. a group "Needs security patches" for a schedule or a report.
+- After a deployment of the update package, the computers it reached are scanned again (on by default).
+- *Look for updates at*: the computer's own source (WSUS if set, else Windows Update), or Windows Update
+  directly, ignoring WSUS (e.g. while a WSUS server is being retired).
+
+The **Windows Update - install updates** package (`windows-update`) has these variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `classifications` | Security Updates, Critical Updates, Definition Updates, Update Rollups | Also: Updates, Feature Packs, Service Packs, Tools, Drivers, Upgrades. `*` = all. |
+| `kbs` | (empty) | Install only these KBs (or update IDs). Empty = by classification. |
+| `exclude_kbs` | (empty) | Never install these. Declined updates are always left out. |
+| `reboot` | `if-required` | `never` leaves the restart to you; `always` restarts at the end. |
+| `passes` | `2` | After a restart, another round installs the updates that needed it. |
+
+Updates are downloaded and installed one at a time, so one failing update does not stop the rest. The
+log shows each one. A computer is marked failed if any update failed; it still restarts first when the
+updates that did install need it. Optional updates (such as feature updates offered as "download and
+install now") are only installed when named in `kbs`.
+
+CLI: `psccm updates scan [names…]`, `psccm updates list [--security]`, `psccm updates show web01`.
 
 ## Group Policy (GPO) import and injection
 
@@ -320,7 +371,7 @@ CLI: `psccm catalog list`, `psccm catalog add 7zip google-chrome`, `psccm catalo
 | Batch size | Rolling deployment. `1` = one computer at a time (HA pairs, web farms). `0` = all. |
 | Stop after failures | Don't start more computers once this many failed. `0` = stop at the first failure. |
 | Skip computers that already have it | Run the package's `detect` script first; exit 0 = skip. |
-| Start at | Run later (one-off). For repeats use **Schedules** (daily/weekly/interval). |
+| Start at | Run later (one-off). For repeats use **Schedules** (daily/weekly/monthly/interval). |
 
 Tags are resolved when a deployment starts, so a schedule on tag `web` picks up new web servers
 imported from AD.
@@ -338,6 +389,7 @@ psccm packages list | show <id> | validate <file.yaml>
 psccm computers list | add <names> [--os linux] [--tag web] | remove <names> | check
 psccm groups list | create <name> --computers a,b
 psccm inventory scan [names…] | show <name> | software [--name "Chrome*"]
+psccm updates scan [names…] | list [--security] | show <name>
 psccm ad sync [--import]
 psccm gpo list | import <GUID> | import-folder <path> [--name N]
 psccm catalog list | check | add <ids> | update [ids] | remove <id>
@@ -405,6 +457,12 @@ steps:
   - name: Pause
     wait: 30               # seconds
 
+  - name: Patch
+    windows_update:        # install missing Windows updates (see Windows Update)
+      classifications: Security Updates, Critical Updates
+      exclude: KB5034441
+      reboot: if-required  # never | always
+
   - name: Shared steps
     include: other-package # run another package's steps (nested package)
 
@@ -421,7 +479,8 @@ rollback:                  # runs (best effort) when a step or verify fails
     script: ...
 ```
 
-**Every step** also accepts `os`, `when`, `timeout` (seconds, default 1800), `retries`,
+**Every step** also accepts `os`, `when`, `timeout` (seconds, default 1800; per install round for
+`windows_update`, default 4 hours), `retries`,
 `retry_delay` (default 10), `success_codes` (default `[0]`; install steps also accept `3010` and `1641`),
 `continue_on_error` and `delegate_to`.
 
@@ -466,6 +525,7 @@ bash (runs with `set -eo pipefail`):
 | Zero-downtime web farm release | `iis-rolling-deploy` | Batch size 1, Stop after failures 0. |
 | HAProxy upgrade | `haproxy-upgrade` | Batch size 1 on HA pairs; config backup restored on failure. |
 | HAProxy config change | `haproxy-config` | Validated with `haproxy -c` before it goes live. |
+| Patch Windows | `windows-update` | *Updates* → *New patch schedule* (Patch Tuesday + 2), batch size for farms. |
 | Patch Linux | `linux-update` | Use a weekly schedule. |
 
 ## Security notes

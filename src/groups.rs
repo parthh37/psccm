@@ -47,11 +47,17 @@ impl GroupRules {
             && self.ad_group.trim().is_empty()
             && self.os_detail.trim().is_empty()
             && !self.uses_inventory()
+            && !self.uses_updates()
     }
 
     /// True when a rule needs scanned inventory data.
     pub fn uses_inventory(&self) -> bool {
         !self.app.trim().is_empty() || self.pending_reboot || self.low_disk_gb > 0.0
+    }
+
+    /// True when a rule needs Windows Update scan data.
+    pub fn uses_updates(&self) -> bool {
+        !self.missing_updates.trim().is_empty()
     }
 
     /// Reject rules that can never be evaluated.
@@ -64,6 +70,9 @@ impl GroupRules {
         }
         if self.low_disk_gb < 0.0 {
             bail!("free disk space limit cannot be negative");
+        }
+        if !matches!(self.missing_updates.trim(), "" | "any" | "security") {
+            bail!("missing updates must be 'any' or 'security'");
         }
         Ok(())
     }
@@ -94,6 +103,14 @@ impl GroupRules {
         if !ad.is_empty() && !c.ad_groups.iter().any(|g| g.eq_ignore_ascii_case(ad)) {
             return false;
         }
+        if self.uses_updates() {
+            // Computers without a successful update scan match no update rule.
+            let Some(u) = inv.and_then(|i| i.updates) else { return false };
+            let n = if self.missing_updates.trim() == "security" { u.security } else { u.missing };
+            if n == 0 {
+                return false;
+            }
+        }
         if self.uses_inventory() {
             // Computers that were never scanned match no inventory rule.
             let Some(inv) = inv.filter(|i| i.scanned_at.is_some()) else { return false };
@@ -120,15 +137,20 @@ impl GroupRules {
 
 /// Load the inventory that `rules` need (nothing when none of them use it).
 pub fn load_inventory<'a>(db: &Db, rules: impl IntoIterator<Item = &'a GroupRules>) -> Result<InventoryIndex> {
-    let (mut any, mut apps) = (false, false);
+    let (mut any, mut apps, mut updates) = (false, false, false);
     for r in rules {
         any |= r.uses_inventory();
         apps |= !r.app.trim().is_empty();
+        updates |= r.uses_updates();
     }
-    if !any {
-        return Ok(HashMap::new());
+    let mut index: InventoryIndex =
+        if any { db.list_inventory(apps)?.into_iter().map(|i| (i.computer_id, i)).collect() } else { HashMap::new() };
+    if updates {
+        for (id, s) in crate::wu::summaries(db)? {
+            index.entry(id).or_insert_with(|| Inventory::empty(id)).updates = Some(s);
+        }
     }
-    Ok(db.list_inventory(apps)?.into_iter().map(|i| (i.computer_id, i)).collect())
+    Ok(index)
 }
 
 /// Lenient version parse: "130.0.6723.92", "v22.11.0", "1:2.34-0ubuntu3", "8.7 (64-bit)" -> numbers.
@@ -240,7 +262,26 @@ mod tests {
                 .iter()
                 .map(|(n, v)| InstalledApp { name: n.to_string(), version: v.to_string(), publisher: String::new() })
                 .collect(),
+            updates: None,
         }
+    }
+
+    #[test]
+    fn update_rules() {
+        use crate::wu::UpdateSummary;
+        let c = comp("web01", "windows", "", &[], &[]);
+        let any = GroupRules { missing_updates: "any".into(), ..Default::default() };
+        let sec = GroupRules { missing_updates: "security".into(), ..Default::default() };
+        assert!(!any.matches(&c, None), "never scanned for updates");
+        let mut i = Inventory::empty(1);
+        i.updates = Some(UpdateSummary { missing: 2, security: 0 });
+        assert!(any.matches(&c, Some(&i)), "no inventory scan is needed");
+        assert!(!sec.matches(&c, Some(&i)));
+        i.updates = Some(UpdateSummary { missing: 2, security: 1 });
+        assert!(sec.matches(&c, Some(&i)));
+        i.updates = Some(UpdateSummary::default());
+        assert!(!any.matches(&c, Some(&i)), "up to date");
+        assert!(GroupRules { missing_updates: "some".into(), ..Default::default() }.validate().is_err());
     }
 
     #[test]

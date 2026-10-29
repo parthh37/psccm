@@ -12,7 +12,7 @@ use tracing::{error, info};
 
 use crate::app::{App, WinRmSettings};
 use crate::db::{DeployOptions, NewDeployment, TargetSpec, not_found};
-use crate::package::{Install, Os, Package, ServiceAction, Shell, Step, render};
+use crate::package::{Install, Os, Package, ServiceAction, Shell, Step, WindowsUpdateSpec, render};
 use crate::transport::ssh::Ssh;
 use crate::transport::winrm::WinRm;
 use crate::transport::{
@@ -269,6 +269,11 @@ pub async fn run_deployment(app: &App, id: &str) -> Result<String> {
     };
     app.db.set_deployment_status(id, status)?;
     info!("deployment {id}: {status}");
+    if run.pkg.steps.iter().any(|s| s.windows_update.is_some()) {
+        // Failed computers may have installed some of the updates, too.
+        let reached = results.iter().filter(|t| matches!(t.status.as_str(), "success" | "failed")).map(|t| t.computer.clone()).collect();
+        crate::wu::after_deployment(app, reached);
+    }
     let succeeded = results.into_iter().filter(|t| t.status == "success").map(|t| t.computer).collect();
     crate::inventory::after_deployment(app, succeeded);
     Ok(status.to_string())
@@ -637,7 +642,14 @@ async fn rollback(cx: &StepCx<'_>, delegates: &mut HashMap<String, Delegate>) {
 
 async fn run_step(cx: &StepCx<'_>, step: &Step) -> Result<()> {
     let vars = cx.vars;
-    let timeout = Duration::from_secs(step.timeout.unwrap_or(if step.reboot { 900 } else { 1800 }));
+    let timeout = Duration::from_secs(step.timeout.unwrap_or(if step.reboot {
+        900
+    } else if step.windows_update.is_some() {
+        // Per install round: downloading and installing a month of updates is slow.
+        4 * 3600
+    } else {
+        1800
+    }));
     if let Some(cond) = &step.when {
         let code = cx.script(cx.default_shell(), &render(cond, vars)?, Duration::from_secs(300)).await?;
         if code != 0 {
@@ -718,6 +730,9 @@ async fn run_step(cx: &StepCx<'_>, step: &Step) -> Result<()> {
     }
     if step.reboot {
         return reboot(cx, timeout).await;
+    }
+    if let Some(spec) = &step.windows_update {
+        return windows_update(cx, spec, timeout).await;
     }
     if let Some(secs) = step.wait {
         (cx.log)(&format!("    waiting {secs}s"));
@@ -802,6 +817,68 @@ fn file_name_from_url(url: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         .collect();
     if clean.is_empty() { "installer.bin".into() } else { clean }
+}
+
+/// Install Windows updates. After a restart another round looks for updates
+/// that needed it (servicing stack first, then the cumulative update), up to
+/// the step's `passes`.
+async fn windows_update(cx: &StepCx<'_>, spec: &WindowsUpdateSpec, timeout: Duration) -> Result<()> {
+    if cx.os != Os::Windows {
+        bail!("windows_update steps only run on Windows");
+    }
+    let declined = crate::wu::UpdateSettings::load(&cx.run.app).declined;
+    let plan = crate::wu::InstallPlan::new(spec, cx.vars, &declined)?;
+    (cx.log)(&format!("    {}", plan.describe()));
+    let script = wrap_script(Shell::Powershell, &plan.script());
+    // Restarts after updates spend a while on "Working on updates".
+    let reboot_timeout = Duration::from_secs(3600);
+    let mut failed = 0;
+    let mut restarted = false;
+    for pass in 1..=plan.passes {
+        if pass > 1 {
+            (cx.log)(&format!("    round {pass}: looking for updates that needed the restart"));
+        }
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let log: LogFn = {
+            let (result, inner) = (result.clone(), cx.log.clone());
+            Arc::new(move |l: &str| {
+                if let Some(r) = crate::wu::parse_result(l) {
+                    *result.lock().unwrap() = Some(r);
+                } else if !l.starts_with(crate::wu::MARK) {
+                    inner(l);
+                }
+            })
+        };
+        let code = cx.transport.run(&script, Shell::Powershell, timeout, &log).await?;
+        let r = *result.lock().unwrap();
+        let r = match (code, r) {
+            (0, Some(r)) => r,
+            (0, None) => bail!("Windows Update did not report a result"),
+            (code, _) => bail!("Windows Update failed (exit code {code})"),
+        };
+        // Updates that failed are tried again in the next round, so the last round counts.
+        failed = r.failed;
+        restarted = false;
+        if r.reboot {
+            if plan.reboot == crate::wu::Reboot::Never {
+                (cx.log)("    a restart is required to finish (not restarting: reboot is 'never')");
+            } else {
+                reboot(cx, reboot_timeout).await?;
+                restarted = true;
+            }
+        }
+        // Another round helps only after a restart that followed install attempts.
+        if !(restarted && r.installed + r.failed > 0) {
+            break;
+        }
+    }
+    if plan.reboot == crate::wu::Reboot::Always && !restarted {
+        reboot(cx, reboot_timeout).await?;
+    }
+    if failed > 0 {
+        bail!("{failed} update(s) failed to install (see the log)");
+    }
+    Ok(())
 }
 
 async fn reboot(cx: &StepCx<'_>, timeout: Duration) -> Result<()> {
