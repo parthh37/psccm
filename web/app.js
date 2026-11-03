@@ -149,11 +149,12 @@ function poll(fn, ms) { stopPolling(); pollTimer = setTimeout(fn, ms); }
 
 async function route() {
   stopPolling();
+  if (!location.hash.startsWith('#/setup')) OUS = null; // the wizard keeps it across its steps
   $('#modal').innerHTML = '';
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   const name = parts[0] || 'dashboard';
   const param = decodeURIComponent(parts.slice(1).join('/') || '');
-  const navKey = { deployment: 'history', package: 'packages', agent: 'agents' }[name] || name;
+  const navKey = { deployment: 'history', package: 'packages', agent: 'agents', setup: 'dashboard' }[name] || name;
   $('#nav').innerHTML = NAV.map(([k, label]) =>
     `<a href="#/${k}" class="${k === navKey ? 'active' : ''}"><svg viewBox="0 0 24 24" fill="currentColor">${ICON[k]}</svg>${label}</a>`).join('');
   const main = $('#main');
@@ -170,6 +171,8 @@ window.addEventListener('hashchange', route);
 
 async function pageDashboard(el) {
   const s = await GET('/summary');
+  // A brand-new console starts with the setup wizard (once per browser).
+  if (!s.computers && !s.credentials && !store.get('setup_done', false)) { location.replace('#/setup'); return; }
   const steps = [
     [s.credentials > 0, 'Add a credential', 'Windows: leave the user empty to use the account running PSCCM (Kerberos). Linux: an SSH user with sudo.', '#/settings'],
     [s.computers > 0, 'Add computers', 'Type names, or import them read-only from Active Directory.', '#/computers'],
@@ -192,7 +195,8 @@ async function pageDashboard(el) {
     ${s.package_errors.length ? `<div class="card"><div class="card-head"><h2 class="err">Packages with errors</h2></div><div class="card-body">
       ${s.package_errors.map(([f, e]) => `<div><b>${esc(f)}</b>: <span class="err">${esc(e)}</span></div>`).join('')}</div></div>` : ''}
     <div class="grid two">
-      ${allDone ? '' : `<div class="card"><div class="card-head"><h2>Getting started</h2></div><div class="card-body"><ul class="checklist">
+      ${allDone ? '' : `<div class="card"><div class="card-head"><h2>Getting started</h2>
+        <div class="right"><button onclick="App.setup()">Setup wizard</button></div></div><div class="card-body"><ul class="checklist">
         ${steps.map(([done, t, d, href]) => `<li><span class="ck ${done ? 'done' : ''}">${done ? '✓' : ''}</span>
           <div><a href="${href}"><b>${t}</b></a><div class="muted small">${d}</div></div></li>`).join('')}
       </ul></div></div>`}
@@ -493,9 +497,11 @@ Object.assign(App, {
           <div class="field"><label>Name pattern</label><input id="gr-name" value="${esc(r.name || '')}" placeholder="web*, app0?"><div class="hint">* and ?, comma separated</div></div>
         </div>
         <div class="row">
-          <div class="field"><label>AD OU contains</label><input id="gr-ou" value="${esc(r.ou || '')}" placeholder="OU=Web Servers"></div>
+          <div class="field"><label>AD OU contains</label><input id="gr-ou" value="${esc(r.ou || '')}" placeholder="OU=Web Servers">
+            <div class="hint">Includes the OUs below it. <button type="button" class="link" id="gr-ou-browse">Browse OUs…</button></div></div>
           <div class="field"><label>OS version contains</label><input id="gr-osd" value="${esc(r.os_detail || '')}" placeholder="Server 2022"></div>
         </div>
+        <div id="gr-ou-box" class="ou-box" hidden></div>
         <div class="row">
           <div class="field"><label>AD security group</label><input id="gr-ad" list="gr-ad-list" value="${esc(r.ad_group || '')}" placeholder="IIS-Servers">
             <datalist id="gr-ad-list">${CS.adGroups.map((a) => `<option value="${esc(a)}">`).join('')}</datalist>
@@ -564,6 +570,9 @@ Object.assign(App, {
     };
     $$('[data-kind]', root).forEach((b) => { b.onclick = () => { $$('[data-kind]', root).forEach((x) => x.classList.toggle('on', x === b)); kindVis(); }; });
     $$('#g-dynamic input, #g-dynamic select', root).forEach((i) => { i.oninput = preview; i.onchange = preview; });
+    $('#gr-ou-browse', root).onclick = () => toggleOuBrowser($('#gr-ou-box', root), null, {
+      onPick: (n) => { $('#gr-ou').value = n.dn; $('#gr-ou-box', root).hidden = true; preview(); },
+    });
     kindVis();
   },
 });
@@ -1144,7 +1153,9 @@ async function pageSettings(el) {
           <div class="field"><label class="check"><input type="checkbox" id="ad-skip" ${ad.skip_tls_verify ? 'checked' : ''}> Don't verify the DC certificate</label></div>
         </div>
         <div class="field"><label>Search in OUs</label><textarea id="ad-bases" rows="2" placeholder="OU=Servers,DC=corp,DC=local">${esc(ad.base_dns.join('\n'))}</textarea>
-          <div class="hint">One distinguished name per line. Empty = the whole domain.</div></div>
+          <div class="hint">One distinguished name per line. Empty = the whole domain.
+            <button type="button" class="link" onclick="App.browseAdOus()">Browse OUs…</button></div>
+          <div id="ad-ou-box" class="ou-box" hidden></div></div>
         <div class="row">
           <div class="field"><label>Extra LDAP filter</label><input id="ad-filter" value="${esc(ad.filter)}" placeholder="(operatingSystem=*Server*)"></div>
           <div class="field"><label>Skip computers not seen for (days)</label><input id="ad-stale" type="number" min="0" value="${ad.stale_days}"><div class="hint">0 = keep all.</div></div>
@@ -1280,6 +1291,92 @@ Object.assign(App, {
     await DEL('/known-hosts/' + encodeURIComponent(h));
     toast('Forgot host key for ' + h);
   }),
+});
+
+// -------------------------------------------------------------- OU browser
+
+let OUS = null; // { key, list } — the AD OU tree, read once per page
+
+/** The OU tree from AD (read-only). `settings` = unsaved AD settings, or the saved ones. */
+async function loadOus(settings) {
+  const key = JSON.stringify(settings ? { ...settings, base_dns: [] } : null);
+  if (!OUS || OUS.key !== key) OUS = { key, list: (await POST('/ad/ous', settings ? { settings } : {})).ous };
+  return OUS.list;
+}
+
+/** Draw a browsable OU tree into `box`. With `multi`, OUs get check boxes
+ *  (`picked` holds lower-cased DNs); otherwise clicking an OU picks it.
+ *  `onPick(node, checked)` is called either way. */
+function ouBrowser(box, list, { multi = false, picked = new Set(), onPick }) {
+  const byKey = new Map(list.map((n) => [n.dn.toLowerCase(), n]));
+  const kids = {};
+  list.forEach((n) => {
+    const p = (n.parent || '').toLowerCase();
+    (kids[byKey.has(p) ? p : ''] ||= []).push(n);
+  });
+  const open = new Set(list.filter((n) => n.kind === 'domain').map((n) => n.dn.toLowerCase()));
+  let q = '';
+  const matches = (n) => !q || (n.name + ' ' + n.dn).toLowerCase().includes(q) || (kids[n.dn.toLowerCase()] || []).some(matches);
+  const icon = { domain: '🌐', ou: '📁', container: '📂' };
+  const row = (n, depth) => {
+    const k = n.dn.toLowerCase();
+    const ch = (kids[k] || []).filter(matches);
+    const isOpen = !!q || open.has(k);
+    const pickable = n.kind !== 'domain';
+    const name = `${icon[n.kind] || ''} ${esc(n.name)}`;
+    return `<div class="ou-row" style="padding-left:${depth * 18}px" title="${esc(n.dn)}${n.description ? '\n' + esc(n.description) : ''}">
+        <button type="button" class="ou-caret" data-t="${esc(k)}" ${ch.length ? '' : 'disabled'} aria-label="${isOpen ? 'Collapse' : 'Expand'}">${ch.length ? (isOpen ? '▾' : '▸') : ''}</button>
+        ${!pickable ? `<span class="ou-name">${name}</span>`
+          : multi ? `<label class="ou-name"><input type="checkbox" data-p="${esc(k)}" ${picked.has(k) ? 'checked' : ''}> ${name}</label>`
+          : `<button type="button" class="link ou-name" data-n="${esc(k)}">${name}</button>`}
+        <span class="small muted">${n.total} computer${n.total === 1 ? '' : 's'}${n.known ? ` · ${n.known} in list` : ''}</span></div>
+      ${isOpen ? ch.map((c) => row(c, depth + 1)).join('') : ''}`;
+  };
+  box.innerHTML = `<input class="search" placeholder="Filter OUs…"><div class="ou-list"></div>
+    <div class="hint">Counts are computers the import settings would include. Read from AD — nothing is changed there.</div>`;
+  const draw = () => {
+    $('.ou-list', box).innerHTML = (kids[''] || []).filter(matches).map((n) => row(n, 0)).join('') || '<div class="muted small">No OUs match.</div>';
+  };
+  $('input.search', box).oninput = (e) => { q = e.target.value.trim().toLowerCase(); draw(); };
+  box.onclick = (e) => {
+    const t = e.target.closest('[data-t]');
+    if (t) { open.has(t.dataset.t) ? open.delete(t.dataset.t) : open.add(t.dataset.t); draw(); return; }
+    const n = e.target.closest('[data-n]');
+    if (n && onPick) onPick(byKey.get(n.dataset.n), true);
+  };
+  box.onchange = (e) => {
+    const k = e.target.dataset && e.target.dataset.p;
+    if (!k) return;
+    e.target.checked ? picked.add(k) : picked.delete(k);
+    if (onPick) onPick(byKey.get(k), e.target.checked);
+  };
+  draw();
+}
+
+/** Show or hide an OU browser in `box` (loading the tree on first open). */
+async function toggleOuBrowser(box, settings, opts) {
+  if (!box.hidden) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = '<div class="muted small">Reading OUs from Active Directory (read-only)…</div>';
+  try {
+    ouBrowser(box, await loadOus(settings), opts);
+  } catch (e) {
+    box.innerHTML = `<div class="err small">${esc(e.message)}</div>`;
+  }
+}
+
+Object.assign(App, {
+  browseAdOus() {
+    const lines = () => $('#ad-bases').value.split('\n').map((s) => s.trim()).filter(Boolean);
+    toggleOuBrowser($('#ad-ou-box'), adForm(), {
+      multi: true,
+      picked: new Set(lines().map((l) => l.toLowerCase())),
+      onPick: (n, on) => {
+        const rest = lines().filter((l) => l.toLowerCase() !== n.dn.toLowerCase());
+        $('#ad-bases').value = (on ? [...rest, n.dn] : rest).join('\n');
+      },
+    });
+  },
 });
 
 // --------------------------------------------------------------- inventory
@@ -2615,7 +2712,226 @@ Object.assign(App, {
   }),
 });
 
+// ------------------------------------------------------------ setup wizard
+
+const SETUP_STEPS = ['Welcome', 'Credentials', 'Active Directory', 'Computers', 'Groups', 'Finish'];
+const SU = { step: 0, ad: null, useAd: null, ous: new Set(), ldapCred: null };
+
+async function pageSetup(el) {
+  const [s, creds, comps, groups] = await Promise.all([GET('/settings'), GET('/credentials'), GET('/computers'), GET('/groups')]);
+  CS.creds = creds;
+  if (!SU.ad) {
+    SU.ad = s.ad;
+    SU.useAd = s.console_os === 'windows' || !!s.ad.server || !!s.ad.credential_id;
+    SU.ous = new Set(s.ad.base_dns.map((d) => d.toLowerCase()));
+  }
+  const ad = SU.ad;
+  const winCred = creds.find((c) => c.kind === 'windows' && c.default_for === 'windows');
+  const sshCred = creds.find((c) => c.kind === 'ssh' && c.default_for === 'linux');
+  const step = SU.step;
+  const body = [
+    () => `<p>This walks you through the first few minutes with PSCCM. Every step can be skipped and changed later in Settings.</p>
+      <ol class="setup-list">
+        <li><b>Credentials</b> — how PSCCM signs in to Windows (WinRM) and Linux (SSH) computers.</li>
+        <li><b>Active Directory</b> — connect read-only and pick the OUs to import from.</li>
+        <li><b>Computers</b> — import them from AD or type their names.</li>
+        <li><b>Groups</b> — create a few dynamic groups to deploy to.</li>
+        <li><b>Finish</b> — check which computers are online and take a first inventory.</li>
+      </ol>
+      <p class="small muted">Console v${esc(s.version)} on ${esc(s.console_os)} · data in <code>${esc(s.data_dir)}</code></p>`,
+
+    () => `<div class="cat">Windows computers</div>
+      ${winCred ? `<p class="small">✓ Default Windows credential: <b>${esc(winCred.name)}</b> (${winCred.username ? esc(winCred.username) : 'the account running PSCCM'}).</p>` : `
+      <label class="check"><input type="radio" name="su-win" value="self" checked> The account running PSCCM (Kerberos, no password stored)</label>
+      <div class="hint" style="margin:0 0 6px 26px">Best when the PSCCM service runs as a domain account that is local admin on the targets.</div>
+      <label class="check"><input type="radio" name="su-win" value="stored"> A stored Windows account</label>
+      <div class="row" id="su-win-f" style="margin:6px 0 0 26px">
+        <div class="field"><label>User name</label><input id="su-win-user" autocomplete="off" placeholder="CORP\\deploy"></div>
+        <div class="field"><label>Password</label><input id="su-win-pass" type="password" autocomplete="new-password"></div></div>
+      <label class="check"><input type="radio" name="su-win" value="none"> No Windows computers</label>`}
+      <div class="cat">Linux computers</div>
+      ${sshCred ? `<p class="small">✓ Default SSH credential: <b>${esc(sshCred.name)}</b> (${esc(sshCred.username)}).</p>` : `
+      <label class="check"><input type="checkbox" id="su-ssh"> I manage Linux computers too</label>
+      <div id="su-ssh-f" style="margin:6px 0 0 26px">
+        <div class="row"><div class="field"><label>SSH user (with sudo)</label><input id="su-ssh-user" autocomplete="off" placeholder="deploy"></div>
+          <div class="field"><label>Password or key passphrase</label><input id="su-ssh-pass" type="password" autocomplete="new-password"></div></div>
+        <div class="field"><label>Private key file (optional)</label><input id="su-ssh-key" placeholder="C:\\Users\\me\\.ssh\\id_ed25519"></div></div>`}
+      <p class="small muted">Passwords are encrypted for the account that runs PSCCM.</p>`,
+
+    () => `<label class="check"><input type="radio" name="su-ad" value="yes" ${SU.useAd ? 'checked' : ''}> Import computers from Active Directory (read-only)</label>
+      <label class="check"><input type="radio" name="su-ad" value="no" ${SU.useAd ? '' : 'checked'}> No Active Directory — I'll add computers by name</label>
+      <div id="su-ad-f" style="margin-top:12px">
+        <div class="row">
+          <div class="field"><label>Connect as</label><select id="ad-mode">
+            <option value="windows" ${ad.mode === 'windows' ? 'selected' : ''}>Account running PSCCM (Windows, no password)</option>
+            <option value="ldap" ${ad.mode === 'ldap' ? 'selected' : ''}>LDAP with a stored credential</option></select></div>
+          <div class="field"><label>Domain controller / domain</label><input id="ad-server" value="${esc(ad.server)}" placeholder="corp.local or dc01.corp.local"></div>
+        </div>
+        <div class="row" id="ad-ldap">
+          <div class="field"><label>Security</label><select id="ad-sec">
+            ${[['ldaps', 'LDAPS (636)'], ['starttls', 'StartTLS (389)'], ['none', 'None (389, plain text)']].map(([v, l]) => `<option value="${v}" ${ad.security === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+          ${creds.some((c) => c.kind === 'ldap')
+            ? `<div class="field"><label>Credential</label><select id="ad-cred">${credOptions(SU.ldapCred || ad.credential_id, ['ldap'], 'Choose…')}</select></div>`
+            : `<div class="field"><label>User (any domain user)</label><input id="su-ldap-user" autocomplete="off" placeholder="reader@corp.local"></div>
+               <div class="field"><label>Password</label><input id="su-ldap-pass" type="password" autocomplete="new-password"></div>`}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center"><button onclick="App.suBrowse()">Connect and pick OUs</button><span id="su-ad-result" class="small"></span></div>
+        <div id="su-ou-box" class="ou-box" hidden></div>
+        <div class="hint" id="su-ou-picked"></div>
+      </div>`,
+
+    () => `<p>You have <b>${comps.length}</b> computer${comps.length === 1 ? '' : 's'} in the list.</p>
+      ${SU.useAd ? `<div class="cat">From Active Directory</div>
+        <div style="display:flex;gap:8px;align-items:center"><button class="primary" onclick="App.suImport()">Import from ${SU.ous.size ? `${SU.ous.size} OU${SU.ous.size === 1 ? '' : 's'}` : 'the whole domain'}</button>
+          <span id="su-imp" class="small muted"></span></div>` : ''}
+      <div class="cat">By name</div>
+      <div class="field"><textarea id="su-names" rows="4" placeholder="web01.corp.local&#10;10.0.0.15"></textarea>
+        <div class="hint">One per line. Use the FQDN for Windows so Kerberos works.</div></div>
+      <button onclick="App.suAddNames()">Add</button>`,
+
+    () => {
+      const have = new Set(groups.groups.map((g) => g.name.toLowerCase()));
+      const ous = OUS ? OUS.list.filter((n) => SU.ous.has(n.dn.toLowerCase())) : [];
+      const ideas = [
+        ['Windows computers', { os: 'windows' }],
+        ['Windows servers', { os: 'windows', os_detail: 'Server' }],
+        ['Linux computers', { os: 'linux' }],
+        ...ous.map((n) => ['OU ' + n.name, { ou: n.dn }]),
+      ];
+      SU.ideas = ideas;
+      return `<p>Dynamic groups keep themselves up to date: new computers that match join automatically. Pick the ones you want.</p>
+        ${ideas.map(([name, r], i) => `<label class="check"><input type="checkbox" data-g="${i}" ${have.has(name.toLowerCase()) ? 'disabled' : i < 2 || r.ou ? 'checked' : ''}>
+          ${esc(name)} <span class="small muted">— ${esc(ruleText({ tags: [], ...r }))}${have.has(name.toLowerCase()) ? ' (exists)' : ''}</span></label>`).join('')}
+        <p class="small muted">More rules (installed software, pending reboot, low disk, missing updates) are on the Computers page.</p>`;
+    },
+
+    () => `<p>Almost done. PSCCM can now:</p>
+      <label class="check"><input type="checkbox" id="su-check" ${comps.length ? 'checked' : 'disabled'}> Check which computers are online</label>
+      <label class="check"><input type="checkbox" id="su-scan" ${comps.length ? 'checked' : 'disabled'}> Take a first inventory (OS, hardware, installed software)</label>
+      <p class="small muted">After that, try <a href="#/deploy">Deploy</a> with a package such as 7-Zip, or look at <a href="#/updates">Updates</a>. Open this wizard again any time from the dashboard.</p>`,
+  ][step]();
+
+  el.innerHTML = `<div class="page-head"><h1>Set up PSCCM</h1><span class="sub">Step ${step + 1} of ${SETUP_STEPS.length}</span>
+      <div class="actions"><button onclick="App.suExit()">Skip setup</button></div></div>
+    <ol class="steps">${SETUP_STEPS.map((t, i) => `<li class="${i < step ? 'done' : i === step ? 'on' : ''}">${t}</li>`).join('')}</ol>
+    <div class="card"><div class="card-head"><h2>${SETUP_STEPS[step]}</h2></div><div class="card-body">${body}</div>
+      <div class="card-foot">
+        ${step ? '<button onclick="App.suGo(-1)">Back</button>' : ''}
+        <span style="flex:1"></span>
+        ${step && step < SETUP_STEPS.length - 1 ? '<button onclick="App.suGo(1, true)">Skip this step</button>' : ''}
+        <button class="primary" onclick="App.suNext()">${step === 0 ? 'Start' : step === SETUP_STEPS.length - 1 ? 'Finish' : 'Next'}</button>
+      </div></div>`;
+
+  if (step === 1) {
+    const vis = () => {
+      const w = $('input[name=su-win]:checked');
+      if ($('#su-win-f')) $('#su-win-f').style.display = w && w.value === 'stored' ? '' : 'none';
+      if ($('#su-ssh')) $('#su-ssh-f').style.display = $('#su-ssh').checked ? '' : 'none';
+    };
+    $$('input[name=su-win], #su-ssh').forEach((i) => { i.onchange = vis; });
+    vis();
+  }
+  if (step === 2) {
+    const vis = () => {
+      SU.useAd = $('input[name=su-ad]:checked').value === 'yes';
+      $('#su-ad-f').style.display = SU.useAd ? '' : 'none';
+      $('#ad-ldap').style.display = $('#ad-mode').value === 'ldap' ? '' : 'none';
+    };
+    $$('input[name=su-ad], #ad-mode').forEach((i) => { i.onchange = vis; });
+    vis();
+    suPicked();
+  }
+}
+
+function suPicked() {
+  const n = SU.ous.size;
+  if ($('#su-ou-picked')) $('#su-ou-picked').textContent = n ? `${n} OU${n === 1 ? '' : 's'} picked.` : 'No OU picked: the whole domain is imported.';
+}
+
+/** The AD settings from step 3, creating the LDAP credential if one was typed. */
+async function suAdSettings() {
+  const ad = { ...SU.ad, mode: $('#ad-mode').value, server: $('#ad-server').value.trim(), security: $('#ad-sec').value };
+  if ($('#ad-cred')) ad.credential_id = +$('#ad-cred').value || null;
+  else if (ad.mode === 'ldap' && $('#su-ldap-user').value.trim()) {
+    if (!SU.ldapCred) {
+      SU.ldapCred = (await POST('/credentials', { name: 'ad-reader', kind: 'ldap', username: $('#su-ldap-user').value.trim(), secret: $('#su-ldap-pass').value || null })).id;
+    }
+    ad.credential_id = SU.ldapCred;
+  }
+  ad.base_dns = OUS ? OUS.list.filter((n) => SU.ous.has(n.dn.toLowerCase())).map((n) => n.dn) : ad.base_dns;
+  return ad;
+}
+
+Object.assign(App, {
+  setup() { Object.assign(SU, { step: 0, ad: null }); location.hash = '#/setup'; },
+  suExit() { store.set('setup_done', true); location.hash = '#/dashboard'; },
+  suGo(d) { SU.step = Math.max(0, Math.min(SETUP_STEPS.length - 1, SU.step + d)); route(); },
+  suNext: act(async () => {
+    const step = SU.step;
+    if (step === 1) {
+      const w = $('input[name=su-win]:checked');
+      if (w && w.value === 'self') await POST('/credentials', { name: 'service-account', kind: 'windows', username: '', secret: null, default_for: 'windows' });
+      if (w && w.value === 'stored') {
+        const username = $('#su-win-user').value.trim();
+        if (!username) throw new Error('Enter the Windows user name, or pick another option');
+        await POST('/credentials', { name: 'windows-default', kind: 'windows', username, secret: $('#su-win-pass').value || null, default_for: 'windows' });
+      }
+      if ($('#su-ssh') && $('#su-ssh').checked) {
+        const username = $('#su-ssh-user').value.trim();
+        if (!username) throw new Error('Enter the SSH user name, or untick Linux');
+        await POST('/credentials', {
+          name: 'linux-default', kind: 'ssh', username, secret: $('#su-ssh-pass').value || null,
+          key_path: $('#su-ssh-key').value.trim() || null, default_for: 'linux',
+        });
+      }
+    }
+    if (step === 2 && SU.useAd) {
+      SU.ad = await suAdSettings();
+      await PUT('/settings/ad', SU.ad);
+    }
+    if (step === 4) {
+      for (const cb of $$('input[data-g]:checked')) {
+        const [name, rules] = SU.ideas[+cb.dataset.g];
+        await POST('/groups', { id: 0, name, description: 'Created by the setup wizard', kind: 'dynamic', rules: { tags: [], ...rules }, members: [] });
+      }
+    }
+    if (step === SETUP_STEPS.length - 1) {
+      if ($('#su-check').checked) POST('/computers/check', { names: null }).catch(() => {});
+      if ($('#su-scan').checked) await POST('/inventory/scan', { names: null });
+      store.set('setup_done', true);
+      toast('PSCCM is set up');
+      location.hash = $('#su-scan').checked ? '#/inventory' : '#/dashboard';
+      return;
+    }
+    App.suGo(1);
+  }),
+  suBrowse: act(async () => {
+    const box = $('#su-ou-box');
+    box.hidden = true; // toggleOuBrowser opens it again with fresh settings
+    OUS = null;
+    SU.ad = await suAdSettings();
+    await toggleOuBrowser(box, SU.ad, { multi: true, picked: SU.ous, onPick: suPicked });
+    $('#su-ad-result').innerHTML = OUS ? `<span style="color:var(--ok)">✓ Connected: ${OUS.list.filter((n) => n.kind !== 'domain').length} OUs</span>` : '';
+  }),
+  suImport: act(async () => {
+    $('#su-imp').textContent = 'Querying Active Directory…';
+    const list = (await POST('/ad/preview', {})).computers.filter((c) => !c.exists);
+    if (!list.length) { $('#su-imp').textContent = 'No new computers found.'; return; }
+    const r = await POST('/ad/import', { computers: list });
+    toast(`Imported ${r.imported} computer(s)`);
+    route();
+  }),
+  suAddNames: act(async () => {
+    const names = $('#su-names').value.trim();
+    if (!names) return;
+    const r = await POST('/computers', { names, os: null, tags: [], credential_id: null });
+    toast(`Added ${r.added} computer(s)`);
+    route();
+  }),
+});
+
 const PAGES = {
+  setup: pageSetup,
   dashboard: pageDashboard, deploy: pageDeploy, history: pageHistory, deployment: pageDeployment,
   computers: pageComputers, packages: pagePackages, package: pagePackage, schedules: pageSchedules, settings: pageSettings,
   gpo: pageGpo, agents: pageAgents, agent: pageAgent, inventory: pageInventory, catalog: pageCatalog, updates: pageUpdates,

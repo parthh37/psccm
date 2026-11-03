@@ -199,7 +199,10 @@ pub fn ou_tag(ou: &str) -> Option<String> {
 
 /// Query AD and return the matching computers (nothing is imported).
 pub async fn fetch(app: &App, s: &AdSettings) -> Result<Vec<AdComputer>> {
-    let entries = search(app, s, Base::Configured, &ldap_filter(s), ATTRS).await?;
+    let mut entries = search(app, s, Base::Configured, &ldap_filter(s), ATTRS).await?;
+    // An OU and one below it can both be configured; keep each computer once.
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|e| seen.insert(e.dn.to_lowercase()));
     let mut list: Vec<AdComputer> = entries.into_iter().map(make).collect();
     if s.stale_days > 0 {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(s.stale_days as i64);
@@ -217,6 +220,126 @@ pub async fn fetch(app: &App, s: &AdSettings) -> Result<Vec<AdComputer>> {
     }
     list.sort_by_key(|a| a.name.to_lowercase());
     Ok(list)
+}
+
+/// One OU or container in the OU browser.
+#[derive(Debug, Clone, Serialize)]
+pub struct OuNode {
+    pub dn: String,
+    pub name: String,
+    /// DN of the node above, `None` for the domain.
+    pub parent: Option<String>,
+    /// "domain", "ou" or "container" (e.g. CN=Computers).
+    pub kind: String,
+    pub description: String,
+    /// Computers directly in this OU that the import settings would include.
+    pub computers: usize,
+    /// The same, counting every OU below too.
+    pub total: usize,
+    /// Computers in the computer list that came from this OU or below.
+    pub known: usize,
+}
+
+/// The whole domain's OU tree, with computer counts. Only searches.
+pub async fn ous(app: &App, s: &AdSettings) -> Result<Vec<OuNode>> {
+    let ous = search(app, s, Base::Root, "(objectCategory=organizationalUnit)", &["name", "description"]).await?;
+    let computers = search(app, s, Base::Root, &ldap_filter(s), &["cn"]).await?;
+    let mut known: HashMap<String, usize> = HashMap::new();
+    for c in app.db.list_computers()? {
+        if let Some(ou) = c.ad_ou.filter(|o| !o.is_empty()) {
+            *known.entry(ou.to_lowercase()).or_default() += 1;
+        }
+    }
+    Ok(ou_tree(ous, computers.iter().map(|e| e.dn.as_str()), &known))
+}
+
+/// The DN one level up: "CN=a,OU=b,DC=x" -> "OU=b,DC=x". An escaped `\,`
+/// stays part of its RDN.
+fn parent_dn(dn: &str) -> Option<&str> {
+    let mut escaped = false;
+    for (i, ch) in dn.char_indices() {
+        match ch {
+            '\\' if !escaped => escaped = true,
+            ',' if !escaped => return Some(dn[i + 1..].trim_start()).filter(|p| !p.is_empty()),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+fn is_domain_root(dn: &str) -> bool {
+    dn.trim_start().get(..3).is_some_and(|p| p.eq_ignore_ascii_case("DC="))
+}
+
+/// Build the tree from OU entries and computer DNs. Containers that hold
+/// computers but are not OUs (CN=Computers) are added, as is the domain.
+fn ou_tree<'a>(ous: Vec<Entry>, computer_dns: impl IntoIterator<Item = &'a str>, known: &HashMap<String, usize>) -> Vec<OuNode> {
+    fn ensure(nodes: &mut HashMap<String, OuNode>, dn: &str) {
+        if nodes.contains_key(&dn.to_lowercase()) {
+            return;
+        }
+        let (kind, name) = if is_domain_root(dn) {
+            let name = dn.split(',').filter_map(|r| r.split_once('=')).map(|(_, v)| v.trim()).collect::<Vec<_>>().join(".");
+            ("domain", name)
+        } else if dn.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("OU=")) {
+            ("ou", cn_of(dn))
+        } else {
+            ("container", cn_of(dn))
+        };
+        let parent = if kind == "domain" { None } else { parent_dn(dn) };
+        nodes.insert(
+            dn.to_lowercase(),
+            OuNode {
+                dn: dn.to_string(),
+                name,
+                parent: parent.map(str::to_string),
+                kind: kind.into(),
+                description: String::new(),
+                computers: 0,
+                total: 0,
+                known: 0,
+            },
+        );
+        if let Some(p) = parent {
+            ensure(nodes, p);
+        }
+    }
+    /// Add `n` to the node at `key` and every node above it.
+    fn add_up(nodes: &mut HashMap<String, OuNode>, key: &str, n: usize, field: fn(&mut OuNode) -> &mut usize) {
+        let mut key = Some(key.to_string());
+        while let Some(k) = key {
+            let Some(node) = nodes.get_mut(&k) else { break };
+            *field(node) += n;
+            key = node.parent.as_ref().map(|p| p.to_lowercase());
+        }
+    }
+
+    let mut nodes: HashMap<String, OuNode> = HashMap::new();
+    for e in &ous {
+        ensure(&mut nodes, &e.dn);
+        let node = nodes.get_mut(&e.dn.to_lowercase()).expect("just added");
+        node.name = e.first("name").unwrap_or_else(|| cn_of(&e.dn));
+        node.description = e.first("description").unwrap_or_default();
+    }
+    for dn in computer_dns {
+        let Some(parent) = parent_dn(dn) else { continue };
+        ensure(&mut nodes, parent);
+        nodes.get_mut(&parent.to_lowercase()).expect("just added").computers += 1;
+        add_up(&mut nodes, &parent.to_lowercase(), 1, |n| &mut n.total);
+    }
+    for (ou, n) in known {
+        add_up(&mut nodes, ou, *n, |n| &mut n.known);
+    }
+    // Parents keep the spelling of the parent's own DN.
+    let spelled: HashMap<String, String> = nodes.iter().map(|(k, n)| (k.clone(), n.dn.clone())).collect();
+    let mut list: Vec<OuNode> = nodes.into_values().collect();
+    for n in &mut list {
+        if let Some(p) = n.parent.as_ref().and_then(|p| spelled.get(&p.to_lowercase())) {
+            n.parent = Some(p.clone());
+        }
+    }
+    list.sort_by_key(|n| (n.name.to_lowercase(), n.dn.to_lowercase()));
+    list
 }
 
 /// Read-only LDAP search in the configured mode. Only search operations
@@ -484,5 +607,42 @@ mod tests {
         assert_eq!(ou_tag("CN=Computers,DC=corp,DC=local"), None);
         // 2024-01-01T00:00:00Z
         assert_eq!(filetime_to_rfc3339(133_485_408_000_000_000).as_deref(), Some("2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn builds_ou_tree() {
+        assert_eq!(parent_dn("CN=web01,OU=Web,DC=corp,DC=local"), Some("OU=Web,DC=corp,DC=local"));
+        assert_eq!(parent_dn(r"OU=Smith\, John,OU=Users,DC=x"), Some("OU=Users,DC=x"));
+        assert_eq!(parent_dn("DC=local"), None);
+
+        let ou = |dn: &str, name: &str| Entry {
+            dn: dn.into(),
+            attrs: HashMap::from([("name".to_string(), vec![name.to_string()])]),
+        };
+        let ous = vec![
+            ou("OU=Servers,DC=corp,DC=local", "Servers"),
+            ou("OU=Web,OU=Servers,DC=corp,DC=local", "Web"),
+            ou("OU=Empty,DC=corp,DC=local", "Empty"),
+        ];
+        let computers = [
+            "CN=web01,OU=Web,OU=Servers,DC=corp,DC=local",
+            "CN=web02,ou=web,ou=servers,dc=corp,dc=local",
+            "CN=db01,OU=Servers,DC=corp,DC=local",
+            "CN=pc01,CN=Computers,DC=corp,DC=local",
+        ];
+        let known = HashMap::from([("ou=web,ou=servers,dc=corp,dc=local".to_string(), 1)]);
+        let tree = ou_tree(ous, computers, &known);
+        let get = |name: &str| tree.iter().find(|n| n.name == name).unwrap();
+
+        let domain = get("corp.local");
+        assert_eq!((domain.kind.as_str(), domain.parent.as_deref(), domain.total, domain.known), ("domain", None, 4, 1));
+        let servers = get("Servers");
+        assert_eq!((servers.computers, servers.total, servers.known), (1, 3, 1));
+        let web = get("Web");
+        assert_eq!((web.computers, web.total, web.parent.as_deref()), (2, 2, Some("OU=Servers,DC=corp,DC=local")));
+        let cn = get("Computers");
+        assert_eq!((cn.kind.as_str(), cn.total), ("container", 1));
+        assert_eq!(get("Empty").total, 0);
+        assert_eq!(tree.len(), 5);
     }
 }

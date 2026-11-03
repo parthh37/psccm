@@ -260,3 +260,27 @@ pre.log .k { color: #86efac; font-weight: 600; }
 .term { background: var(--code-bg); color: var(--code-text); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; padding: 12px; border-radius: 8px; height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
 .term-in { width: 100%; margin-top: 8px; font-family: ui-monospace, Menlo, Consolas, monospace; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); }
 .stat .meter { margin-top: 8px; }
+
+/* AD OU browser */
+.ou-box { border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); padding: 10px; margin-top: 8px; }
+.ou-box .search { width: 100%; max-width: none; margin-bottom: 8px; }
+.ou-list { max-height: 300px; overflow: auto; }
+.ou-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; white-space: nowrap; }
+.ou-row .muted { margin-left: auto; padding-left: 12px; }
+.ou-caret { border: none; background: none; width: 18px; padding: 0; color: var(--muted); flex: none; }
+.ou-caret:disabled { cursor: default; }
+.ou-name { display: inline-flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; }
+
+/* setup wizard */
+input[type=radio] { width: auto; accent-color: var(--accent); }
+.steps { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0; margin: 0 0 16px; counter-reset: step; }
+.steps li { counter-increment: step; display: flex; align-items: center; gap: 7px; padding: 5px 12px 5px 6px; border-radius: 16px;
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+.steps li::before { content: counter(step); width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--idle-soft); font-size: 11px; font-weight: 650; }
+.steps li.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.steps li.on::before { background: var(--accent); color: var(--accent-text); }
+.steps li.done { color: var(--text); }
+.steps li.done::before { content: '✓'; background: var(--ok); color: #fff; }
+.setup-list { padding-left: 20px; line-height: 1.9; }
+.card-foot { display: flex; gap: 8px; align-items: center; padding: 12px 16px; border-top: 1px solid var(--border); }
