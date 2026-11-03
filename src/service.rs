@@ -253,7 +253,7 @@ mod imp {
             Ok(st) => out += &format!("Service:   {:?} (exit code {:?})\n", st.current_state, st.exit_code),
             Err(_) => out += "Service:   not installed\n",
         }
-        out += &format!("Listens:   {}:{} {}\n", s.bind, s.port, if s.token.is_some() { "(token required)" } else { "(this computer only)" });
+        out += &format!("Listens:   {}:{} {}\n", s.bind, s.port, if s.token.is_some() { "(token required)" } else { "(this computer only, administrators only)" });
         let ip: std::net::IpAddr = match s.bind.parse() {
             Ok(ip) if !std::net::IpAddr::is_unspecified(&ip) => ip,
             _ => std::net::Ipv4Addr::LOCALHOST.into(),
@@ -347,7 +347,11 @@ mod imp {
             crate::scheduler::spawn(app.clone());
             let addr: std::net::SocketAddr = format!("{}:{}", s.bind, s.port).parse()?;
             tracing::info!("PSCCM service listening on {addr}");
-            crate::web::serve(app, addr, s.token.filter(|t| !t.is_empty()), async move { stop.notified().await }).await
+            // Without a token the console is reachable from this computer only, but
+            // everyone signed in here could use it: let in administrators only.
+            let token = s.token.filter(|t| !t.is_empty());
+            let admins_only = token.is_none();
+            crate::web::serve(app, addr, token, admins_only, async move { stop.notified().await }).await
         });
         if let Err(e) = &result {
             tracing::error!("{e:#}");
