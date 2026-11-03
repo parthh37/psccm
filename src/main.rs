@@ -257,6 +257,8 @@ enum ServiceCmd {
     },
     /// Stop and remove the service.
     Uninstall,
+    /// Show whether the service runs, where it listens and its last log lines.
+    Status,
     /// Used by the service manager.
     #[command(hide = true)]
     Run,
@@ -450,6 +452,9 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
         }
         Cmd::Service { cmd } => match cmd {
             ServiceCmd::Install { bind, port, token, new_token_file, account } => {
+                if cfg!(not(windows)) {
+                    return service::install(&app.data_dir, None, None);
+                }
                 let mut token = token.filter(|t| !t.is_empty());
                 check_token(token.as_deref())?;
                 if let Some(file) = &new_token_file {
@@ -461,10 +466,47 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
                 if !ip.is_loopback() && token.is_none() {
                     bail!("binding to {bind} needs --token");
                 }
-                app.db.set_setting("server", &service::ServerSettings { bind, port, token })?;
+                // Otherwise the service "starts" and stops at once with nothing listening.
+                if let Err(e) = std::net::TcpListener::bind((ip, port)) {
+                    bail!("port {port} on {bind} is in use ({e}): another program (IIS, another web server, an older PSCCM?) listens there; choose another --port");
+                }
+                let s = service::ServerSettings { bind, port, token };
+                app.db.set_setting("server", &s)?;
+                // Lock the folder now, while running elevated: the service account
+                // may not be allowed to change its permissions later.
+                app.secure_data_dir();
+                if let Some(acct) = account.as_deref().filter(|a| !a.is_empty()) {
+                    service::prepare_account(acct, &app.data_dir)?;
+                }
+                if !ip.is_loopback()
+                    && let Err(e) = service::open_firewall(port)
+                {
+                    eprintln!("warning: {e:#}; allow TCP port {port} in the firewall so other computers can connect");
+                }
+                service::publish(&s, &app.data_dir)?;
                 let password = std::env::var("PSCCM_SERVICE_PASSWORD").ok();
                 service::install(&app.data_dir, account, password)?;
+                // The listener comes up a moment after the service reports "running".
+                let probe: std::net::SocketAddr =
+                    (if ip.is_unspecified() { std::net::Ipv4Addr::LOCALHOST.into() } else { ip }, port).into();
+                let up = (0..20).any(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::net::TcpStream::connect_timeout(&probe, std::time::Duration::from_secs(1)).is_ok()
+                });
+                if !up {
+                    bail!(
+                        "the service was installed but the console does not answer on port {port}; see {}",
+                        app.data_dir.join("psccm.log").display()
+                    );
+                }
+                let host = if ip.is_loopback() || ip.is_unspecified() { "localhost".to_string() } else { ip.to_string() };
                 println!("Service '{}' installed and started (data: {})", service::SERVICE_NAME, app.data_dir.display());
+                println!("Console: http://{host}:{port}/");
+                Ok(())
+            }
+            ServiceCmd::Status => {
+                let s: service::ServerSettings = app.db.get_setting("server")?;
+                print!("{}", service::status_report(&s, &app.data_dir));
                 Ok(())
             }
             ServiceCmd::Uninstall => {

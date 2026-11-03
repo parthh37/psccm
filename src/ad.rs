@@ -27,7 +27,8 @@ pub struct AdSettings {
     /// windows mode (uses the console's domain).
     #[serde(default)]
     pub server: String,
-    /// ldap mode: "ldaps" (636), "starttls" (389) or "none" (389, plain)
+    /// ldap mode: "ldaps" (636) or "starttls" (389). "none" (plain text) is
+    /// refused, since the bind would send the stored password in the clear.
     #[serde(default = "default_security")]
     pub security: String,
     #[serde(default)]
@@ -368,6 +369,10 @@ async fn search_ldap(app: &App, s: &AdSettings, base: Base<'_>, filter: &str, at
     } else {
         format!("ldap://{server}:389")
     };
+    // A simple bind sends the password as is: never over an unencrypted connection.
+    if url.starts_with("ldap://") && s.security != "starttls" {
+        bail!("refusing to send the AD password unencrypted: choose LDAPS or StartTLS, or use Windows mode (no password stored)");
+    }
     let settings = LdapConnSettings::new()
         .set_conn_timeout(Duration::from_secs(15))
         .set_starttls(s.security == "starttls")

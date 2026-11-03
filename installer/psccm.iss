@@ -36,13 +36,27 @@ CloseApplications=no
 SetupLogging=yes
 LicenseFile=..\LICENSE
 
+[Tasks]
+Name: "trayicon"; Description: "Show the PSCCM status icon in the notification area (for every user who signs in here)"
+
 [Files]
 Source: "..\target\release\psccm.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\psccm-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
+[InstallDelete]
+; Status icon files an earlier upgrade moved aside while they were running.
+Type: files; Name: "{app}\psccm-tray*.old"
+
 [Dirs]
 Name: "{commonappdata}\PSCCM"
+
+[Registry]
+; Where the status icon finds the console (it cannot read the admin-only database).
+Root: HKLM; Subkey: "SOFTWARE\PSCCM"; ValueType: dword; ValueName: "Port"; ValueData: "{code:GetPort}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "SOFTWARE\PSCCM"; ValueType: string; ValueName: "DataDir"; ValueData: "{commonappdata}\PSCCM"
+Root: HKLM; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PSCCM Tray"; ValueData: """{app}\psccm-tray.exe"""; Tasks: trayicon; Flags: uninsdeletevalue
 
 [Icons]
 Name: "{group}\PSCCM Console"; Filename: "{code:ConsoleUrl}"
@@ -51,9 +65,15 @@ Name: "{group}\Uninstall PSCCM"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{code:ConsoleUrl}"; Description: "Open the PSCCM console"; Flags: shellexec postinstall skipifsilent nowait
+; Silent upgrades skip this: running status icons restart into the new file themselves.
+Filename: "{app}\psccm-tray.exe"; Flags: nowait runasoriginaluser skipifsilent; Tasks: trayicon
 
 [UninstallRun]
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM psccm-tray.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopTray"
 Filename: "{app}\psccm.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
+
+[UninstallDelete]
+Type: files; Name: "{app}\psccm-tray*.old"
 
 [Messages]
 FinishedLabel=PSCCM is installed and running as the "PSCCM" Windows service.
@@ -147,8 +167,15 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code, i: Integer;
+  TrayExe: string;
 begin
   Result := '';
+  { A running status icon keeps its file in use. A running file can still be
+    renamed, so move it aside; the running icons notice the new file and
+    restart into it. }
+  TrayExe := ExpandConstant('{app}\psccm-tray.exe');
+  if FileExists(TrayExe) then
+    RenameFile(TrayExe, ExpandConstant('{app}\psccm-tray-') + GetDateTimeString('yyyymmddhhnnss', #0, #0) + '.old');
   if ServiceExists() then begin
     Exec(ExpandConstant('{sys}\sc.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, Code);
     for i := 1 to 60 do begin
@@ -181,8 +208,9 @@ begin
     SetEnvironmentVariable('PSCCM_SERVICE_PASSWORD', AccountPage.Values[1]);
   end;
   if not Exec(ExpandConstant('{app}\psccm.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
-    SuppressibleMsgBox('The PSCCM service could not be installed (exit code ' + IntToStr(Code) + ').' + #13#10 +
-      'Check the account name and password, or run "psccm service install" from an administrator prompt.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox('The PSCCM service could not be installed or did not start (exit code ' + IntToStr(Code) + ').' + #13#10 +
+      'Check the account name and password and that port ' + GetPort('') + ' is free. From an administrator prompt, ' +
+      '"psccm service status" shows the service state and the end of ' + ExpandConstant('{commonappdata}\PSCCM\psccm.log') + '.', mbError, MB_OK, IDOK);
   SetEnvironmentVariable('PSCCM_SERVICE_PASSWORD', '');
   if (NetworkPage.SelectedValueIndex = 1) and LoadStringFromFile(TokenFile, TokenText) then
     Token := Trim(String(TokenText));

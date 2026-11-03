@@ -506,6 +506,23 @@ impl Db {
         }
     }
 
+    /// Re-encrypt secrets saved in an older format. Values this account
+    /// cannot decrypt are left as they are. Returns how many were upgraded.
+    pub fn upgrade_secrets(&self) -> Result<usize> {
+        let old: Vec<(i64, String)> = self.with(|c| {
+            let mut st = c.prepare("SELECT id, secret FROM credentials WHERE secret IS NOT NULL")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        })?;
+        let mut n = 0;
+        for (id, stored) in old.into_iter().filter(|(_, s)| secrets::is_legacy(s)) {
+            let Ok(plain) = secrets::unprotect(&stored) else { continue };
+            let new = secrets::protect(&plain)?;
+            self.with(|c| c.execute("UPDATE credentials SET secret=?2 WHERE id=?1 AND secret=?3", params![id, new, stored]))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     // ------------------------------------------------------------- known hosts
 
     pub fn known_host(&self, host: &str) -> Result<Option<String>> {
@@ -1861,6 +1878,37 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credentials saved by older versions are re-encrypted in place and
+    /// still decrypt to the same password.
+    #[cfg(windows)]
+    #[test]
+    fn upgrades_legacy_secrets() {
+        let dir = std::env::temp_dir().join(format!("psccm-sec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        let cred = |name: &str| NewCredential {
+            name: name.into(),
+            kind: "ldap".into(),
+            username: "reader@corp.local".into(),
+            secret: Some("s3cret".into()),
+            key_path: None,
+            default_for: None,
+        };
+        let old = db.add_credential(&cred("old")).unwrap();
+        let new = db.add_credential(&cred("new")).unwrap();
+        let legacy = secrets::protect_legacy("s3cret");
+        db.with(|c| c.execute("UPDATE credentials SET secret=?2 WHERE id=?1", params![old, legacy])).unwrap();
+        assert_eq!(db.upgrade_secrets().unwrap(), 1);
+        assert_eq!(db.upgrade_secrets().unwrap(), 0);
+        for id in [old, new] {
+            let stored: String = db.with(|c| c.query_row("SELECT secret FROM credentials WHERE id=?1", [id], |r| r.get(0))).unwrap();
+            assert!(stored.starts_with("dpapi2:"));
+            assert_eq!(db.credential_secret(id).unwrap().as_deref(), Some("s3cret"));
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn records_inventory_changes() {
