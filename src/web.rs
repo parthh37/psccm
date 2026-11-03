@@ -123,6 +123,7 @@ pub async fn serve(
         .route("/known-hosts/{host}", delete(forget_host))
         .route("/ad/preview", post(ad_preview))
         .route("/ad/import", post(ad_import))
+        .route("/ad/ous", post(ad_ous))
         .route("/deployments", get(list_deployments).post(create_deployment))
         .route("/deployments/{id}", get(get_deployment).delete(delete_deployment))
         .route("/deployments/{id}/cancel", post(cancel_deployment))
@@ -814,6 +815,14 @@ async fn ad_preview(State(st): State<St>, Json(req): Json<AdPreview>) -> ApiResu
     };
     let list = ad::fetch(&st.app, &s).await?;
     Ok(Json(json!({ "computers": list })))
+}
+
+async fn ad_ous(State(st): State<St>, Json(req): Json<AdPreview>) -> ApiResult {
+    let s = match req.settings {
+        Some(s) => s,
+        None => st.app.db.get_setting("ad")?,
+    };
+    Ok(Json(json!({ "ous": ad::ous(&st.app, &s).await? })))
 }
 
 #[derive(Deserialize)]

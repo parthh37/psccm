@@ -8,7 +8,8 @@ computers without installing an agent, similar to PDQ Deploy.
 
 - **Windows** targets over **WinRM** (PowerShell remoting, Kerberos/NTLM, encrypted).
 - **Linux** targets over **SSH** (password or key, `sudo`), with host-key pinning.
-- **Active Directory** computer import that is **read-only**: it only runs LDAP searches.
+- **Active Directory** computer import that is **read-only**: it only runs LDAP searches. An OU
+  browser shows the OU tree with computer counts for picking what to import.
 - **Computer groups**: static lists or dynamic rules (OS, name pattern, OU, AD security group, tag,
   installed software and version, pending reboot, low disk space).
 - **Inventory**: agentless scans of OS, hardware, disks, logged-on user, pending reboot and installed
@@ -21,7 +22,7 @@ computers without installing an agent, similar to PDQ Deploy.
 - **Optional agent** for computers with no WinRM/SSH: it connects out to the console and adds live
   CPU/disk analytics, on-demand event-log capture, Task Scheduler, firewall and local-user
   management, and an in-browser terminal — all with nothing opened inbound.
-- **Web console** for everyday use, plus a **CLI** for scripts and CI pipelines.
+- **Web console** with a first-run setup wizard, plus a **CLI** for scripts and CI pipelines.
 - **YAML packages** with detection, variables, conditions, retries, rollback, rolling
   batches and steps delegated to another host (e.g. drain HAProxy while patching IIS).
 - **App catalog**: 7-Zip, Chrome, Firefox, Node.js, Python, Java, VS Code, Git and more at
@@ -79,6 +80,10 @@ Windows targets need a Windows console (PowerShell remoting); Linux targets work
 
 ## First steps
 
+A new console opens the **setup wizard**, which walks through the steps below: credentials, Active
+Directory and the OUs to import from, adding computers, a few dynamic groups, and a first online check
+and inventory scan. Every step can be skipped; reopen the wizard from *Dashboard → Getting started*.
+
 1. **Settings → Credentials.** If the service already runs as a domain admin-type account, Windows
    needs no credential. Otherwise add a Windows credential (`CORP\deploy`) and tick *default for
    Windows*. For Linux add an SSH credential (user with sudo) and tick *default for Linux*. Add
@@ -131,6 +136,12 @@ account needs no delegated rights. Options cover the OUs to search, an extra LDA
 disabled or stale computers, tagging by OU (`OU=Web Servers` → tag `web-servers`) and auto-sync every N
 minutes. Imports add and refresh computers; they never delete any. Each computer's AD security group
 memberships are imported too, so they can drive dynamic groups.
+
+**OU browser.** *Browse OUs…* (under *Search in OUs*, in the group editor's *AD OU contains* rule and in
+the setup wizard) shows the domain's OU tree with how many computers each OU holds and how many are
+already in the computer list. Tick OUs to import from, or click one to use it in a dynamic group. It
+reads the tree with the same read-only searches (`objectCategory=organizationalUnit`); `psccm ad ous`
+prints it on the command line.
 
 ## Computer groups
 
@@ -427,7 +438,7 @@ psccm computers list | add <names> [--os linux] [--tag web] | remove <names> | c
 psccm groups list | create <name> --computers a,b
 psccm inventory scan [names…] | show <name> | software [--name "Chrome*"]
 psccm updates scan [names…] | list [--security] | show <name>
-psccm ad sync [--import]
+psccm ad sync [--import] | ous
 psccm gpo list | import <GUID> | import-folder <path> [--name N]
 psccm catalog list | check | add <ids> | update [ids] | remove <id>
 psccm cred add --name deploy --kind ssh --user deploy [--key ~/.ssh/id_ed25519] [--default-for linux]

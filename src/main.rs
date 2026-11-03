@@ -324,6 +324,8 @@ enum AdCmd {
         #[arg(long)]
         import: bool,
     },
+    /// Show the OU tree with how many computers each OU holds (read-only).
+    Ous,
 }
 
 #[derive(Subcommand)]
@@ -575,6 +577,19 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
                 }
                 println!("{} computers (run with --import to add them)", list.len());
             }
+            Ok(())
+        }
+        Cmd::Ad { cmd: AdCmd::Ous } => {
+            let settings: ad::AdSettings = app.db.get_setting("ad")?;
+            let ous = ad::ous(&app, &settings).await?;
+            fn print(ous: &[ad::OuNode], parent: Option<&str>, depth: usize) {
+                for n in ous.iter().filter(|n| n.parent.as_deref() == parent) {
+                    let label = format!("{}{}", "  ".repeat(depth), n.name);
+                    println!("{label:<50} {:>6} computers {:>6} in list   {}", n.total, n.known, n.dn);
+                    print(ous, Some(&n.dn), depth + 1);
+                }
+            }
+            print(&ous, None, 0);
             Ok(())
         }
         Cmd::Cred { cmd } => cred_cmd(&app, cmd),
