@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, bail};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRef, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, FromRef, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -49,6 +49,9 @@ type ApiResult<T = Value> = Result<Json<T>, ApiError>;
 struct St {
     app: App,
     token: Option<String>,
+    /// Only Administrators of this computer, SYSTEM and the account PSCCM
+    /// runs as may connect (see `peer`).
+    admins_only: bool,
 }
 
 /// Lets the agent handlers extract `State<App>` from the shared `St` state.
@@ -58,14 +61,33 @@ impl FromRef<St> for App {
     }
 }
 
+/// `admins_only`: let in only local connections from Administrators of this
+/// computer, SYSTEM and the account PSCCM runs as (Windows, loopback only).
 pub async fn serve(
     app: App,
     addr: SocketAddr,
     token: Option<String>,
+    admins_only: bool,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     if !addr.ip().is_loopback() && token.is_none() {
         bail!("listening on {addr} needs --token (or PSCCM_TOKEN) so others on the network cannot deploy");
+    }
+    if admins_only {
+        if !cfg!(windows) {
+            bail!("--admins-only is only available on Windows");
+        }
+        if !addr.ip().is_loopback() {
+            bail!("--admins-only checks who is signed in to this computer, so it needs a loopback --bind (127.0.0.1 or ::1)");
+        }
+        if crate::peer::prepare() {
+            tracing::info!("the console accepts administrators of this computer only");
+        } else {
+            tracing::warn!(
+                "PSCCM runs as an account that cannot look at other users' programs, so only that account can use \
+                 the console; run the service as Local System or as a local administrator, or set an access token"
+            );
+        }
     }
     if token.as_deref().is_some_and(|t| t.len() < MIN_TOKEN_LEN) {
         tracing::warn!("the access token is shorter than {MIN_TOKEN_LEN} characters; use a long random one");
@@ -76,7 +98,7 @@ pub async fn serve(
         Ok(n) => tracing::info!("re-encrypted {n} stored credential(s) in the current format"),
         Err(e) => tracing::warn!("could not re-encrypt stored credentials: {e:#}"),
     }
-    let st = St { app, token };
+    let st = St { app, token, admins_only };
     let api = Router::new()
         .route("/summary", get(summary))
         .route("/computers", get(list_computers).post(add_computers))
@@ -164,7 +186,9 @@ pub async fn serve(
         .layer(middleware::from_fn_with_state(st.clone(), guard))
         .with_state(st);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).with_graceful_shutdown(shutdown).await?;
+    axum::serve(listener, router.into_make_service_with_connect_info::<crate::peer::Conn>())
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -187,6 +211,9 @@ async fn auth(State(st): State<St>, headers: HeaderMap, req: Request, next: Next
 }
 
 /// Browser-facing protections for every request:
+/// * with `admins_only` the Windows account that opened the connection must
+///   be an administrator of this computer, so other people signed in to a
+///   shared server cannot drive a console that has no token;
 /// * without a token (loopback only) the Host header must name this machine,
 ///   so a web page cannot reach the console through DNS rebinding;
 /// * a request a browser sent from another site (its `Origin` differs from the
@@ -194,6 +221,20 @@ async fn auth(State(st): State<St>, headers: HeaderMap, req: Request, next: Next
 ///   hijacking of the terminal;
 /// * responses carry headers that stop framing, sniffing and leaking.
 async fn guard(State(st): State<St>, headers: HeaderMap, req: Request, next: Next) -> Response {
+    if st.admins_only
+        && let Err(why) = local_user_allowed(&req)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CACHE_CONTROL, "no-store")],
+            format!(
+                "Only administrators of this computer can use this PSCCM console.\n\n{why}.\n\n\
+                 Sign in to the server as an administrator, or open the console from another computer \
+                 with its access token (psccm service install --bind 0.0.0.0 --token ...)."
+            ),
+        )
+            .into_response();
+    }
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     if st.token.is_none() && !is_local_host(host) {
         return (StatusCode::FORBIDDEN, "open the console as http://localhost or http://127.0.0.1").into_response();
@@ -229,6 +270,14 @@ async fn guard(State(st): State<St>, headers: HeaderMap, req: Request, next: Nex
         h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
     }
     resp
+}
+
+/// The verdict for the connection `req` arrived on (see `peer::Conn`).
+fn local_user_allowed(req: &Request) -> Result<(), String> {
+    match req.extensions().get::<ConnectInfo<crate::peer::Conn>>() {
+        Some(ConnectInfo(conn)) => conn.verdict().as_ref().map(|_| ()).map_err(Clone::clone),
+        None => Err("the connection could not be identified".into()),
+    }
 }
 
 /// `localhost`, `127.0.0.1` or `[::1]`, with or without a port.

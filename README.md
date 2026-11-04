@@ -56,8 +56,8 @@ Windows. Being agentless, it needs nothing on the targets beyond WinRM or SSH.
 - **Network access**: this computer only, or other computers too. For network access a random
   access token is generated and shown at the end.
 - **Service account**: the Windows account the `PSCCM` service runs as. Use a domain account that is
-  local admin on your targets (e.g. `CORP\svc-psccm`), so Windows deployments use Kerberos with no
-  stored password. Leave it empty for Local System and add a Windows credential in the console.
+  local admin on your targets and on this server (e.g. `CORP\svc-psccm`), so Windows deployments use
+  Kerberos with no stored password. Leave it empty for Local System and add a Windows credential in the console.
 
 Files go to `C:\Program Files\PSCCM`, data to `C:\ProgramData\PSCCM`. Upgrades keep the service
 account and settings.
@@ -67,7 +67,9 @@ The setup also adds a **status icon** to the notification area for everyone who 
 it onto the taskbar to keep it in sight. Green: running and the console answers. Yellow:
 starting/stopping, or the service runs but nothing answers on the port. Red: stopped. Grey: not
 installed. It pops up a notice when the console goes down or comes back. Right-click for *Open
-console*, *Start / Stop / Restart service* and *View log* (these ask for administrator rights).
+console*, *Start / Stop / Restart service* and *View log* (these ask for administrator rights). Only
+administrators of the server can open the console itself (see [Security notes](#security-notes)); for
+anyone else the icon says so.
 
 ### The service runs but there is no page on port 8080
 
@@ -454,7 +456,7 @@ of the package are kept with each deployment.
 ## CLI
 
 ```text
-psccm serve [--bind IP] [--port N] [--token T] [--no-browser]
+psccm serve [--bind IP] [--port N] [--token T] [--no-browser] [--admins-only]
 psccm deploy <package> -t web01,web02 [--group "Web farm"] [--tag web] [-v version=22] [--batch-size 1] [--max-failures 0] [--force]
 psccm run web01,lb01 -s "Get-Service W3SVC"          # ad-hoc command (PowerShell / bash)
 psccm packages list | show <id> | validate <file.yaml>
@@ -611,6 +613,16 @@ bash (runs with `set -eo pipefail`):
   generates a random one). Anyone who can use the console can run commands as admin on every managed
   computer, so protect it like a domain admin account. The console itself speaks plain HTTP: when other
   computers use it, put it behind an HTTPS reverse proxy that forwards `Host` or `X-Forwarded-Host`.
+- **Other people signed in to the server.** Localhost alone does not keep the console private:
+  on a shared server everyone who signs in (an RDP user, say) can reach `http://localhost:8080`. The
+  Windows service without a token therefore asks Windows which program opened each connection and
+  serves only **members of the local Administrators group** (also when UAC runs their browser
+  unelevated), **Local System** and **the account the service runs as**; everyone else gets
+  "Only administrators of this computer can use this PSCCM console" and the refusal is logged. For this
+  the service must run as Local System or as an account that is a local administrator of the server,
+  which updates need anyway. Under any other account only that account gets in, and `psccm.log` says
+  so at start. A console with a token checks the token instead. `psccm serve` (portable) lets in any
+  local user, as before; add `--admins-only` to get the service behaviour on a shared computer.
 - Browser protections: requests from other sites (a different `Origin`) are refused, including the
   terminal WebSocket; without a token only `localhost` / `127.0.0.1` host names are accepted (DNS
   rebinding); responses carry a Content-Security-Policy and refuse framing.

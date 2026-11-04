@@ -10,6 +10,7 @@ mod gpo;
 mod groups;
 mod inventory;
 mod package;
+mod peer;
 mod scheduler;
 mod secrets;
 mod service;
@@ -53,6 +54,10 @@ enum Cmd {
         /// Do not open the browser.
         #[arg(long)]
         no_browser: bool,
+        /// Only let in administrators of this computer and the account running PSCCM (Windows,
+        /// loopback bind), for a shared server. The service always does this when it has no token.
+        #[arg(long)]
+        admins_only: bool,
     },
     /// Deploy a package and wait for the result (exit code 1 if any target failed).
     Deploy {
@@ -431,9 +436,10 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
         port: 8080,
         token: std::env::var("PSCCM_TOKEN").ok(),
         no_browser: false,
+        admins_only: false,
     });
     match command {
-        Cmd::Serve { bind, port, token, no_browser } => {
+        Cmd::Serve { bind, port, token, no_browser, admins_only } => {
             check_token(token.as_deref())?;
             let addr: std::net::SocketAddr = format!("{bind}:{port}").parse().context("invalid --bind/--port")?;
             app.db.fail_interrupted()?;
@@ -448,7 +454,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
-            web::serve(app, addr, token.filter(|t| !t.is_empty()), shutdown).await
+            web::serve(app, addr, token.filter(|t| !t.is_empty()), admins_only, shutdown).await
         }
         Cmd::Service { cmd } => match cmd {
             ServiceCmd::Install { bind, port, token, new_token_file, account } => {

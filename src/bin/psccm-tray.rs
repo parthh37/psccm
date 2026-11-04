@@ -172,16 +172,20 @@ mod tray {
 
     /// Does the console serve its page? A plain GET of "/" with a local Host
     /// header, which the console accepts with or without an access token.
-    fn console_answers(cfg: &Config) -> bool {
+    /// Returns the HTTP status: 403 means the console runs but lets in
+    /// administrators only, and this user is not one.
+    fn console_status(cfg: &Config) -> Option<u16> {
         let addr = SocketAddr::new(cfg.ip(), cfg.port);
-        let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(800)) else { return false };
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
         let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
         let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
-        if write!(s, "GET / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n", cfg.port).is_err() {
-            return false;
-        }
+        write!(s, "GET / HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n", cfg.port).ok()?;
         let mut head = [0u8; 12];
-        s.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.") && &head[8..12] == b" 200"
+        s.read_exact(&mut head).ok()?;
+        if !head.starts_with(b"HTTP/1.") {
+            return None;
+        }
+        std::str::from_utf8(&head[9..12]).ok()?.parse().ok()
     }
 
     fn check(cfg: &Config) -> (Health, String) {
@@ -192,8 +196,11 @@ mod tray {
             return (Health::Missing, "PSCCM service is not installed".into());
         };
         match st.current_state {
-            ServiceState::Running if console_answers(cfg) => (Health::Ok, format!("PSCCM is running\n{}", cfg.url())),
-            ServiceState::Running => (Health::Silent, format!("PSCCM service runs, but nothing answers on port {}", cfg.port)),
+            ServiceState::Running => match console_status(cfg) {
+                Some(200) => (Health::Ok, format!("PSCCM is running\n{}", cfg.url())),
+                Some(403) => (Health::Ok, "PSCCM is running\nOnly administrators of this server can open the console".into()),
+                _ => (Health::Silent, format!("PSCCM service runs, but nothing answers on port {}", cfg.port)),
+            },
             ServiceState::StartPending | ServiceState::ContinuePending => (Health::Busy, "PSCCM is starting…".into()),
             ServiceState::StopPending | ServiceState::PausePending | ServiceState::Paused => (Health::Busy, "PSCCM is stopping…".into()),
             ServiceState::Stopped => {
