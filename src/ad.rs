@@ -532,7 +532,9 @@ pub(crate) async fn run_ps(script: &str, env: &[(&str, &str)]) -> Result<String>
 /// [`run_ps`] with a timeout in seconds.
 pub(crate) async fn run_ps_timeout(script: &str, env: &[(&str, &str)], secs: u64) -> Result<String> {
     let mut cmd = tokio::process::Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-OutputFormat", "Text", "-EncodedCommand"])
+    // Started from PowerShell 7, 5.1 would inherit its module path and fail to load its own modules.
+    cmd.env_remove("PSModulePath")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-OutputFormat", "Text", "-EncodedCommand"])
         .arg(encode_command(script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

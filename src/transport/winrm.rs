@@ -89,6 +89,8 @@ impl WinRm {
             .env("PSCCM_SKIPCA", if self.skip_ca_check { "1" } else { "0" })
             .env_remove("PSCCM_USER")
             .env_remove("PSCCM_PASS")
+            // Started from PowerShell 7, 5.1 would inherit its module path and fail to load its own modules.
+            .env_remove("PSModulePath")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
