@@ -24,6 +24,8 @@ pub struct Ctx {
     pub scan: Mutex<crate::inventory::ScanState>,
     /// Progress of the current (or last) Windows Update scan.
     pub wu_scan: Mutex<crate::inventory::ScanState>,
+    /// AD restore plans waiting for confirmation, and the running AD backup.
+    pub ad_backup: Mutex<crate::adbackup::State>,
 }
 
 /// Console-side agent settings: the shared enrollment token agents present.
@@ -81,6 +83,8 @@ const BUILTIN: &[(&str, &str)] = &[
     ("windows-update.yaml", include_str!("../packages/windows-update.yaml")),
     ("reboot.yaml", include_str!("../packages/reboot.yaml")),
     ("install-agent.yaml", include_str!("../packages/install-agent.yaml")),
+    ("ad-systemstate-backup.yaml", include_str!("../packages/ad-systemstate-backup.yaml")),
+    ("ad-ds-new-forest.yaml", include_str!("../packages/ad-ds-new-forest.yaml")),
 ];
 
 pub fn builtin_packages() -> &'static [(&'static str, &'static str)] {
@@ -98,6 +102,7 @@ impl Ctx {
             agents: Hub::default(),
             scan: Mutex::new(Default::default()),
             wu_scan: Mutex::new(Default::default()),
+            ad_backup: Mutex::new(Default::default()),
         };
         std::fs::create_dir_all(ctx.packages_dir())?;
         std::fs::create_dir_all(ctx.repo_dir())?;

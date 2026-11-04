@@ -164,6 +164,9 @@ pub fn adhoc_package(command: &str, shell: Option<Shell>) -> Result<Package> {
 /// Create a new deployment from an old one (all targets or only failed ones).
 pub fn redeploy(app: &App, id: &str, only_failed: bool) -> Result<String> {
     let dep = app.db.get_deployment(id)?.ok_or_else(|| not_found("deployment"))?;
+    if dep.source == crate::adbackup::RESTORE_SOURCE {
+        bail!("an AD restore does not run again from here: build a new restore plan on the AD backup page (it is confirmed twice before it runs)");
+    }
     let pkg: Package = serde_yaml::from_str(&dep.package_yaml)?;
     let targets = if only_failed {
         let failed: Vec<String> = app

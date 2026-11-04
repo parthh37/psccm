@@ -133,12 +133,13 @@ const ICON = {
   schedules: '<path d="M7 2h2v2h6V2h2v2h3v18H4V4h3zm-1 8v10h12V10zm0-4v2h12V6z"/>',
   settings: '<path d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zm8.6 5.5l1.9 1.5-2 3.4-2.3-.9a7.7 7.7 0 0 1-2.1 1.2L15.8 21h-4l-.4-2.4a7.7 7.7 0 0 1-2.1-1.2l-2.3.9-2-3.4L7 13.4a7.8 7.8 0 0 1 0-2.8L5 9.1l2-3.4 2.3.9a7.7 7.7 0 0 1 2.1-1.2L11.8 3h4l.4 2.4a7.7 7.7 0 0 1 2.1 1.2l2.3-.9 2 3.4-1.9 1.5a7.8 7.8 0 0 1 0 2.9z"/>',
   agents: '<path d="M4 4h16v10H4zm2 2v6h12V6zm-3 11h18v2H3zm9-9a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/>',
+  adbackup: '<path d="M12 2C7 2 3 3.6 3 5.5v13C3 20.4 7 22 12 22s9-1.6 9-3.5v-13C21 3.6 17 2 12 2zm0 2c4.4 0 7 1.2 7 1.5S16.4 7 12 7 5 5.8 5 5.5 7.6 4 12 4zM5 8.3C6.6 9 9.1 9.5 12 9.5s5.4-.5 7-1.2V12c0 .3-2.6 1.5-7 1.5S5 12.3 5 12zm0 6.5c1.6.7 4.1 1.2 7 1.2s5.4-.5 7-1.2v3.7c0 .3-2.6 1.5-7 1.5s-7-1.2-7-1.5z"/>',
   updates: '<path d="M12 4a8 8 0 0 1 7.4 5H22l-3.5 4L15 9h2.2A6 6 0 0 0 6.3 10.1L4.4 9.4A8 8 0 0 1 12 4zm-7.5 7L8 15H5.8a6 6 0 0 0 10.9 1.9l1.9.7A8 8 0 0 1 3.6 15H1zm6.5-3h2v4.6l3 1.8-1 1.7-4-2.4z"/>',
 };
 
 const NAV = [
   ['dashboard', 'Dashboard'], ['deploy', 'Deploy'], ['history', 'Deployments'], ['computers', 'Computers'],
-  ['agents', 'Agents'], ['inventory', 'Inventory'], ['updates', 'Updates'], ['packages', 'Packages'], ['catalog', 'App catalog'], ['gpo', 'Group Policy'], ['schedules', 'Schedules'], ['settings', 'Settings'],
+  ['agents', 'Agents'], ['inventory', 'Inventory'], ['updates', 'Updates'], ['packages', 'Packages'], ['catalog', 'App catalog'], ['gpo', 'Group Policy'], ['adbackup', 'AD backup'], ['schedules', 'Schedules'], ['settings', 'Settings'],
 ];
 
 // ------------------------------------------------------------------ router
@@ -1136,7 +1137,7 @@ async function pageSettings(el) {
           <td><button class="danger" onclick="App.delCred(${c.id})">Delete</button></td></tr>`).join('')}</tbody></table>`
         : '<div class="empty"><b>No credentials</b>Windows computers work without one when PSCCM runs as a domain account with admin rights.</div>'}</div></div>
 
-    <div class="card"><div class="card-head"><h2>Active Directory</h2><span class="small muted">Read-only: PSCCM only searches computer objects, it never changes AD</span></div>
+    <div class="card"><div class="card-head"><h2>Active Directory</h2><span class="small muted">Read-only: imports and backups only search AD. Restores (AD backup page) are confirmed twice and run as a job on a DC</span></div>
       <div class="card-body">
         <div class="row">
           <div class="field"><label>Connect as</label><select id="ad-mode">
@@ -1926,6 +1927,361 @@ Object.assign(App, {
       route();
     } }, { label: 'Close' }], { wide: true });
   }),
+});
+
+// ---------------------------------------------------- AD backup and restore
+
+const ADB = { data: null, computers: [] };
+const ADB_LABEL = {
+  user: ['user', 'users'], inetOrgPerson: ['user', 'users'], computer: ['computer', 'computers'], group: ['group', 'groups'],
+  contact: ['contact', 'contacts'], organizationalUnit: ['OU', 'OUs'], foreignSecurityPrincipal: ['foreign member', 'foreign members'],
+  gpos: ['GPO', 'GPOs'], links: ['link', 'links'], gpo: ['GPO', 'GPOs'],
+};
+const adbLabel = (k, n = 1) => (ADB_LABEL[k] || [k, k])[n === 1 ? 0 : 1];
+const adbType = (k) => { const l = adbLabel(k); return l.charAt(0).toUpperCase() + l.slice(1); };
+const adbCounts = (m) => Object.entries(m.counts || {}).map(([k, v]) => `${v} ${esc(adbLabel(k, v))}`).join(' · ');
+const adbWhen = (m) => `${fmtTime(m.created_at)} <span class="muted">(${ago(m.created_at)})</span>`;
+const adbDcOptions = (sel) => `<option value="">Choose a domain controller…</option>` + ADB.computers.map((c) =>
+  `<option value="${esc(c.name)}" ${c.name.toLowerCase() === (sel || '').toLowerCase() ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
+const adbBackupOptions = (kind, sel, none) => (none ? `<option value="">${esc(none)}</option>` : '') + ADB.data.backups.filter((b) => b.kind === kind).map((b) =>
+  `<option value="${esc(b.id)}" ${b.id === sel ? 'selected' : ''}>${esc(fmtTime(b.created_at))} — ${esc(b.domain)} — ${esc(adbCounts(b).replace(/&amp;/g, '&'))}</option>`).join('');
+
+async function pageAdBackup(el) {
+  const [d, comps] = await Promise.all([GET('/ad-backup'), GET('/computers')]);
+  ADB.data = d;
+  ADB.computers = comps.filter((c) => c.os !== 'linux');
+  const s = d.settings;
+  const kindName = { objects: 'AD objects', gpo: 'Group Policy' };
+  el.innerHTML = `<div class="page-head"><h1>AD backup &amp; restore</h1>
+      <span class="sub">Back up AD objects, Group Policy and domain controller System State. Restore what changed, or rebuild the domain on a new server.</span>
+      <div class="actions"><button onclick="App.adbBackup('gpos')">Back up GPOs now</button>
+        <button class="primary" onclick="App.adbBackup('objects')">Back up AD objects now</button></div></div>
+    ${d.running ? `<div class="card"><div class="card-body"><span class="pill s-running">running</span> Backing up ${esc(d.running)}…</div></div>` : ''}
+    <div class="card"><div class="card-head"><h2>Backups</h2>
+        <span class="small muted">Backups only read AD. A restore is confirmed twice and then runs as a job on a domain controller.</span></div>
+      <div class="card-body flush">${d.backups.length ? `<div class="table-wrap"><table><thead><tr>
+          <th>Taken</th><th>Type</th><th>Domain</th><th>Contents</th><th>Size</th><th></th></tr></thead><tbody>
+        ${d.backups.map((b) => `<tr><td class="small">${adbWhen(b)}${b.auto ? ' <span class="tag">automatic</span>' : ''}${b.note ? `<div class="muted">${esc(b.note)}</div>` : ''}</td>
+          <td>${kindName[b.kind] || esc(b.kind)}<div class="small muted">from ${esc(b.source)}</div></td>
+          <td>${esc(b.domain)}</td>
+          <td class="small">${adbCounts(b)}${(b.warnings || []).map((w) => `<div class="err">${esc(w)}</div>`).join('')}</td>
+          <td class="small">${sizeFmt(b.size)}</td>
+          <td style="white-space:nowrap"><button onclick="App.adbView(${jstr(b.id)})">View</button>
+            ${b.kind === 'objects' ? `<button class="primary" onclick="App.adbCompare(${jstr(b.id)})">Compare &amp; restore</button>`
+              : `<button class="primary" onclick="App.adbGpoRestore(${jstr(b.id)})">Restore…</button>`}
+            <button class="danger" onclick="App.adbDelete(${jstr(b.id)})">Delete</button></td></tr>`).join('')}</tbody></table></div>`
+        : '<div class="empty"><b>No backups yet</b>Click "Back up AD objects now". It uses the connection in Settings → Active Directory.</div>'}</div></div>
+
+    <div class="grid two">
+      <div class="card"><div class="card-head"><h2>Automatic backups</h2></div><div class="card-body">
+        <div class="row">
+          <div class="field"><label>AD objects every (hours)</label><input id="adb-oh" type="number" min="0" value="${s.objects_hours}">
+            <div class="hint">0 = only by hand.${s.last_objects ? ` Last ${ago(s.last_objects)}.` : ''}</div></div>
+          <div class="field"><label>GPOs every (hours)</label><input id="adb-gh" type="number" min="0" value="${s.gpo_hours}">
+            <div class="hint">0 = only by hand.${s.last_gpo ? ` Last ${ago(s.last_gpo)}.` : ''}</div></div>
+          <div class="field"><label>Keep</label><input id="adb-keep" type="number" min="1" value="${s.keep}">
+            <div class="hint">Automatic backups of each type. Others stay until deleted.</div></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Run Backup-GPO on</label><select id="adb-gpohost">
+            <option value="">This console (needs Group Policy Management)</option>
+            ${ADB.computers.map((c) => `<option value="${esc(c.name)}" ${c.name === s.gpo_host ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>
+            <div class="hint">A domain controller has the GroupPolicy module already.</div></div>
+          <div class="field"><label>Domain controller for restores</label><select id="adb-dc">${adbDcOptions(s.restore_dc)}</select></div>
+        </div>
+        <button onclick="App.adbSaveSettings()">Save</button></div></div>
+
+      <div class="card"><div class="card-head"><h2>Disaster recovery</h2></div><div class="card-body">
+        <p class="small">Lost the domain? Build a new server, make it the first DC of a new forest, then rebuild the OUs, users, groups,
+          computers, memberships and GPOs from a backup — into the same domain name or a new one.</p>
+        <ol class="small">
+          <li>Add the new server to Computers, then <button class="link" onclick="App.deployPackage(${jstr(d.new_forest_package)})">promote it to a new forest</button>.</li>
+          <li>Update the credential PSCCM uses for it (it is now a DC).</li>
+          <li><button class="link" onclick="App.adbRebuild()">Rebuild from a backup…</button></li>
+        </ol>
+        <button class="primary" onclick="App.adbRebuild()">Rebuild on a new server…</button></div></div>
+    </div>
+
+    <div class="card"><div class="card-head"><h2>System State (domain controllers)</h2>
+        <span class="small muted">Windows Server Backup of the AD database, SYSVOL and registry — for restoring a DC itself</span></div>
+      <div class="card-body">
+        <p class="small">The package <a href="#/package/${esc(d.systemstate_package)}">${esc(d.systemstate_package)}</a> runs <code>wbadmin start systemstatebackup</code>
+          on the DCs you choose. Schedule it on the Schedules page (e.g. daily); each run shows in Deployments.</p>
+        <button class="primary" onclick="App.deployPackage(${jstr(d.systemstate_package)})">Back up System State…</button>
+        <button onclick="location.hash='#/schedules'">Schedule…</button>
+        <button onclick="App.adbVersions()">Show backups on a DC…</button>
+        <button onclick="App.adbRunbook()">How to restore System State</button></div></div>`;
+}
+
+/** Restore plan, confirmation 1 of 2: every item that will be restored and what happens to it. */
+function adbShowPlan(plan) {
+  const from = [plan.objects_backup && `AD objects of ${fmtTime(plan.objects_backup.created_at)}`, plan.gpo_backup && `GPOs of ${fmtTime(plan.gpo_backup.created_at)}`].filter(Boolean).join(' and ');
+  const MAX = 1500;
+  const rows = (q) => plan.steps.filter((s) => !q || [s.action, s.class, s.name, s.target, s.detail].join(' ').toLowerCase().includes(q));
+  const table = (q) => {
+    const r = rows(q);
+    return `<table><thead><tr><th>Action</th><th>Type</th><th>Name</th><th>What PSCCM will do</th></tr></thead><tbody>
+      ${r.slice(0, MAX).map((s) => `<tr><td class="small"><b>${esc(s.action)}</b></td><td class="small">${esc(adbType(s.class))}</td>
+        <td class="small">${esc(s.name)}<div class="muted"><code>${esc(s.target)}</code></div></td><td class="small">${esc(s.detail)}</td></tr>`).join('')}</tbody></table>
+      ${r.length > MAX ? `<div class="small muted" style="padding:8px">${r.length - MAX} more rows are not shown here: download the full plan to review them.</div>` : ''}`;
+  };
+  const m = modal(`Confirm 1 of 2 — review what will be restored`, `
+    <div class="adb-box">Restore <b>${esc(from)}</b> (${esc(plan.source_domain)})<br>
+      into <b>${esc(plan.domain)}</b> through <b>${esc(plan.dc)}</b> — ${plan.mode === 'revert' ? 'putting back what changed since the backup' : 'rebuild (disaster recovery)'}.
+      <div class="small muted">This plan expires ${ago(plan.expires_at)}. Nothing has been changed yet.</div></div>
+    <div class="chips" style="margin:10px 0">${Object.entries(plan.summary).map(([k, v]) => `<span class="chip">${esc(k)}: <b>${v}</b></span>`).join('')}</div>
+    ${plan.warnings.length ? `<div class="adb-box warn"><ul>${plan.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    ${plan.left_alone.length ? `<div class="cat">Not restored</div><ul class="small">${plan.left_alone.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
+    <div class="cat" style="display:flex;gap:8px;align-items:center">What will be restored (${plan.steps.length})
+      <input id="adb-pq" placeholder="Filter…" style="margin-left:auto;max-width:220px">
+      <button class="link" id="adb-csv">Download the plan (CSV)</button></div>
+    <div class="table-wrap" id="adb-steps" style="max-height:42vh;overflow:auto">${table('')}</div>
+    <label class="check" style="margin-top:12px"><input type="checkbox" id="adb-reviewed"> I have reviewed every item above and what PSCCM will do to it</label>`,
+  [{ label: 'Cancel', onClick: async () => { await DEL('/ad-backup/plan/' + plan.id); } },
+    { label: 'Continue to the final confirmation', cls: 'primary', onClick: async () => {
+      if (!$('#adb-reviewed').checked) { toast('Tick the box to confirm you reviewed the plan', true); return false; }
+      const reviewed = await POST(`/ad-backup/plan/${plan.id}/review`);
+      adbFinal(reviewed);
+      return false;
+    } }], { wide: true });
+  $('#adb-pq', m.root).blur();
+  $('.modal-body', m.root).scrollTop = 0;
+  $('#adb-pq', m.root).oninput = (e) => { $('#adb-steps', m.root).innerHTML = table(e.target.value.trim().toLowerCase()); };
+  $('#adb-csv', m.root).onclick = () => downloadCsv(`restore-plan-${plan.id.slice(0, 8)}.csv`, ['Action', 'Type', 'Name', 'DN', 'What PSCCM will do'],
+    plan.steps.map((s) => [s.action, s.class, s.name, s.target, s.detail]));
+}
+
+/** Confirmation 2 of 2: type the domain name. */
+function adbFinal(plan) {
+  const what = Object.entries(plan.summary).map(([k, v]) => `${k.toLowerCase()}: ${v}`).join(', ');
+  const m = modal('Confirm 2 of 2 — this writes to Active Directory', `
+    <div class="adb-box bad"><b>PSCCM will now start a job on ${esc(plan.dc)} that changes the domain ${esc(plan.domain)}</b> (${esc(what)}).
+      It cannot be undone automatically.
+      ${plan.mode === 'revert' && plan.options.backup_first && plan.objects_backup ? '<div style="margin-top:6px">First, PSCCM backs up AD as it is now.</div>' : ''}
+      <div style="margin-top:6px">The job checks that ${esc(plan.dc)} is in ${esc(plan.domain)} and changes nothing otherwise.</div></div>
+    ${plan.creates_accounts ? `<div class="field"><label>Initial password for accounts the restore creates (optional)</label>
+      <input id="adb-pw" type="password" autocomplete="new-password">
+      <div class="hint">They must change it at next logon. Empty = a random password and the account stays disabled until you reset it.
+        Accounts brought back from the Recycle Bin keep their own password.</div></div>` : ''}
+    <div class="field"><label>Type <b>${esc(plan.domain)}</b> to confirm</label><input id="adb-confirm" autocomplete="off" spellcheck="false"></div>`,
+  [{ label: 'Cancel', onClick: async () => { await DEL('/ad-backup/plan/' + plan.id); } },
+    { label: 'Restore now', cls: 'primary danger-bg', onClick: async () => {
+      const confirm = $('#adb-confirm').value.trim();
+      if (confirm.toLowerCase() !== plan.domain.toLowerCase()) { toast(`Type ${plan.domain} to confirm`, true); return false; }
+      const r = await POST(`/ad-backup/plan/${plan.id}/execute`, { confirm, initial_password: $('#adb-pw') ? $('#adb-pw').value : '' });
+      toast('Restore started');
+      location.hash = '#/deployment/' + r.deployment_id;
+    } }]);
+  const btn = $('.modal-foot button:last-child', m.root);
+  btn.disabled = true;
+  $('#adb-confirm', m.root).oninput = (e) => { btn.disabled = e.target.value.trim().toLowerCase() !== plan.domain.toLowerCase(); };
+  $('#adb-confirm', m.root).focus();
+}
+
+async function adbPlan(req) {
+  if (!req.dc) throw new Error('Choose the domain controller that runs the restore');
+  toast('Building the restore plan…');
+  adbShowPlan(await POST('/ad-backup/plan', req));
+}
+
+function adbChangeText(i) {
+  const v = (a) => (a.length ? a.join('; ') : '(empty)');
+  const parts = [];
+  if (i.status === 'deleted') parts.push('<b>deleted</b> from AD');
+  if (i.moved) parts.push(`moved to <code>${esc(i.live_dn)}</code>`);
+  if (i.renamed) parts.push('renamed');
+  for (const c of i.changes) parts.push(`${esc(c.attr)}: <span class="muted">${esc(v(c.live))}</span> → ${esc(v(c.backup))}`);
+  if (i.add_members.length) parts.push(`missing members: ${esc(i.add_members.map((m) => m.name).join(', '))}`);
+  if (i.remove_members.length) parts.push(`added since: ${esc(i.remove_members.map((m) => m.name).join(', '))}`);
+  return parts.join('<br>') || '<span class="muted">created after the backup — left alone</span>';
+}
+
+Object.assign(App, {
+  adbBackup: act(async (kind) => {
+    toast(kind === 'gpos' ? 'Backing up all GPOs…' : 'Reading AD objects…');
+    const m = await POST('/ad-backup/' + kind, {});
+    toast(`Backup taken: ${adbCounts(m).replace(/&amp;/g, '&')}`);
+    route();
+  }),
+  adbSaveSettings: act(async () => {
+    await PUT('/ad-backup/settings', {
+      objects_hours: +$('#adb-oh').value || 0, gpo_hours: +$('#adb-gh').value || 0, keep: +$('#adb-keep').value || 14,
+      gpo_host: $('#adb-gpohost').value, restore_dc: $('#adb-dc').value,
+    });
+    toast('Saved');
+    route();
+  }),
+  adbDelete: act(async (id) => {
+    if (!confirm('Delete this backup from the console? (Nothing changes in AD.)')) return;
+    await DEL('/ad-backup/' + id);
+    route();
+  }),
+  adbView: act(async (id) => {
+    const d = await GET('/ad-backup/' + id);
+    if (d.gpos) {
+      modal('GPO backup ' + fmtTime(d.meta.created_at), `<div class="table-wrap" style="max-height:60vh;overflow:auto"><table><thead><tr><th>GPO</th><th>Linked to</th></tr></thead><tbody>
+        ${d.gpos.map((g) => `<tr><td><b>${esc(g.name)}</b><div class="small muted"><code>{${esc(g.guid)}}</code></div></td>
+          <td class="small">${g.links.length ? g.links.map((l) => `<div title="${esc(l.target)}">${esc(l.target)}${l.enforced ? ' <span class="tag">enforced</span>' : ''}${l.enabled ? '' : ' <span class="tag">link off</span>'}</div>`).join('') : '<span class="muted">not linked</span>'}</td></tr>`).join('')}
+        </tbody></table></div>`, [{ label: 'Close' }], { wide: true });
+      return;
+    }
+    const MAX = 1000;
+    const table = (q) => {
+      const r = d.objects.filter((o) => !q || (o.dn + ' ' + o.class).toLowerCase().includes(q));
+      return `<table><thead><tr><th>Name</th><th>Type</th><th>DN</th><th>Groups</th></tr></thead><tbody>
+        ${r.slice(0, MAX).map((o) => `<tr><td><a href="javascript:void 0" data-g="${esc(o.guid)}">${esc(o.name)}</a>${o.critical ? ' <span class="tag">built-in</span>' : ''}</td>
+          <td class="small">${esc(adbType(o.class))}</td><td class="small"><code>${esc(o.dn)}</code></td><td class="small num">${o.groups || ''}</td></tr>`).join('')}</tbody></table>
+        ${r.length > MAX ? `<div class="small muted" style="padding:8px">${r.length - MAX} more — filter to find them</div>` : ''}`;
+    };
+    const m = modal(`AD objects backup ${fmtTime(d.meta.created_at)}`, `<div class="small muted">${esc(d.meta.domain)} · ${adbCounts(d.meta)}</div>
+      <input id="adb-oq" placeholder="Filter by name, OU or type…" style="margin:10px 0">
+      <div class="table-wrap" id="adb-ol" style="max-height:55vh;overflow:auto">${table('')}</div>`, [{ label: 'Close' }], { wide: true });
+    const box = $('#adb-ol', m.root);
+    $('#adb-oq', m.root).oninput = (e) => { box.innerHTML = table(e.target.value.trim().toLowerCase()); };
+    box.onclick = act(async (e) => {
+      const g = e.target.dataset && e.target.dataset.g;
+      if (!g) return;
+      const o = await GET(`/ad-backup/${id}/objects/${g}`);
+      modal(`${adbType(o.class)}: ${o.name}`, `<div class="small"><code>${esc(o.dn)}</code><div class="muted">GUID ${esc(o.guid)}${o.sid ? ' · SID ' + esc(o.sid) : ''}</div></div>
+        <div class="table-wrap" style="max-height:50vh;overflow:auto;margin-top:10px"><table><tbody>
+          ${Object.entries(o.attrs).map(([k, v]) => `<tr><td class="small"><b>${esc(k)}</b></td><td class="small">${v.map((x) => esc(x)).join('<br>')}</td></tr>`).join('')}
+          ${o.member_of.length ? `<tr><td class="small"><b>member of</b></td><td class="small">${o.member_of.map((x) => esc(x)).join('<br>')}</td></tr>` : ''}
+        </tbody></table></div>`, [{ label: 'Back', onClick: () => App.adbView(id) }]);
+    });
+  }),
+  adbCompare: act(async (id) => {
+    const wait = modal('Comparing with AD…', '<p class="small muted">Reading AD as it is now and comparing it with the backup. Nothing is changed.</p>');
+    let d;
+    try { d = await POST(`/ad-backup/${id}/compare`); } catch (e) { wait.close(); throw e; }
+    const F = { tab: 'all', sel: new Set() };
+    const restorable = (i) => i.status !== 'new' && !(i.status === 'deleted' && i.critical);
+    const counts = {
+      deleted: d.items.filter((i) => i.status === 'deleted').length,
+      changed: d.items.filter((i) => i.status === 'changed').length,
+      new: d.items.filter((i) => i.status === 'new').length,
+    };
+    const shown = () => d.items.filter((i) => F.tab === 'all' || i.status === F.tab);
+    const body = () => {
+      const r = shown();
+      return r.length ? `<table><thead><tr><th style="width:24px"></th><th>Status</th><th>Type</th><th>Name</th><th>Backup → now</th></tr></thead><tbody>
+        ${r.slice(0, 2000).map((i) => `<tr><td>${restorable(i) ? `<input type="checkbox" data-g="${esc(i.guid)}" ${F.sel.has(i.guid) ? 'checked' : ''}>` : ''}</td>
+          <td>${pill({ deleted: 'failed', changed: 'partial', new: 'skipped' }[i.status]).replace(/>(failed|partial|skipped)</, `>${i.status}<`)}</td>
+          <td class="small">${esc(adbType(i.class))}${i.critical ? ' <span class="tag">built-in</span>' : ''}</td>
+          <td class="small"><b>${esc(i.name)}</b><div class="muted"><code>${esc(i.dn)}</code></div></td>
+          <td class="small">${adbChangeText(i)}</td></tr>`).join('')}</tbody></table>`
+        : '<div class="empty"><b>No differences</b>AD matches the backup.</div>';
+    };
+    const tabs = () => [['all', `All (${d.items.length})`], ['deleted', `Deleted (${counts.deleted})`], ['changed', `Changed (${counts.changed})`], ['new', `New since (${counts.new})`]]
+      .map(([k, l]) => `<button class="tab ${F.tab === k ? 'on' : ''}" data-t="${k}">${l}</button>`).join('');
+    const m = modal(`Compare backup of ${fmtTime(d.backup.created_at)} with AD now`, `
+      <div class="small muted">${esc(d.backup.domain)} · ${d.unchanged} objects unchanged · ${d.items.length} different. Pick what to restore.</div>
+      <div style="display:flex;gap:8px;align-items:center;margin:10px 0"><div class="tabs" id="adb-tabs">${tabs()}</div>
+        <button class="link" id="adb-all" style="margin-left:auto">Select all shown</button><button class="link" id="adb-none">Clear</button></div>
+      <div class="table-wrap" id="adb-diff" style="max-height:45vh;overflow:auto">${body()}</div>
+      <div class="row" style="margin-top:12px">
+        <div class="field"><label>Run the restore on</label><select id="adb-cdc">${adbDcOptions(ADB.data.settings.restore_dc)}</select></div>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="adb-recreate" checked> Re-create deleted objects that are no longer in the AD Recycle Bin</label>
+          <label class="check"><input type="checkbox" id="adb-rmadded"> Also remove group members added after the backup</label>
+          <label class="check"><input type="checkbox" id="adb-first" checked> Back up AD as it is now before restoring</label></div></div>`,
+    [{ label: 'Close' }, { label: 'Review restore plan', cls: 'primary', onClick: async () => {
+      if (!F.sel.size) { toast('Select what to restore', true); return false; }
+      await adbPlan({
+        mode: 'revert', dc: $('#adb-cdc').value, objects_backup: id, objects: [...F.sel],
+        options: { recreate_missing: $('#adb-recreate').checked, remove_added_members: $('#adb-rmadded').checked, backup_first: $('#adb-first').checked },
+      });
+      return false;
+    } }], { wide: true });
+    const redraw = () => { $('#adb-diff', m.root).innerHTML = body(); $('#adb-tabs', m.root).innerHTML = tabs(); };
+    $('#adb-tabs', m.root).onclick = (e) => { if (e.target.dataset.t) { F.tab = e.target.dataset.t; redraw(); } };
+    $('#adb-diff', m.root).onchange = (e) => { const g = e.target.dataset.g; if (g) e.target.checked ? F.sel.add(g) : F.sel.delete(g); };
+    $('#adb-all', m.root).onclick = () => { shown().filter(restorable).forEach((i) => F.sel.add(i.guid)); redraw(); };
+    $('#adb-none', m.root).onclick = () => { F.sel.clear(); redraw(); };
+  }),
+  adbGpoRestore: act(async (id) => {
+    const d = await GET('/ad-backup/' + id);
+    const m = modal(`Restore GPOs from ${fmtTime(d.meta.created_at)}`, `
+      <div class="field"><label>Into</label><select id="adb-gmode">
+        <option value="revert">The same domain (${esc(d.meta.domain)}) — Restore-GPO: settings and permissions</option>
+        <option value="rebuild">Another domain (e.g. a new forest) — Import-GPO: settings only</option></select></div>
+      <div class="field" id="adb-gdom-f" hidden><label>Domain the DC is in</label><input id="adb-gdom" value="${esc(d.meta.domain)}"></div>
+      <div class="field"><label>Run the restore on</label><select id="adb-gdc">${adbDcOptions(ADB.data.settings.restore_dc)}</select></div>
+      <label class="check"><input type="checkbox" id="adb-glinks" checked> Restore the GPOs' links to OUs and the domain</label>
+      <div class="cat" style="display:flex">GPOs <button class="link" id="adb-gall" style="margin-left:auto">Select all</button></div>
+      <div class="table-wrap" style="max-height:40vh;overflow:auto"><table><tbody>
+        ${d.gpos.map((g) => `<tr><td style="width:24px"><input type="checkbox" data-g="${esc(g.guid)}"></td><td><b>${esc(g.name)}</b>
+          <div class="small muted">${g.links.length ? 'linked to ' + g.links.map((l) => esc(l.target.split(',')[0])).join(', ') : 'not linked'}</div></td></tr>`).join('')}</tbody></table></div>`,
+    [{ label: 'Close' }, { label: 'Review restore plan', cls: 'primary', onClick: async (root) => {
+      const gpos = $$('input[data-g]:checked', root).map((i) => i.dataset.g);
+      if (!gpos.length) { toast('Select the GPOs to restore', true); return false; }
+      const mode = $('#adb-gmode').value;
+      await adbPlan({ mode, dc: $('#adb-gdc').value, domain: $('#adb-gdom').value, gpo_backup: id, gpos, options: { restore_links: $('#adb-glinks').checked } });
+      return false;
+    } }], { wide: true });
+    $('#adb-gmode', m.root).onchange = (e) => { $('#adb-gdom-f', m.root).hidden = e.target.value !== 'rebuild'; };
+    $('#adb-gall', m.root).onclick = () => $$('input[data-g]', m.root).forEach((i) => { i.checked = true; });
+  }),
+  adbRebuild() {
+    const objs = ADB.data.backups.filter((b) => b.kind === 'objects');
+    const gpos = ADB.data.backups.filter((b) => b.kind === 'gpo');
+    if (!objs.length && !gpos.length) { toast('There is no backup to rebuild from yet', true); return; }
+    const m = modal('Disaster recovery — rebuild from a backup', `
+      <p class="small muted">Creates the OUs, users, groups, computers and contacts of the backup (parents first), their managers and group
+        memberships, then imports the GPOs and their links. Existing objects are matched by their DN. Use a DC of the new domain.</p>
+      <div class="field"><label>AD objects backup</label><select id="adb-ro">${adbBackupOptions('objects', objs[0] && objs[0].id, 'None (GPOs only)')}</select></div>
+      <div class="field"><label>GPO backup</label><select id="adb-rg">${adbBackupOptions('gpo', gpos[0] && gpos[0].id, 'None (objects only)')}</select></div>
+      <div class="row">
+        <div class="field"><label>Domain controller (of the new domain)</label><select id="adb-rdc">${adbDcOptions(ADB.data.settings.restore_dc)}</select></div>
+        <div class="field"><label>Its domain</label><input id="adb-rdom" value="${esc((objs[0] || gpos[0]).domain)}">
+          <div class="hint">Another name moves every DN, logon name and host name into it.</div></div></div>
+      <label class="check"><input type="checkbox" id="adb-rupd" checked> Overwrite the attributes of objects that already exist</label>
+      <label class="check"><input type="checkbox" id="adb-rlinks" checked> Restore GPO links</label>`,
+    [{ label: 'Close' }, { label: 'Review restore plan', cls: 'primary', onClick: async () => {
+      await adbPlan({
+        mode: 'rebuild', dc: $('#adb-rdc').value, domain: $('#adb-rdom').value.trim(),
+        objects_backup: $('#adb-ro').value || null, gpo_backup: $('#adb-rg').value || null,
+        options: { update_existing: $('#adb-rupd').checked, restore_links: $('#adb-rlinks').checked },
+      });
+      return false;
+    } }], { wide: true });
+    $('#adb-ro', m.root).onchange = (e) => {
+      const b = objs.find((x) => x.id === e.target.value);
+      if (b) $('#adb-rdom', m.root).value = b.domain;
+    };
+  },
+  adbVersions() {
+    modal('System State backups on a domain controller', `
+      <div class="row"><div class="field"><label>Domain controller</label><select id="adb-vdc">${adbDcOptions(ADB.data.settings.restore_dc)}</select></div>
+        <div class="field"><label>Backup target (optional)</label><input id="adb-vt" placeholder="E: or \\\\nas\\dc-backups"></div></div>
+      <pre class="log" id="adb-vout" style="min-height:0;max-height:45vh;border-radius:8px" hidden></pre>`,
+    [{ label: 'Close' }, { label: 'Show backups', cls: 'primary', onClick: async () => {
+      const dc = $('#adb-vdc').value;
+      if (!dc) { toast('Choose a domain controller', true); return false; }
+      const out = $('#adb-vout');
+      out.hidden = false;
+      out.textContent = 'Running wbadmin get versions…';
+      const r = await POST('/ad-backup/systemstate/versions', { dc, target: $('#adb-vt').value });
+      out.textContent = r.output || '(no output)';
+      return false;
+    } }], { wide: true });
+  },
+  adbRunbook() {
+    modal('Restoring System State of a domain controller', `<div class="small">
+      <p>A System State restore replaces the DC's AD database, so it runs in <b>Directory Services Restore Mode</b> (DSRM), where the DC is offline
+        and remoting with domain accounts does not work. Do it at the DC's console (or Hyper-V / iLO / vSphere console), signed in with the DSRM password.</p>
+      <ol>
+        <li>Boot into DSRM: <code>bcdedit /set safeboot dsrepair</code> then <code>shutdown /r /t 0</code>. Sign in as <code>.\\Administrator</code> with the DSRM password.</li>
+        <li>List the backups: <code>wbadmin get versions -backupTarget:E:</code> (or your share).</li>
+        <li>Restore: <code>wbadmin start systemstaterecovery -version:MM/DD/YYYY-HH:MM -backupTarget:E: -quiet</code>.<br>
+          This is a <b>non-authoritative</b> restore: the DC then catches up from the other DCs. Use it for a broken DC.</li>
+        <li>To bring back objects deleted everywhere (no Recycle Bin), mark them <b>authoritative</b> before restarting:
+          <code>ntdsutil "activate instance ntds" "authoritative restore" "restore subtree OU=Staff,DC=corp,DC=local" quit quit</code>.
+          If it is the only DC, or SYSVOL was lost everywhere, add <code>-authsysvol</code> to the wbadmin command.</li>
+        <li>Leave DSRM: <code>bcdedit /deletevalue safeboot</code> then <code>shutdown /r /t 0</code>.</li>
+      </ol>
+      <p>Most object mistakes are easier to fix with <b>Compare &amp; restore</b> on an AD objects backup: no DSRM, and only the chosen objects change.
+        To replace a lost DC on new hardware, promote a new server instead and let AD replicate to it.</p></div>`, [{ label: 'Close' }], { wide: true });
+  },
 });
 
 // ------------------------------------------------------------- app catalog
@@ -2934,7 +3290,7 @@ const PAGES = {
   setup: pageSetup,
   dashboard: pageDashboard, deploy: pageDeploy, history: pageHistory, deployment: pageDeployment,
   computers: pageComputers, packages: pagePackages, package: pagePackage, schedules: pageSchedules, settings: pageSettings,
-  gpo: pageGpo, agents: pageAgents, agent: pageAgent, inventory: pageInventory, catalog: pageCatalog, updates: pageUpdates,
+  gpo: pageGpo, adbackup: pageAdBackup, agents: pageAgents, agent: pageAgent, inventory: pageInventory, catalog: pageCatalog, updates: pageUpdates,
 };
 
 route();

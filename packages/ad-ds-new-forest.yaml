@@ -1,0 +1,45 @@
+id: ad-ds-new-forest
+name: AD - Promote a new server to the first DC of a new forest
+category: Active Directory
+description: >-
+  Disaster recovery: installs AD DS, DNS and Group Policy Management on a fresh Windows Server and
+  creates a new forest, so a PSCCM AD backup can be rebuilt into it (AD backup -> Disaster
+  recovery). Refuses on a computer that is already in a domain. The server restarts at the end;
+  afterwards it is a DC and its local Administrator is the domain's Administrator, so update the
+  credential PSCCM uses for it.
+platforms: [windows]
+variables:
+  domain:
+    required: true
+    description: DNS name of the new domain, e.g. corp.local (the old name rebuilds the same domain)
+  netbios:
+    default: ""
+    description: NetBIOS name of the domain (empty = the first label of the DNS name, upper case)
+  safe_mode_password:
+    required: true
+    secret: true
+    description: Directory Services Restore Mode (DSRM) administrator password
+steps:
+  - name: Check that the server is not in a domain
+    script: |
+      $cs = Get-CimInstance Win32_ComputerSystem
+      if ($cs.PartOfDomain) { throw "$env:COMPUTERNAME is already in domain $($cs.Domain); this package only promotes a fresh server that is not in a domain" }
+      Write-Output "$env:COMPUTERNAME is in workgroup $($cs.Workgroup)"
+  - name: Install AD DS, DNS and Group Policy Management
+    timeout: 3600
+    script: |
+      $r = Install-WindowsFeature AD-Domain-Services, DNS, GPMC -IncludeManagementTools
+      if (-not $r.Success) { throw 'installing the AD DS features failed' }
+      Write-Output "Installed: $(@($r.FeatureResult | ForEach-Object { $_.DisplayName }) -join ', ')"
+  - name: Create the forest
+    timeout: 3600
+    script: |
+      $domain = {{domain|ps}}
+      $netbios = {{netbios|ps}}
+      if (-not $netbios) { $netbios = $domain.Split('.')[0].ToUpper() }
+      $pw = ConvertTo-SecureString {{safe_mode_password|ps}} -AsPlainText -Force
+      Import-Module ADDSDeployment
+      Install-ADDSForest -DomainName $domain -DomainNetbiosName $netbios -SafeModeAdministratorPassword $pw -InstallDns -NoRebootOnCompletion -Force | Out-String | Write-Output
+  - name: Restart
+    reboot: true
+    timeout: 3600

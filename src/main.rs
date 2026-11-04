@@ -1,6 +1,7 @@
 //! PSCCM - lightweight, agentless deployment manager for Windows and Linux.
 
 mod ad;
+mod adbackup;
 mod agent;
 mod app;
 mod catalog;
@@ -121,6 +122,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GpoCmd,
     },
+    /// Active Directory backup and restore (objects and GPOs).
+    AdBackup {
+        #[command(subcommand)]
+        cmd: AdBackupCmd,
+    },
     /// App catalog: common apps (7-Zip, Chrome, Node.js...) at their latest version.
     Catalog {
         #[command(subcommand)]
@@ -217,6 +223,58 @@ enum GpoCmd {
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdBackupCmd {
+    /// List backups.
+    List,
+    /// Back up users, groups, computers, contacts and OUs now (read-only).
+    Objects {
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Back up every GPO now (Backup-GPO on the host set in the console).
+    Gpos {
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Compare an objects backup with AD as it is now.
+    Compare { id: String },
+    /// Restore from backups. Shows the plan and asks twice before anything changes.
+    Restore {
+        /// Objects backup id.
+        #[arg(long)]
+        objects: Option<String>,
+        /// GPO backup id.
+        #[arg(long)]
+        gpos: Option<String>,
+        /// Domain controller (from the computer list) that runs the restore.
+        #[arg(long)]
+        dc: String,
+        /// Disaster recovery: rebuild everything into this domain (e.g. a new
+        /// forest on a new server) instead of reverting what changed.
+        #[arg(long, value_name = "DOMAIN")]
+        rebuild: Option<String>,
+        /// Only these object / GPO GUIDs (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Also remove group members that were added after the backup.
+        #[arg(long)]
+        remove_added_members: bool,
+        /// Do not re-create deleted objects that are no longer in the Recycle Bin.
+        #[arg(long)]
+        no_recreate: bool,
+        /// Do not restore GPO links.
+        #[arg(long)]
+        no_links: bool,
+        /// Rebuild: leave objects that already exist unchanged.
+        #[arg(long)]
+        keep_existing: bool,
+        /// Revert: skip the backup of the current state taken before the restore.
+        #[arg(long)]
+        no_backup_first: bool,
     },
 }
 
@@ -585,6 +643,7 @@ async fn real_main(cli: Cli, data_dir: PathBuf) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::AdBackup { cmd } => ad_backup_cmd(&app, cmd).await,
         Cmd::Deploy { package, targets, tag, group, vars, concurrency, batch_size, max_failures, force } => {
             let lib = app.library()?;
             let pkg = lib.packages.get(&package).ok_or_else(|| anyhow!("package '{package}' not found"))?;
@@ -684,6 +743,113 @@ async fn run_and_report(app: &App, id: &str) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn ask(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+async fn ad_backup_cmd(app: &App, cmd: AdBackupCmd) -> Result<()> {
+    let counts = |m: &adbackup::BackupMeta| m.counts.iter().map(|(k, v)| format!("{v} {k}")).collect::<Vec<_>>().join(", ");
+    match cmd {
+        AdBackupCmd::List => {
+            for m in adbackup::list(app) {
+                println!("{:<28} {:<8} {:<20} {}{}", m.id, m.kind, m.domain, counts(&m), if m.note.is_empty() { String::new() } else { format!("  ({})", m.note) });
+            }
+            Ok(())
+        }
+        AdBackupCmd::Objects { note } => {
+            let m = adbackup::backup_objects(app, false, &note).await?;
+            println!("Backup {} of {}: {}", m.id, m.domain, counts(&m));
+            Ok(())
+        }
+        AdBackupCmd::Gpos { note } => {
+            let m = adbackup::backup_gpos(app, false, &note).await?;
+            println!("Backup {} of {}: {}", m.id, m.domain, counts(&m));
+            for w in &m.warnings {
+                println!("  warning: {w}");
+            }
+            Ok(())
+        }
+        AdBackupCmd::Compare { id } => {
+            let d = adbackup::compare_live(app, &id).await?;
+            for i in &d.items {
+                let mut what = vec![];
+                if i.moved {
+                    what.push(format!("moved to {}", i.live_dn.as_deref().unwrap_or("")));
+                }
+                if i.renamed {
+                    what.push("renamed".to_string());
+                }
+                what.extend(i.changes.iter().map(|c| format!("{}: {:?} -> now {:?}", c.attr, c.backup, c.live)));
+                if !i.add_members.is_empty() {
+                    what.push(format!("{} member(s) missing", i.add_members.len()));
+                }
+                if !i.remove_members.is_empty() {
+                    what.push(format!("{} member(s) added", i.remove_members.len()));
+                }
+                println!("{:<8} {:<18} {}  {}  {}", i.status, i.class, i.name, i.guid, what.join("; "));
+            }
+            println!("{} unchanged, {} different", d.unchanged, d.items.len());
+            Ok(())
+        }
+        AdBackupCmd::Restore { objects, gpos, dc, rebuild, only, remove_added_members, no_recreate, no_links, keep_existing, no_backup_first } => {
+            let only = (!only.is_empty()).then_some(only);
+            let req = adbackup::PlanRequest {
+                mode: if rebuild.is_some() { "rebuild".into() } else { "revert".into() },
+                dc,
+                domain: rebuild.unwrap_or_default(),
+                objects_backup: objects,
+                gpo_backup: gpos,
+                objects: only.clone(),
+                gpos: only,
+                options: adbackup::PlanOptions {
+                    recreate_missing: !no_recreate,
+                    remove_added_members,
+                    restore_links: !no_links,
+                    update_existing: !keep_existing,
+                    backup_first: !no_backup_first,
+                },
+            };
+            let plan = adbackup::plan(app, req).await?;
+            println!("Restore plan ({}) into {} on {}:\n", plan.mode, plan.domain, plan.dc);
+            for s in &plan.steps {
+                println!("  {:<20} {:<18} {}  [{}]\n      {}", s.action, s.class, s.name, s.target, s.detail);
+            }
+            for l in &plan.left_alone {
+                println!("\n  Left alone: {l}");
+            }
+            println!();
+            for w in &plan.warnings {
+                println!("  ! {w}");
+            }
+            println!("\nSummary: {}", plan.summary.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", "));
+            if ask("\nStep 1 of 2: have you reviewed every item above? Type yes to continue: ")? != "yes" {
+                adbackup::cancel_plan(app, &plan.id);
+                bail!("cancelled; nothing was changed");
+            }
+            adbackup::review(app, &plan.id)?;
+            let password = if plan.creates_accounts {
+                rpassword::prompt_password("Initial password for accounts that are re-created (empty = random password, account disabled): ")?
+            } else {
+                String::new()
+            };
+            let typed = ask(&format!("Step 2 of 2: this writes to AD domain {} through {}. Type the domain name to restore now: ", plan.domain, plan.dc))?;
+            if !typed.eq_ignore_ascii_case(&plan.domain) {
+                adbackup::cancel_plan(app, &plan.id);
+                bail!("the domain name did not match; cancelled, nothing was changed");
+            }
+            let (dep, staged) = adbackup::execute(app, &plan.id, &typed, &password).await?;
+            let result = run_and_report(app, &dep).await;
+            let _ = std::fs::remove_dir_all(staged);
+            result
+        }
+    }
 }
 
 /// The CLI downloads but never auto-deploys: the process would exit before

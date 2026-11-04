@@ -18,7 +18,7 @@ use crate::ad::{self, AdComputer, AdSettings};
 use crate::app::{AgentSettings, App, WinRmSettings};
 use crate::agent::{self, RunAs};
 use crate::db::{ComputerUpdate, DeployOptions, Group, GroupRules, NewComputer, NewCredential, Schedule, TargetSpec};
-use crate::{catalog, gpo, inventory, update, wu};
+use crate::{adbackup, catalog, gpo, inventory, update, wu};
 use crate::engine;
 use crate::package::{Package, Shell};
 use crate::scheduler;
@@ -106,6 +106,18 @@ pub async fn serve(
         .route("/gpos/import-folder", post(import_gpo_folder))
         .route("/gpos/{guid}", get(get_gpo).delete(delete_gpo))
         .route("/gpos/{guid}/import", post(import_gpo))
+        .route("/ad-backup", get(adb_overview))
+        .route("/ad-backup/settings", put(adb_save_settings))
+        .route("/ad-backup/objects", post(adb_backup_objects))
+        .route("/ad-backup/gpos", post(adb_backup_gpos))
+        .route("/ad-backup/systemstate/versions", post(adb_systemstate_versions))
+        .route("/ad-backup/plan", post(adb_plan))
+        .route("/ad-backup/plan/{id}", get(adb_get_plan).delete(adb_cancel_plan))
+        .route("/ad-backup/plan/{id}/review", post(adb_review))
+        .route("/ad-backup/plan/{id}/execute", post(adb_execute))
+        .route("/ad-backup/{id}", get(adb_get).delete(adb_delete))
+        .route("/ad-backup/{id}/objects/{guid}", get(adb_object))
+        .route("/ad-backup/{id}/compare", post(adb_compare))
         .route("/update", get(update_status))
         .route("/update/check", post(update_check))
         .route("/update/install", post(update_install))
@@ -585,6 +597,110 @@ async fn import_gpo_folder(State(st): State<St>, Json(r): Json<ImportFolder>) ->
 async fn delete_gpo(State(st): State<St>, Path(guid): Path<String>) -> ApiResult {
     gpo::delete(&st.app, &guid)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ------------------------------------------------------- AD backup / restore
+
+async fn adb_overview(State(st): State<St>) -> ApiResult {
+    let running = st.app.ad_backup.lock().unwrap().running.clone();
+    Ok(Json(json!({
+        "settings": adbackup::settings(&st.app),
+        "backups": adbackup::list(&st.app),
+        "running": running,
+        "systemstate_package": adbackup::SYSTEMSTATE_PACKAGE,
+        "new_forest_package": adbackup::NEW_FOREST_PACKAGE,
+        "console_os": std::env::consts::OS,
+    })))
+}
+
+async fn adb_save_settings(State(st): State<St>, Json(s): Json<adbackup::BackupSettings>) -> ApiResult {
+    adbackup::save_settings(&st.app, s)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize, Default)]
+struct BackupReq {
+    #[serde(default)]
+    note: String,
+}
+
+async fn adb_backup_objects(State(st): State<St>, Json(r): Json<BackupReq>) -> ApiResult {
+    Ok(Json(json!(adbackup::backup_objects(&st.app, false, r.note.trim()).await?)))
+}
+
+async fn adb_backup_gpos(State(st): State<St>, Json(r): Json<BackupReq>) -> ApiResult {
+    Ok(Json(json!(adbackup::backup_gpos(&st.app, false, r.note.trim()).await?)))
+}
+
+async fn adb_get(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    let meta = adbackup::read_meta(&st.app, &id)?;
+    if meta.kind == "gpo" {
+        let (meta, gpos) = adbackup::load_gpos(&st.app, &id)?;
+        return Ok(Json(json!({ "meta": meta, "gpos": gpos })));
+    }
+    let (meta, objects) = adbackup::load_objects(&st.app, &id)?;
+    let list: Vec<Value> = objects
+        .iter()
+        .map(|o| json!({ "guid": o.guid, "dn": o.dn, "name": o.name, "class": o.class, "critical": o.critical, "attrs": o.attrs.len(), "groups": o.member_of.len() }))
+        .collect();
+    Ok(Json(json!({ "meta": meta, "objects": list })))
+}
+
+async fn adb_object(State(st): State<St>, Path((id, guid)): Path<(String, String)>) -> ApiResult {
+    let (_, objects) = adbackup::load_objects(&st.app, &id)?;
+    let o = objects.into_iter().find(|o| o.guid.eq_ignore_ascii_case(&guid)).ok_or_else(|| anyhow!("object not found"))?;
+    Ok(Json(json!(o)))
+}
+
+async fn adb_delete(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    adbackup::delete(&st.app, &id)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn adb_compare(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(json!(adbackup::compare_live(&st.app, &id).await?)))
+}
+
+#[derive(Deserialize)]
+struct VersionsReq {
+    dc: String,
+    #[serde(default)]
+    target: String,
+}
+
+async fn adb_systemstate_versions(State(st): State<St>, Json(r): Json<VersionsReq>) -> ApiResult {
+    Ok(Json(json!({ "output": adbackup::systemstate_versions(&st.app, r.dc.trim(), &r.target).await? })))
+}
+
+async fn adb_plan(State(st): State<St>, Json(r): Json<adbackup::PlanRequest>) -> ApiResult {
+    Ok(Json(json!(adbackup::plan(&st.app, r).await?)))
+}
+
+async fn adb_get_plan(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(json!(adbackup::get_plan(&st.app, &id)?)))
+}
+
+async fn adb_cancel_plan(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    adbackup::cancel_plan(&st.app, &id);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn adb_review(State(st): State<St>, Path(id): Path<String>) -> ApiResult {
+    Ok(Json(json!(adbackup::review(&st.app, &id)?)))
+}
+
+#[derive(Deserialize)]
+struct ExecuteReq {
+    /// The domain name, typed by the user.
+    confirm: String,
+    #[serde(default)]
+    initial_password: String,
+}
+
+async fn adb_execute(State(st): State<St>, Path(id): Path<String>, Json(r): Json<ExecuteReq>) -> ApiResult {
+    let (dep, staged) = adbackup::execute(&st.app, &id, &r.confirm, &r.initial_password).await?;
+    adbackup::start(&st.app, dep.clone(), staged);
+    Ok(Json(json!({ "deployment_id": dep })))
 }
 
 // ------------------------------------------------------------------ updates

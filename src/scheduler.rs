@@ -31,6 +31,7 @@ pub fn spawn(app: App) {
                 error!("update scan: {e:#}");
             }
             crate::catalog::tick(&app);
+            crate::adbackup::tick(&app);
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
         }
     });

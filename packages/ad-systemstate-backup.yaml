@@ -1,0 +1,46 @@
+id: ad-systemstate-backup
+name: AD - System State backup of a domain controller
+category: Active Directory
+description: >-
+  Back up the System State of a domain controller (AD database, SYSVOL, registry, boot files)
+  with Windows Server Backup (wbadmin), installing that feature when it is missing. Schedule it
+  on the Schedules page. A dedicated backup volume keeps several versions; a network share keeps
+  only the latest (wbadmin replaces it) and needs write access for the DC's computer account
+  (e.g. DC01$), because the backup service writes as the computer. Restoring System State needs
+  Directory Services Restore Mode: see AD backup -> System State in the console.
+platforms: [windows]
+variables:
+  target:
+    required: true
+    description: 'Backup volume (e.g. E:) or network share (\\nas\dc-backups), not the system drive'
+  keep_versions:
+    default: "7"
+    description: Volume targets keep this many backups (older ones are deleted). 0 = keep all.
+steps:
+  - name: Check that this is a domain controller
+    script: |
+      $cs = Get-CimInstance Win32_ComputerSystem
+      if ($cs.DomainRole -lt 4) { throw "$env:COMPUTERNAME is not a domain controller" }
+      Write-Output "$env:COMPUTERNAME is a domain controller of $($cs.Domain)"
+  - name: Install Windows Server Backup
+    script: |
+      if ((Get-WindowsFeature Windows-Server-Backup).Installed) { Write-Output 'Windows Server Backup is installed'; exit 0 }
+      $r = Install-WindowsFeature Windows-Server-Backup
+      if (-not $r.Success) { throw 'installing the Windows-Server-Backup feature failed' }
+      Write-Output 'Installed Windows Server Backup'
+  - name: Back up System State
+    timeout: 14400
+    script: |
+      $target = {{target|ps}}
+      Write-Output "Backing up System State of $env:COMPUTERNAME to $target (this takes a while)"
+      & wbadmin.exe start systemstatebackup "-backupTarget:$target" -quiet
+      if ($LASTEXITCODE) { throw "wbadmin failed with exit code $LASTEXITCODE (see the lines above)" }
+      & wbadmin.exe get versions "-backupTarget:$target"
+  - name: Remove old backups
+    continue_on_error: true
+    script: |
+      $target = {{target|ps}}
+      $keep = [int]{{keep_versions|ps}}
+      if ($keep -le 0 -or $target.StartsWith('\\')) { Write-Output 'Nothing to remove'; exit 0 }
+      & wbadmin.exe delete systemstatebackup "-backupTarget:$target" "-keepVersions:$keep" -quiet
+      exit 0

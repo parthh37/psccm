@@ -211,6 +211,17 @@
       </article>
 
       <article class="card">
+        <div class="icon"><svg class="i" aria-hidden="true"><use href="#i-sliders"/></svg></div>
+        <h3>AD backup &amp; restore</h3>
+        <p>Scheduled backups of users, groups, computers, OUs and memberships, of every GPO and of DC System State. Compare a backup with AD and restore exactly what changed.</p>
+        <ul>
+          <li>Recycle Bin restores, attribute-by-attribute reverts, GPO restore with links</li>
+          <li>Disaster recovery: rebuild the domain on a new server, under the same or a new name</li>
+          <li>Every restore is reviewed item by item, then confirmed by typing the domain name</li>
+        </ul>
+      </article>
+
+      <article class="card">
         <div class="icon violet"><svg class="i" aria-hidden="true"><use href="#i-terminal"/></svg></div>
         <h3>Optional outbound-only agent</h3>
         <p>For computers with no WinRM or SSH. The same executable runs as a small service that connects <em>out</em> to the console, so nothing is opened inbound.</p>
@@ -541,7 +552,7 @@
       <p>Anyone who can use the console can run commands as admin on every managed computer, so PSCCM is built to keep that power contained.</p>
     </div>
     <ul class="sec">
-      <li><span class="icon"><svg class="i" aria-hidden="true"><use href="#i-eye"/></svg></span><div><strong>Read-only Active Directory</strong><span>Only LDAP searches. No code path writes to AD, and GPO import only reads AD and SYSVOL.</span></div></li>
+      <li><span class="icon"><svg class="i" aria-hidden="true"><use href="#i-eye"/></svg></span><div><strong>Read-only Active Directory</strong><span>Imports, backups and GPO import only search AD and read SYSVOL. The console never writes to AD; a restore runs as a job on a DC only after two confirmations, and stops unless that DC is in the confirmed domain.</span></div></li>
       <li><span class="icon"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg></span><div><strong>Encrypted credentials</strong><span>Passwords are encrypted with DPAPI and never returned by the API; secret variables are masked in the API and logs. On a Linux console, prefer SSH keys.</span></div></li>
       <li><span class="icon"><svg class="i" aria-hidden="true"><use href="#i-key"/></svg></span><div><strong>SSH host-key pinning</strong><span>Host keys are pinned on first use. A changed key fails the deployment until you forget it in Settings.</span></div></li>
       <li><span class="icon"><svg class="i" aria-hidden="true"><use href="#i-pen"/></svg></span><div><strong>ed25519-signed releases</strong><span>Updates install only when <code>SHA256SUMS</code> is signed by the release key built into PSCCM and the download matches. Assets also carry a build-provenance attestation.</span></div></li>
