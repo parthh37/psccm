@@ -1,12 +1,14 @@
 //! Read-only Active Directory computer inventory.
 //!
 //! Only LDAP *search* operations are used; nothing is ever written to AD, so
-//! an ordinary domain user (no delegated rights) is enough. Two modes:
+//! an ordinary domain user (no delegated rights) is enough. (AD restores in
+//! `adbackup.rs` run as jobs on a domain controller, never from here.) Two modes:
 //! - `ldap`: cross-platform LDAP/LDAPS bind with a stored credential.
 //! - `windows`: the console's logged-on Windows account via ADSI (Kerberos,
 //!   no password stored). Works with DCs that require LDAP signing.
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ldap3::adapters::{Adapter, EntriesOnly, PagedResults};
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use serde::{Deserialize, Serialize};
@@ -120,6 +122,9 @@ fn ldap_filter(s: &AdSettings) -> String {
     };
     format!("(&(objectCategory=computer){disabled}{extra})")
 }
+
+/// Attributes with binary values. Both search modes return them base64-encoded.
+pub const BINARY_ATTRS: &[&str] = &["objectguid", "objectsid", "sidhistory", "logonhours", "thumbnailphoto", "usercertificate"];
 
 /// One directory object: its DN and attribute values (names lower-cased).
 #[derive(Debug, Clone, Default)]
@@ -416,7 +421,20 @@ async fn search_ldap(app: &App, s: &AdSettings, base: Base<'_>, filter: &str, at
             .with_context(|| format!("searching {base}"))?;
         while let Some(entry) = stream.next().await? {
             let e = SearchEntry::construct(entry);
-            let attrs = e.attrs.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
+            let mut attrs: HashMap<String, Vec<String>> = e
+                .attrs
+                .into_iter()
+                .map(|(k, v)| {
+                    let k = k.to_lowercase();
+                    // A binary value that happens to be valid UTF-8 lands here;
+                    // that conversion was lossless, so its bytes are intact.
+                    let v = if BINARY_ATTRS.contains(&k.as_str()) { v.iter().map(|s| B64.encode(s.as_bytes())).collect() } else { v };
+                    (k, v)
+                })
+                .collect();
+            for (k, v) in e.bin_attrs {
+                attrs.entry(k.to_lowercase()).or_default().extend(v.iter().map(|b| B64.encode(b)));
+            }
             out.push(Entry { dn: e.dn, attrs });
         }
         stream.finish().await.success().with_context(|| format!("searching {base}"))?;
@@ -460,9 +478,12 @@ $rows = foreach ($root in {roots}) {{
     foreach ($r in $searcher.FindAll()) {{
         $o = @{{ dn = [string]$r.Properties['distinguishedname'][0] }}
         foreach ($p in $props) {{
-            $o[$p.ToLower()] = @($r.Properties[$p.ToLower()] | ForEach-Object {{
-                if ($_ -is [datetime]) {{ $_.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z') }} else {{ [string]$_ }}
+            $vals = @($r.Properties[$p.ToLower()] | ForEach-Object {{
+                if ($_ -is [byte[]]) {{ [Convert]::ToBase64String($_) }}
+                elseif ($_ -is [datetime]) {{ $_.ToUniversalTime().ToString('yyyyMMddHHmmss.0Z') }} else {{ [string]$_ }}
             }})
+            # Leave out empty attributes: a whole-domain backup asks for many.
+            if ($vals.Count) {{ $o[$p.ToLower()] = $vals }}
         }}
         [pscustomobject]$o
     }}
@@ -471,7 +492,8 @@ ConvertTo-Json -InputObject @($rows) -Compress -Depth 3
 "#,
         filter = ps_quote(filter),
     );
-    let stdout = run_ps(&script, &[]).await.map_err(|e| {
+    // A whole-domain read for a backup can take a while in a large domain.
+    let stdout = run_ps_timeout(&script, &[], 1800).await.map_err(|e| {
         let err = format!("{e:#}");
         let hint = if err.contains("0x80005000") || err.contains("0x8007054B") || err.contains("domain") {
             " — is this PC joined to the domain? If not, enter the domain controller and use LDAP mode."
@@ -504,6 +526,11 @@ fn json_strings(v: serde_json::Value) -> Vec<String> {
 /// Run a short PowerShell script on the console and return its stdout. A
 /// non-zero exit becomes an error with the (cleaned) stderr text.
 pub(crate) async fn run_ps(script: &str, env: &[(&str, &str)]) -> Result<String> {
+    run_ps_timeout(script, env, 300).await
+}
+
+/// [`run_ps`] with a timeout in seconds.
+pub(crate) async fn run_ps_timeout(script: &str, env: &[(&str, &str)], secs: u64) -> Result<String> {
     let mut cmd = tokio::process::Command::new("powershell.exe");
     cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-OutputFormat", "Text", "-EncodedCommand"])
         .arg(encode_command(script))
@@ -515,7 +542,7 @@ pub(crate) async fn run_ps(script: &str, env: &[(&str, &str)]) -> Result<String>
         cmd.env(k, v);
     }
     let out = cmd.spawn().context("starting powershell.exe")?.wait_with_output();
-    let out = tokio::time::timeout(Duration::from_secs(300), out)
+    let out = tokio::time::timeout(Duration::from_secs(secs), out)
         .await
         .map_err(|_| anyhow!("PowerShell timed out"))??;
     if !out.status.success() {
@@ -538,7 +565,6 @@ fn strip_clixml(s: &str) -> String {
 
 /// Base64 of the UTF-16LE script, as `powershell -EncodedCommand` expects.
 fn encode_command(script: &str) -> String {
-    use base64::{Engine, engine::general_purpose::STANDARD as B64};
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     B64.encode(utf16)
 }

@@ -19,6 +19,9 @@ computers without installing an agent, similar to PDQ Deploy.
   install with automatic restarts on a monthly Patch Tuesday schedule, with no agent needed.
 - **Group Policy import and injection**: read GPOs from AD/SYSVOL (read-only) or a GPO backup, and
   apply their computer settings directly on chosen computers, with no GPO link or AD change.
+- **AD backup and restore**: scheduled backups of users, groups, computers, OUs and memberships,
+  of all GPOs and of DC System State; compare a backup with AD and restore what changed, or rebuild
+  the domain on a new server after a disaster. Every restore is confirmed twice.
 - **Optional agent** for computers with no WinRM/SSH: it connects out to the console and adds live
   CPU/disk analytics, on-demand event-log capture, Task Scheduler, firewall and local-user
   management, and an in-browser terminal — all with nothing opened inbound.
@@ -37,7 +40,8 @@ Built-in packages: 7-Zip, Google Chrome, Notepad++, Node.js install/upgrade, Mic
 Apps (Office), Microsoft Teams (new), IIS install, IIS site deploy, IIS app-pool recycle, IIS
 zero-downtime deploy behind HAProxy, HAProxy install/upgrade, HAProxy config deploy, HAProxy
 drain/ready, generic MSI/EXE/MSIX install, Windows uninstall, Windows Update, Linux package
-install/remove/upgrade, Linux full update, and reboot.
+install/remove/upgrade, Linux full update, reboot, DC System State backup, and promoting a new
+server to the first DC of a new forest (disaster recovery).
 
 ## Why not Ansible?
 
@@ -100,6 +104,7 @@ Windows targets need a Windows console (PowerShell remoting); Linux targets work
 | `packages\` | Package YAML files (the built-ins are written here on first start) |
 | `repository\` | Installers and files that packages push (`install: file`, `copy: src`) |
 | `gpos\` | Imported Group Policy snapshots |
+| `ad-backups\` | AD objects and GPO backups |
 | `catalog.yaml` | Your own App catalog entries (optional) |
 | `psccm.log` | Service log |
 
@@ -157,8 +162,9 @@ For the second command, `PSCCM_SERVICE_PASSWORD` holds the account password; run
   StartTLS. This also works when the console runs on Linux. Plain-text LDAP is refused, because the
   bind would send the stored password unencrypted.
 
-PSCCM only performs LDAP **searches** for `objectCategory=computer`. No code path writes to AD, so the
-account needs no delegated rights. Options cover the OUs to search, an extra LDAP filter, skipping
+PSCCM only performs LDAP **searches** for `objectCategory=computer`. The console never writes to AD, so
+the account needs no delegated rights. (Restores from an [AD backup](#ad-backup-and-restore) run as a
+job on a domain controller, with the deploy credential, after two confirmations.) Options cover the OUs to search, an extra LDAP filter, skipping
 disabled or stale computers, tagging by OU (`OU=Web Servers` → tag `web-servers`) and auto-sync every N
 minutes. Imports add and refresh computers; they never delete any. Each computer's AD security group
 memberships are imported too, so they can drive dynamic groups.
@@ -299,6 +305,59 @@ the GPO changes in AD (the page shows outdated imports). CLI: `psccm gpo list`,
 `psccm gpo import <GUID>`, `psccm gpo import-folder <path>`.
 
 Reading SYSVOL uses the service account (Windows mode) or the AD credential (LDAP mode).
+
+---
+
+## AD backup and restore
+
+*AD backup* page. Three kinds of backup:
+
+| Backup | What it holds | How it is taken |
+|---|---|---|
+| **AD objects** | Users, groups, computers, contacts and OUs: ~70 attributes each (names, mail, phone, title, department, manager, logon script, home folder, UPN, account options, SPNs, proxy addresses, extensionAttributes, `gPLink`…), GUID, SID and group memberships | LDAP searches from the console, with the Active Directory settings (read-only) |
+| **Group Policy** | Every GPO (`Backup-GPO -All`: settings, permissions) plus where each one is linked | On the DC chosen in *Run Backup-GPO on*, or on the console when it has Group Policy Management |
+| **System State** | A DC's AD database, SYSVOL, registry and boot files | Built-in package `ad-systemstate-backup` (`wbadmin`); schedule it on the Schedules page |
+
+Objects and GPO backups can run automatically every N hours (*Automatic backups*); the last N
+automatic backups of each kind are kept. Passwords are never in a backup (AD does not hand them out).
+
+**Compare & restore** (same domain). Reads AD as it is now and lists every object that was deleted,
+moved, renamed or changed since the backup, attribute by attribute, plus group members that are
+missing or were added. Pick what to put back. Deleted objects come back from the **AD Recycle Bin**
+(same SID, password and memberships); one that is no longer there can be re-created from the backup
+(new SID). Objects created after the backup are listed but never deleted; members added since stay
+unless you tick *Also remove group members added after the backup*. **Restore** on a GPO backup
+runs `Restore-GPO` (a GPO deleted since is re-created) and puts its links back.
+
+**Disaster recovery** (any domain). Build a new Windows Server, add it to Computers and deploy
+`ad-ds-new-forest` to make it the first DC of a new forest (same domain name or a new one). Then
+*Rebuild on a new server…* creates the backup's OUs (parents first), users, groups, computers and
+contacts, sets managers, adds group members and imports the GPOs with their links. With another
+domain name, every DN, `user@domain` logon name and DNS host name moves into the new domain.
+Built-in accounts and groups are not created (the new domain has its own) but get their members
+back. Re-created users get the initial password you enter (must change at next logon) or, without
+one, a random password with the account disabled. Computers must join the new domain.
+
+**Two confirmations.** A restore always starts as a plan; nothing changes while you look at it:
+
+1. *Review what will be restored*: every object and GPO, and what PSCCM will do to it (restore from
+   the Recycle Bin, move back, revert `title: Clerk → Boss`, add 3 members, create…), with
+   warnings and what is left alone. Download it as CSV. Tick that you reviewed it.
+2. *Type the domain name* to start. For a same-domain restore PSCCM first backs up AD as it is now.
+
+The restore then runs as a deployment on the chosen DC with the ActiveDirectory and GroupPolicy
+PowerShell modules, logging each operation (`OK` / `SKIPPED` / `FAILED`). Before it changes
+anything, it checks that the DC is in the domain you confirmed and stops otherwise. A plan
+expires after 30 minutes and runs once; a restore deployment cannot be redeployed.
+
+**System State restore** replaces a DC's whole database and needs Directory Services Restore Mode
+at the DC's console, so PSCCM does not run it remotely; *How to restore System State* gives the
+`bcdedit` / `wbadmin start systemstaterecovery` / `ntdsutil` steps, and *Show backups on a DC* lists
+the versions with `wbadmin get versions`.
+
+CLI: `psccm ad-backup list`, `psccm ad-backup objects`, `psccm ad-backup gpos`,
+`psccm ad-backup compare <id>`, and `psccm ad-backup restore --objects <id> [--gpos <id>] --dc DC01
+[--rebuild new.local] [--only <guid,…>]`, which prints the plan and asks the same two questions.
 
 ---
 

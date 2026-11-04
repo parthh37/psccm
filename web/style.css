@@ -284,3 +284,8 @@ input[type=radio] { width: auto; accent-color: var(--accent); }
 .steps li.done::before { content: '✓'; background: var(--ok); color: #fff; }
 .setup-list { padding-left: 20px; line-height: 1.9; }
 .card-foot { display: flex; gap: 8px; align-items: center; padding: 12px 16px; border-top: 1px solid var(--border); }
+.adb-box { border: 1px solid var(--border); background: var(--accent-soft); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+.adb-box.warn { background: var(--warn-soft); border-color: var(--warn); }
+.adb-box.bad { background: var(--bad-soft); border-color: var(--bad); }
+.adb-box ul { margin: 0; padding-left: 18px; }
+button.danger-bg { background: var(--bad); border-color: var(--bad); color: #fff; }

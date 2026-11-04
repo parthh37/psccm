@@ -316,7 +316,7 @@ pub async fn list(app: &App) -> Result<Vec<GpoInfo>> {
 }
 
 /// "20261028123456.0Z" -> RFC 3339.
-fn generalized_time(t: &str) -> String {
+pub(crate) fn generalized_time(t: &str) -> String {
     chrono::NaiveDateTime::parse_from_str(t.get(..14).unwrap_or(t), "%Y%m%d%H%M%S")
         .map(|d| d.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         .unwrap_or_else(|_| t.to_string())
