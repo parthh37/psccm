@@ -47,12 +47,15 @@ impl Conn {
 }
 
 /// Well-known SIDs in their binary form.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows check (and tests) use these
 const SID_ADMINISTRATORS: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0]; // S-1-5-32-544
+#[cfg_attr(not(windows), allow(dead_code))]
 const SID_SYSTEM: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]; // S-1-5-18
 
 /// The rule: SYSTEM, the account PSCCM runs as, or a member of the local
 /// Administrators group. Membership counts even when UAC filtered the group
 /// to deny-only: a browser started by an administrator runs unelevated.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn allowed(user: &[u8], groups: &[Vec<u8>], me: &[u8]) -> bool {
     user == SID_SYSTEM || user == me || groups.iter().any(|g| g == SID_ADMINISTRATORS)
 }
