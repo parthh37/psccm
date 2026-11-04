@@ -1147,7 +1147,7 @@ async function pageSettings(el) {
         </div>
         <div class="row" id="ad-ldap">
           <div class="field"><label>Security</label><select id="ad-sec">
-            ${[['ldaps', 'LDAPS (636) — recommended'], ['starttls', 'StartTLS (389)'], ['none', 'None (389, plain text)']].map(([v, l]) => `<option value="${v}" ${ad.security === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+            ${[['ldaps', 'LDAPS (636) — recommended'], ['starttls', 'StartTLS (389)']].map(([v, l]) => `<option value="${v}" ${ad.security === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
           <div class="field"><label>Credential (type LDAP)</label><select id="ad-cred">${credOptions(ad.credential_id, ['ldap'], 'Choose…')}</select>
             <div class="hint">Any normal domain user works — no extra rights needed.</div></div>
           <div class="field"><label class="check"><input type="checkbox" id="ad-skip" ${ad.skip_tls_verify ? 'checked' : ''}> Don't verify the DC certificate</label></div>
@@ -2769,7 +2769,7 @@ async function pageSetup(el) {
         </div>
         <div class="row" id="ad-ldap">
           <div class="field"><label>Security</label><select id="ad-sec">
-            ${[['ldaps', 'LDAPS (636)'], ['starttls', 'StartTLS (389)'], ['none', 'None (389, plain text)']].map(([v, l]) => `<option value="${v}" ${ad.security === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+            ${[['ldaps', 'LDAPS (636)'], ['starttls', 'StartTLS (389)']].map(([v, l]) => `<option value="${v}" ${ad.security === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
           ${creds.some((c) => c.kind === 'ldap')
             ? `<div class="field"><label>Credential</label><select id="ad-cred">${credOptions(SU.ldapCred || ad.credential_id, ['ldap'], 'Choose…')}</select></div>`
             : `<div class="field"><label>User (any domain user)</label><input id="su-ldap-user" autocomplete="off" placeholder="reader@corp.local"></div>

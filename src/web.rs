@@ -71,6 +71,11 @@ pub async fn serve(
         tracing::warn!("the access token is shorter than {MIN_TOKEN_LEN} characters; use a long random one");
     }
     app.secure_data_dir();
+    match app.db.upgrade_secrets() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("re-encrypted {n} stored credential(s) in the current format"),
+        Err(e) => tracing::warn!("could not re-encrypt stored credentials: {e:#}"),
+    }
     let st = St { app, token };
     let api = Router::new()
         .route("/summary", get(summary))

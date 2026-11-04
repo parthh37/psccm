@@ -3,6 +3,8 @@
 //! On Windows secrets are protected with DPAPI (user scope): only the Windows
 //! account that saved a credential can decrypt it, so run the console under
 //! the same account that created the credentials (e.g. a service account).
+//! A PSCCM-specific entropy value is mixed in, so another program running as
+//! that account cannot decrypt a copied value with a plain DPAPI call.
 //! On Linux they are stored base64-encoded and protected only by the
 //! permissions of the data directory; prefer SSH keys there.
 
@@ -10,22 +12,42 @@ use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 
 #[cfg(windows)]
-const PREFIX: &str = "dpapi:";
+const PREFIX: &str = "dpapi2:";
+/// Values saved by versions before the entropy was added.
+#[cfg(windows)]
+const LEGACY_PREFIX: Option<&str> = Some("dpapi:");
 #[cfg(not(windows))]
 const PREFIX: &str = "b64:";
+#[cfg(not(windows))]
+const LEGACY_PREFIX: Option<&str> = None;
+
+const ENTROPY: &[u8] = b"PSCCM credential store v2";
 
 pub fn protect(plain: &str) -> Result<String> {
-    let data = platform::protect(plain.as_bytes())?;
+    let data = platform::protect(plain.as_bytes(), ENTROPY)?;
     Ok(format!("{PREFIX}{}", B64.encode(data)))
 }
 
 pub fn unprotect(stored: &str) -> Result<String> {
-    let body = stored
-        .strip_prefix(PREFIX)
-        .ok_or_else(|| anyhow!("credential was saved on another platform; re-enter it"))?;
+    let (body, entropy) = match (stored.strip_prefix(PREFIX), LEGACY_PREFIX.and_then(|p| stored.strip_prefix(p))) {
+        (Some(b), _) => (b, ENTROPY),
+        (None, Some(b)) => (b, &[][..]),
+        _ => return Err(anyhow!("credential was saved on another platform; re-enter it")),
+    };
     let raw = B64.decode(body)?;
-    let plain = platform::unprotect(&raw)?;
+    let plain = platform::unprotect(&raw, entropy)?;
     Ok(String::from_utf8(plain)?)
+}
+
+/// Saved in an older format that [`protect`] no longer writes.
+pub fn is_legacy(stored: &str) -> bool {
+    LEGACY_PREFIX.is_some_and(|p| stored.starts_with(p))
+}
+
+/// A value as versions before the entropy saved it.
+#[cfg(all(test, windows))]
+pub fn protect_legacy(plain: &str) -> String {
+    format!("dpapi:{}", B64.encode(platform::protect(plain.as_bytes(), &[]).unwrap()))
 }
 
 /// Compare a presented token with the expected one in constant time, so the
@@ -79,15 +101,16 @@ mod platform {
         }
     }
 
-    pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn protect(data: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
         let input = blob(data);
+        let extra = blob(entropy);
         let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
-        // SAFETY: input points at `data` for the duration of the call.
+        // SAFETY: input and extra point at `data` / `entropy` for the duration of the call.
         let ok = unsafe {
             CryptProtectData(
                 &input,
                 std::ptr::null(),
-                std::ptr::null(),
+                &extra,
                 std::ptr::null(),
                 std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -100,15 +123,18 @@ mod platform {
         Ok(unsafe { take(out) })
     }
 
-    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn unprotect(data: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
         let input = blob(data);
+        let extra = blob(entropy);
+        // No entropy is passed as NULL, as older versions did.
+        let extra_ptr = if entropy.is_empty() { std::ptr::null() } else { &extra as *const _ };
         let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
         // SAFETY: as above.
         let ok = unsafe {
             CryptUnprotectData(
                 &input,
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                extra_ptr,
                 std::ptr::null(),
                 std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -129,11 +155,11 @@ mod platform {
 mod platform {
     use anyhow::Result;
 
-    pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn protect(data: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
         Ok(data.to_vec())
     }
 
-    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn unprotect(data: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
         Ok(data.to_vec())
     }
 }
@@ -145,6 +171,21 @@ mod tests {
         let enc = super::protect("p@ss wörd").unwrap();
         assert_ne!(enc, "p@ss wörd");
         assert_eq!(super::unprotect(&enc).unwrap(), "p@ss wörd");
+        assert!(!super::is_legacy(&enc));
+    }
+
+    /// Values written before the entropy was added still decrypt, and new
+    /// ones do not decrypt without it.
+    #[cfg(windows)]
+    #[test]
+    fn legacy_and_entropy() {
+        use base64::Engine;
+        let stored = super::protect_legacy("old secret");
+        assert!(super::is_legacy(&stored));
+        assert_eq!(super::unprotect(&stored).unwrap(), "old secret");
+        let new = super::protect("x").unwrap();
+        let raw = super::B64.decode(new.strip_prefix("dpapi2:").unwrap()).unwrap();
+        assert!(super::platform::unprotect(&raw, &[]).is_err());
     }
 
     #[test]

@@ -62,6 +62,29 @@ Windows. Being agentless, it needs nothing on the targets beyond WinRM or SSH.
 Files go to `C:\Program Files\PSCCM`, data to `C:\ProgramData\PSCCM`. Upgrades keep the service
 account and settings.
 
+The setup also adds a **status icon** to the notification area for everyone who signs in to the server
+(`psccm-tray.exe`; untick the task to skip it). Windows 11 puts new icons behind the **^** arrow, so drag
+it onto the taskbar to keep it in sight. Green: running and the console answers. Yellow:
+starting/stopping, or the service runs but nothing answers on the port. Red: stopped. Grey: not
+installed. It pops up a notice when the console goes down or comes back. Right-click for *Open
+console*, *Start / Stop / Restart service* and *View log* (these ask for administrator rights).
+
+### The service runs but there is no page on port 8080
+
+Run `psccm service status` from an administrator prompt (in `C:\Program Files\PSCCM`). It shows the
+service state, the address and port, whether the console answers, the firewall rule and the end of
+`psccm.log`. The usual causes:
+
+- **"This computer only" was chosen.** The console then only answers at `http://localhost:8080` *on
+  the server itself*; `http://<server-name>:8080` fails, even on the server. Reinstall with *Other
+  computers too* (or `psccm service install --bind 0.0.0.0 --token …`).
+- **Windows Firewall** blocks the port for other computers. `service install` with a network bind now
+  adds the inbound rule *PSCCM Console*; older installs need it added by hand.
+- **The port is taken** (IIS, Jenkins, Tomcat…). The service stops right after starting and
+  `psccm.log` says the address is in use. `service install` now checks this up front.
+- **The service account** lacks "Log on as a service" (error 1069) or cannot write
+  `C:\ProgramData\PSCCM`. `service install` now grants both.
+
 **Portable:** download `psccm-x86_64-windows.exe` (or build with `cargo build --release`), put it in a
 folder and double-click it. Data is kept in `data\` next to the executable and the console opens at
 <http://127.0.0.1:8080/>.
@@ -129,7 +152,8 @@ For the second command, `PSCCM_SERVICE_PASSWORD` holds the account password; run
 - **Account running PSCCM** (Windows, recommended): uses ADSI with the console's own Kerberos
   ticket. No password is stored, and it works with DCs that require LDAP signing.
 - **LDAP with a stored credential**: any normal domain user (`reader@corp.local`), over LDAPS 636 or
-  StartTLS. This also works when the console runs on Linux.
+  StartTLS. This also works when the console runs on Linux. Plain-text LDAP is refused, because the
+  bind would send the stored password unencrypted.
 
 PSCCM only performs LDAP **searches** for `objectCategory=computer`. No code path writes to AD, so the
 account needs no delegated rights. Options cover the OUs to search, an extra LDAP filter, skipping
@@ -443,7 +467,7 @@ psccm gpo list | import <GUID> | import-folder <path> [--name N]
 psccm catalog list | check | add <ids> | update [ids] | remove <id>
 psccm cred add --name deploy --kind ssh --user deploy [--key ~/.ssh/id_ed25519] [--default-for linux]
 psccm update [--install]
-psccm service install [--bind IP] [--port N] [--token T] [--account DOMAIN\user] | uninstall
+psccm service install [--bind IP] [--port N] [--token T] [--account DOMAIN\user] | uninstall | status
 psccm history
 ```
 
@@ -591,8 +615,12 @@ bash (runs with `set -eo pipefail`):
   terminal WebSocket; without a token only `localhost` / `127.0.0.1` host names are accepted (DNS
   rebinding); responses carry a Content-Security-Policy and refuse framing.
 - The data folder is restricted to the account running PSCCM, SYSTEM and Administrators (mode 700 on
-  Linux). Passwords are encrypted with DPAPI (Windows) and never returned by the API; secret variables
-  are masked in the API and logs. On a Linux console, secrets are only base64-encoded, so prefer SSH
+  Linux); `service install` locks it before the service first starts. Passwords (including the AD
+  credential) are encrypted with DPAPI for the service account, with a PSCCM-specific entropy value so
+  another program running as that account cannot simply decrypt a copied value; credentials saved by
+  older versions are re-encrypted on start. Passwords are never returned by the API or shown in the
+  console (to change one, delete the credential and add it again); secret variables are masked in the
+  API and logs. On a Linux console, secrets are only base64-encoded, so prefer SSH
   keys there.
 - Computer names may only contain letters, digits, `.`, `-`, `_` and `:`; anything else (from AD,
   agents or typed in) is refused, because names end up in scripts. In package scripts, write
