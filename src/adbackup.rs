@@ -1738,6 +1738,7 @@ $global:Links = @()
         );
         std::fs::write(dir.join("run.ps1"), [b"\xEF\xBB\xBF".as_slice(), script.as_bytes()].concat()).unwrap();
         let out = std::process::Command::new("powershell.exe")
+            .env_remove("PSModulePath")
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(dir.join("run.ps1"))
             .output()
